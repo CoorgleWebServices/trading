@@ -1,0 +1,16 @@
+# runtime directory (config with secrets, database, lock, logs) — keep only its .htaccess
+data/*
+!data/.htaccess
+
+# databases and logs anywhere
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.log
+*.log.[0-9]
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp

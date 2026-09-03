@@ -1,0 +1,32 @@
+# Binance Micro-Trader — project root (upload as public_html/trader/)
+# Only index.php, cron.php and assets/ are meant to be reachable over HTTP.
+# The HTTPS redirect is done in PHP by the panel (force_https), not here.
+
+Options -Indexes
+
+# --- directories that must never be served: data/, lib/, tests/, docs/, .git/
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(data|lib|tests|docs|\.git)(/|$) - [F,L]
+</IfModule>
+<IfModule !mod_rewrite.c>
+    <IfModule mod_alias.c>
+        RedirectMatch 403 /(data|lib|tests|docs|\.git)(/|$)
+    </IfModule>
+</IfModule>
+
+# --- files that must never be served: dotfiles (.htaccess, .git*, .gitignore), bootstrap.php,
+#     config.php, SQLite databases (+ WAL/SHM/journal), logs (+ rotated), JSON, Markdown, lock files
+<FilesMatch "(^\.|^(bootstrap|config)\.php$|\.(sqlite|sqlite-wal|sqlite-shm|sqlite-journal|db|log|log\.[0-9]+|json|md|lock|bak|tmp)$)">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+</IfModule>
