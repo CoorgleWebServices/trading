@@ -50,9 +50,10 @@ final class BinanceMarketData implements MarketDataInterface
     /** @var Binance */
     private $api;
 
-    public function __construct(?Binance $api = null, bool $testnet = false, int $recvWindow = 10000)
+    /** @param bool|string $network see Binance::normalizeNetwork() ('prod'|'demo'|'testnet') */
+    public function __construct(?Binance $api = null, $network = false, int $recvWindow = 10000)
     {
-        $this->api = $api !== null ? $api : new Binance('', '', $testnet, $recvWindow);
+        $this->api = $api !== null ? $api : new Binance('', '', $network, $recvWindow);
     }
 
     public function api(): Binance
@@ -92,7 +93,7 @@ final class BinanceMarketData implements MarketDataInterface
 }
 
 /**
- * Real exchange (testnet or live) backed by a keyed Binance client.
+ * Real exchange (demo, testnet or live) backed by a keyed Binance client.
  */
 final class LiveExchange implements ExchangeInterface
 {
@@ -650,7 +651,7 @@ final class PaperExchange implements ExchangeInterface
 final class Exchange
 {
     /**
-     * @throws RuntimeException when live/testnet keys are missing or the mode is unknown
+     * @throws RuntimeException when live/testnet/demo keys are missing or the mode is unknown
      */
     public static function factory(array $cfg, Db $db): ExchangeInterface
     {
@@ -667,7 +668,7 @@ final class Exchange
             return new PaperExchange($md, $db, $fee, $start, $quote);
         }
 
-        if ($mode === 'live' || $mode === 'testnet') {
+        if ($mode === 'live' || $mode === 'testnet' || $mode === 'demo') {
             $key    = isset($cfg['api_key']) ? trim((string)$cfg['api_key']) : '';
             $secret = isset($cfg['api_secret']) ? trim((string)$cfg['api_secret']) : '';
             if ($key === '' || $secret === '') {
@@ -675,12 +676,12 @@ final class Exchange
                     'Mode "' . $mode . '" requires a Binance API key and secret — enter them in Settings or switch to paper mode.'
                 );
             }
-            $api = new Binance($key, $secret, $mode === 'testnet', $recv);
+            $api = new Binance($key, $secret, Binance::normalizeNetwork($mode), $recv);
             self::applyStoredOffset($api, $db);
             return new LiveExchange($api, $mode);
         }
 
-        throw new RuntimeException('Unknown trading mode "' . $mode . '" (expected paper, testnet or live).');
+        throw new RuntimeException('Unknown trading mode "' . $mode . '" (expected paper, demo, testnet or live).');
     }
 
     private static function applyStoredOffset(Binance $api, Db $db): void

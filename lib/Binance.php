@@ -37,14 +37,20 @@ final class BinanceException extends RuntimeException
 }
 
 /**
- * Minimal signed/unsigned Binance SPOT REST client (prod, testnet, data-api).
+ * Minimal signed/unsigned Binance SPOT REST client (prod, demo, testnet, data-api).
  * See docs/DESIGN.md §6.
  */
 final class Binance
 {
     const URL_PROD    = 'https://api.binance.com';
     const URL_TESTNET = 'https://testnet.binance.vision';
+    const URL_DEMO    = 'https://demo-api.binance.com';
     const URL_DATA    = 'https://data-api.binance.vision';
+
+    /** Networks this client can talk to. Paths and signing are identical on all of them. */
+    const NET_PROD    = 'prod';
+    const NET_TESTNET = 'testnet';
+    const NET_DEMO    = 'demo';
 
     const CONNECT_TIMEOUT = 8;
     const TIMEOUT         = 15;
@@ -53,8 +59,8 @@ final class Binance
     private $apiKey;
     /** @var string */
     private $apiSecret;
-    /** @var bool */
-    private $testnet;
+    /** @var string one of NET_PROD, NET_TESTNET, NET_DEMO */
+    private $network;
     /** @var int */
     private $recvWindow;
     /** @var array<string,bool> symbols the exchange rejected with -1121 in this process */
@@ -66,32 +72,79 @@ final class Binance
     /** @var bool  once true, public endpoints go to tradeUrl() instead of data-api */
     private $dataFallback = false;
 
-    public function __construct(string $apiKey, string $apiSecret, bool $testnet = false, int $recvWindow = 10000)
+    /**
+     * @param bool|string $network true/'testnet' for the Spot testnet, 'demo' for Binance Demo
+     *                             Trading (demo.binance.com keys), false/'prod' for the live
+     *                             exchange. Bools are accepted for backward compatibility.
+     */
+    public function __construct(string $apiKey, string $apiSecret, $network = false, int $recvWindow = 10000)
     {
         $this->apiKey     = $apiKey;
         $this->apiSecret  = $apiSecret;
-        $this->testnet    = $testnet;
+        $this->network    = self::normalizeNetwork($network);
         $this->recvWindow = max(1000, min(60000, $recvWindow));
+    }
+
+    /**
+     * Accepts a trading mode ('paper'|'live'|'testnet'|'demo'), a network name, or a legacy bool.
+     * Anything unrecognised falls back to the live network, which is what an unknown mode used to do.
+     *
+     * @param bool|string $network
+     */
+    public static function normalizeNetwork($network): string
+    {
+        if (is_bool($network)) {
+            return $network ? self::NET_TESTNET : self::NET_PROD;
+        }
+        $n = strtolower(trim((string) $network));
+        if ($n === self::NET_TESTNET) {
+            return self::NET_TESTNET;
+        }
+        if ($n === self::NET_DEMO) {
+            return self::NET_DEMO;
+        }
+        return self::NET_PROD;
     }
 
     // ------------------------------------------------------------------ urls
 
     public function tradeUrl(): string
     {
-        return $this->testnet ? self::URL_TESTNET : self::URL_PROD;
+        if ($this->network === self::NET_TESTNET) {
+            return self::URL_TESTNET;
+        }
+        if ($this->network === self::NET_DEMO) {
+            return self::URL_DEMO;
+        }
+        return self::URL_PROD;
     }
 
+    /**
+     * Public market data. Only the live network has a separate read-only host; testnet and demo
+     * must answer their own market data or the prices would not match their order books.
+     */
     public function dataUrl(): string
     {
-        if ($this->testnet || $this->dataFallback) {
+        if ($this->network !== self::NET_PROD || $this->dataFallback) {
             return $this->tradeUrl();
         }
         return self::URL_DATA;
     }
 
+    public function network(): string
+    {
+        return $this->network;
+    }
+
     public function isTestnet(): bool
     {
-        return $this->testnet;
+        return $this->network === self::NET_TESTNET;
+    }
+
+    /** True when orders are simulated by the exchange itself (testnet or demo), i.e. no real money. */
+    public function isSimulated(): bool
+    {
+        return $this->network !== self::NET_PROD;
     }
 
     public function hasKeys(): bool
@@ -675,7 +728,7 @@ final class Binance
             $tag     = 'Binance ' . $method . ' ' . $path;
 
             if ($res['errno'] !== 0) {
-                if ($public && !$this->testnet && !$this->dataFallback) {
+                if ($public && $this->network === self::NET_PROD && !$this->dataFallback) {
                     // one-time fallback from data-api to the trade host
                     $this->dataFallback = true;
                     continue;

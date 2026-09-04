@@ -19,8 +19,11 @@ Never stringify floats with `(string)` or string interpolation for API parameter
   equity floor kill switch, high-water-mark drawdown kill switch, daily and weekly loss caps,
   consecutive-loss cooldown ladder, trade-count caps, stop-loss on every position, dust-aware
   sizing, order idempotency, exchange-state reconciliation.
-* Three modes: `paper` (simulated fills at live bid/ask, default), `testnet`
+* Four modes: `paper` (simulated fills at live bid/ask, default), `demo`
+  (demo-api.binance.com with Binance Demo Trading keys from demo.binance.com), `testnet`
   (testnet.binance.vision with testnet keys), `live` (api.binance.com with real keys).
+  `demo` and `testnet` are different environments with different keys; a key from one is
+  rejected by the other with `-2015 Invalid API-key, IP, or permissions for action`.
 * Simple password-protected panel hosted at e.g. `https://yourdomain.com/trader/`.
 * "AI" here means a **deterministic mean-reversion scoring model plus a bounded self-tuning
   rule** driven by rolling win rate. No LLM calls. Nothing here guarantees profit; the honest
@@ -83,7 +86,7 @@ trader/
 | `panel_password_hash` | `""` | `password_hash()` bcrypt; empty ⇒ setup wizard |
 | `cron_key` | random 64 hex | required for the HTTP trigger of cron.php |
 | `api_key` / `api_secret` | `""` | secret never rendered back; panel shows fingerprint of key only (`abcd…wxyz`) |
-| `mode` | `"paper"` | `paper` \| `testnet` \| `live` |
+| `mode` | `"paper"` | `paper` \| `demo` \| `testnet` \| `live` |
 | `enabled` | `false` | master switch for NEW entries; exits are always managed |
 | `force_https` | `true` | panel redirects http→https and sets the secure cookie flag |
 | `symbols` | `["SOLUSDT","ETHUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","ADAUSDT"]` | watchlist; must end with `quote_asset`; the bot ranks eligible ones each tick |
@@ -237,9 +240,9 @@ Util::clientOrderId(string $side, string $symbol, int $tickMinute): string;  // 
 ```php
 final class BinanceException extends RuntimeException { public int $binanceCode; public int $httpStatus; public ?int $retryAfter; }
 final class Binance {
-  public function __construct(string $apiKey, string $apiSecret, bool $testnet=false, int $recvWindow=10000);
-  public function tradeUrl(): string;   // https://api.binance.com | https://testnet.binance.vision
-  public function dataUrl(): string;    // https://data-api.binance.vision | testnet same as tradeUrl; on cURL failure fall back to tradeUrl once
+  public function __construct(string $apiKey, string $apiSecret, $network=false, int $recvWindow=10000);  // bool (legacy) | 'prod'|'demo'|'testnet'
+  public function tradeUrl(): string;   // https://api.binance.com | https://demo-api.binance.com | https://testnet.binance.vision
+  public function dataUrl(): string;    // https://data-api.binance.vision; demo/testnet use tradeUrl; on cURL failure fall back to tradeUrl once
   public function syncTime(): int;  public function setTimeOffset(int $ms): void;  public function timeOffset(): int;
   public function exchangeInfo(array $symbols): array;   // parsed shape below, cached by caller
   public function klines(string $symbol, string $interval, int $limit=320): array; // rows [openTime(int), open, high, low, close, volume (floats), closeTime(int)]

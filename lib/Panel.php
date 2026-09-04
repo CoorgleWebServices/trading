@@ -659,7 +659,7 @@ final class Panel
 
         // ---- mode & bot state
         $text['mode']   = strtoupper($mode);
-        $levels['mode'] = $mode === 'live' ? 'danger' : ($mode === 'testnet' ? 'warn' : 'info');
+        $levels['mode'] = $mode === 'live' ? 'danger' : (($mode === 'testnet' || $mode === 'demo') ? 'warn' : 'info');
 
         $enabled       = !empty($cfg['enabled']);
         $halted        = $st('halted', '0') === '1';

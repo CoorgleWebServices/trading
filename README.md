@@ -21,8 +21,9 @@ No Composer, no external libraries, no shell access required. PHP 7.4+ (works on
   high-water-mark drawdown kill switch, daily and weekly loss caps, a cooldown ladder after
   losses, trade-count caps, a stop-loss on every position, dust-aware sizing, order idempotency
   and reconciliation with the exchange.
-* three modes: `paper` (simulated fills at the live bid/ask - the default), `testnet`
-  (testnet.binance.vision) and `live` (api.binance.com).
+* four modes: `paper` (simulated fills at the live bid/ask - the default), `demo`
+  (demo-api.binance.com, keys from demo.binance.com), `testnet` (testnet.binance.vision) and
+  `live` (api.binance.com).
 
 **It is NOT**
 
@@ -43,8 +44,8 @@ No Composer, no external libraries, no shell access required. PHP 7.4+ (works on
   extensions `curl`, `pdo_sqlite`, `json`. `bcmath` is used when present; otherwise an
   integer-math fallback is used - both are exact.
 * Cron jobs enabled in cPanel (or any external service that can call a URL every minute).
-* Outbound HTTPS to `api.binance.com`, `data-api.binance.vision` and, for testnet,
-  `testnet.binance.vision`. Some hosts block outbound connections - the "Test API connection"
+* Outbound HTTPS to `api.binance.com` and `data-api.binance.vision`, plus `demo-api.binance.com`
+  for demo mode or `testnet.binance.vision` for testnet mode. Some hosts block outbound connections - the "Test API connection"
   button in Settings tells you.
 * HTTPS on your domain (Let's Encrypt/AutoSSL in cPanel is fine). The panel redirects HTTP to
   HTTPS by default.
@@ -126,12 +127,29 @@ Notes:
 
 ## Binance API key setup
 
-You do not need keys for paper mode. For testnet and live:
+You do not need keys for paper mode. For demo, testnet and live:
 
-1. **Testnet first.** Go to <https://testnet.binance.vision>, log in with GitHub, *Generate HMAC_SHA256
-   Key*. Paste key and secret into Settings, set mode to **testnet**. Testnet balances are fake and
-   reset now and then; that is fine, you are testing the plumbing, not the strategy.
-2. **Live key.** Binance → profile → *API Management* → *Create API* (system generated).
+1. **Demo Trading (recommended practice environment).** From your Binance account open
+   **Demo Trading**, then *API Key Management* at
+   <https://demo.binance.com/en/my/settings/api-management>, and create an HMAC key. Tick
+   **Enable Reading** and **Enable Spot & Margin Trading**. Copy both the key and the secret
+   before leaving the page, because the secret is shown only once. Paste them into Settings and
+   set mode to **demo**. Demo balances are fake, you reset them yourself from the Binance UI, and
+   prices mirror the live book.
+2. **Testnet (the older alternative).** Go to <https://testnet.binance.vision>, log in with GitHub,
+   *Generate HMAC_SHA256 Key*, and set mode to **testnet**. Testnet balances reset roughly monthly.
+
+   Demo and testnet are **separate environments with separate keys and separate hosts**. A demo key
+   sent to testnet, or a testnet key sent to live, is rejected with
+   `-2015 Invalid API-key, IP, or permissions for action`. Match the mode to where the key came from:
+
+   | Mode | Host the bot calls | Where the key comes from |
+   |---|---|---|
+   | `demo` | `https://demo-api.binance.com` | demo.binance.com |
+   | `testnet` | `https://testnet.binance.vision` | testnet.binance.vision |
+   | `live` | `https://api.binance.com` | binance.com API Management |
+
+3. **Live key.** Binance → profile → *API Management* → *Create API* (system generated).
    Then, on the key's permissions:
    * tick **Enable Spot & Margin Trading** - this is the only permission the bot needs;
    * leave **Enable Withdrawals** OFF (the bot never withdraws, and a leaked key must not be able to);
@@ -158,7 +176,7 @@ You do not need keys for paper mode. For testnet and live:
    the numbers are realistic. Watch: win rate, expectancy per trade, total fees versus total PnL,
    the no-trade-reasons histogram (if it is all `atr_low` or `size_unaffordable` your watchlist or
    sizing is wrong), and whether any position ends up `STUCK`.
-2. **Testnet for 1 - 2 weeks.** Same strategy, real HTTP calls, real signing, real filters
+2. **Demo or testnet for 1 - 2 weeks.** Same strategy, real HTTP calls, real signing, real filters
    (`LOT_SIZE`, `NOTIONAL`), real error codes. This shakes out key/IP/permission problems and time
    drift (`-1021`) before any money is involved.
 3. **Live with a tiny size.** 10 - 20 USDT, `trade_usdt` 6.5, the default caps. Check the dashboard
@@ -336,8 +354,11 @@ Sessions expire after 30 minutes of inactivity; five wrong passwords lock the IP
 ## Troubleshooting
 
 **`-2015 Invalid API-key, IP, or permissions for action`**
-The key is wrong, the server's outbound IP is not in the key's IP whitelist, "Enable Spot & Margin
-Trading" is not ticked, or you pasted testnet keys while in live mode (or vice versa). The bot sets
+Nearly always the key and the mode do not match. Demo keys (from demo.binance.com) only work in
+**demo** mode, testnet keys only in **testnet** mode, and real keys only in **live** mode, because
+each mode talks to a different host - see the table in the key-setup section. Otherwise: the key is
+wrong, the server's outbound IP is not in the key's IP whitelist, or "Enable Spot & Margin Trading"
+is not ticked. The bot sets
 `enabled=false` when it sees this. Fix the key in Binance, re-enter it in Settings, press "Test
 API connection", then Start. The error text from Binance contains the IP it saw - use exactly
 that one in the whitelist.
@@ -398,7 +419,7 @@ Either sell it manually or remove that symbol from the watchlist, then *Reset ha
       `config.php` and `bootstrap.php`.
 * [ ] Panel password of 12+ characters that you use nowhere else. Change it in Settings if in doubt.
 * [ ] API key: **spot trading only, withdrawals OFF, IP-restricted** to the server's outbound IP.
-* [ ] Testnet keys and live keys never mixed up; `mode` checked before pressing Start.
+* [ ] Demo, testnet and live keys never mixed up; `mode` checked before pressing Start.
 * [ ] `data/config.json` is `0600` and `data/` is not world-writable (`750`).
 * [ ] The cron key is only in the cron command, never in a bookmark or a chat message; rotate it in
       Settings if it leaks (the HTTP trigger uses a constant-time comparison and answers 403 otherwise).

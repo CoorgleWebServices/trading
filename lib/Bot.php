@@ -50,7 +50,7 @@ final class Bot
     private $ex;
     /** @var int|null */
     private $fixedNowMs;
-    /** @var string paper | testnet | live */
+    /** @var string paper | demo | testnet | live */
     private $mode;
     /** @var array symbol => parsed symbol info */
     private $info = [];

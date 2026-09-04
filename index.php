@@ -104,7 +104,7 @@ if (!$setupDone) {
             $errors[] = (string) $ve;
         }
         if ($values['mode'] !== 'paper' && ((string) $newCfg['api_key'] === '' || (string) $newCfg['api_secret'] === '')) {
-            $errors[] = 'Testnet and live mode need both an API key and a secret - or start in paper mode.';
+            $errors[] = 'Demo, testnet and live mode need both an API key and a secret - or start in paper mode.';
         }
         if ($values['mode'] === 'live' && !isset($_POST['live_confirm'])) {
             $errors[] = 'Live mode requires the confirmation checkbox.';
@@ -445,9 +445,8 @@ function panel_test_api(array $cfg): string
     $recv   = (int) ($cfg['recv_window'] ?? 10000);
     $symbols = isset($cfg['symbols']) && is_array($cfg['symbols']) ? $cfg['symbols'] : [];
     $first  = $symbols !== [] ? (string) $symbols[0] : 'BTCUSDT';
-    $testnet = $mode === 'testnet';
     try {
-        $api = new Binance($key, $secret, $testnet, $recv);
+        $api = new Binance($key, $secret, Binance::normalizeNetwork($mode), $recv);
         $offset = $api->syncTime();
         $book = $api->bookTicker($first);
         $msg = 'Connected to ' . $api->tradeUrl() . ' (time offset ' . $offset . ' ms, ' . $first . ' bid ' . Util::money((float) $book['bid'], 6)
@@ -523,7 +522,7 @@ function panel_layout(string $title, string $body, array $opts = []): string
         $h .= '<div class="flash flash-' . $e($f['type']) . '" role="status">' . $e($f['msg']) . '</div>';
     }
     $h .= $body;
-    $h .= '</main><footer class="foot"><span>Binance Micro-Trader · paper / testnet / live · nothing here is financial advice</span>';
+    $h .= '</main><footer class="foot"><span>Binance Micro-Trader · paper / demo / testnet / live · nothing here is financial advice</span>';
     if ($auto) {
         $h .= '<span class="refresh-info" data-refresh-info>auto-refresh every 20 s</span>';
     }
@@ -548,7 +547,13 @@ function page_setup(array $v, array $errors): string
     $h .= '<label>Panel password (min. 12 characters)<input type="password" name="password" required minlength="12" autocomplete="new-password"></label>';
     $h .= '<label>Repeat password<input type="password" name="password2" required minlength="12" autocomplete="new-password"></label>';
     $h .= '<label>Mode<select name="mode">';
-    foreach (['paper' => 'paper - simulated fills, no keys needed', 'testnet' => 'testnet - testnet.binance.vision keys', 'live' => 'live - REAL money'] as $k => $label) {
+    $modeLabels = [
+        'paper'   => 'paper - simulated fills, no keys needed',
+        'demo'    => 'demo - Binance Demo Trading (demo.binance.com keys)',
+        'testnet' => 'testnet - testnet.binance.vision keys',
+        'live'    => 'live - REAL money',
+    ];
+    foreach ($modeLabels as $k => $label) {
         $h .= '<option value="' . $e($k) . '"' . ($v['mode'] === $k ? ' selected' : '') . '>' . $e($label) . '</option>';
     }
     $h .= '</select></label>';
@@ -752,7 +757,7 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     // -- mode & API
     $h .= '<fieldset><legend>Mode &amp; API</legend><div class="grid3">';
     $h .= '<label>Mode<select name="mode">';
-    foreach (['paper', 'testnet', 'live'] as $m) {
+    foreach (['paper', 'demo', 'testnet', 'live'] as $m) {
         $h .= '<option value="' . $e($m) . '"' . ((string) $v['mode'] === $m ? ' selected' : '') . '>' . $e($m) . '</option>';
     }
     $h .= '</select></label>';

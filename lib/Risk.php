@@ -541,10 +541,10 @@ final class Risk
 
         if (array_key_exists('mode', $in)) {
             $mode = strtolower(trim((string) $in['mode']));
-            if (in_array($mode, ['paper', 'testnet', 'live'], true)) {
+            if (in_array($mode, ['paper', 'demo', 'testnet', 'live'], true)) {
                 $cfg['mode'] = $mode;
             } else {
-                $errors[] = 'mode must be paper, testnet or live';
+                $errors[] = 'mode must be paper, demo, testnet or live';
             }
         }
 
@@ -766,7 +766,7 @@ final class Risk
     private static function mode(array $cfg): string
     {
         $m = strtolower(trim((string) ($cfg['mode'] ?? 'paper')));
-        return in_array($m, ['paper', 'testnet', 'live'], true) ? $m : 'paper';
+        return in_array($m, ['paper', 'demo', 'testnet', 'live'], true) ? $m : 'paper';
     }
 
     private static function f(array $cfg, string $key, float $default): float

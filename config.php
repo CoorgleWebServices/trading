@@ -148,7 +148,7 @@ function trader_config_merge(array $cfg): array
     $out['quote_asset'] = strtoupper(trim((string) $out['quote_asset']));
     $out['symbols'] = array_values(array_unique(array_map('strtoupper', $out['symbols'])));
     $out['mode'] = strtolower(trim((string) $out['mode']));
-    if (!in_array($out['mode'], ['paper', 'testnet', 'live'], true)) {
+    if (!in_array($out['mode'], ['paper', 'demo', 'testnet', 'live'], true)) {
         $out['mode'] = 'paper';
     }
     return $out;

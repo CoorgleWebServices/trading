@@ -1340,6 +1340,77 @@ T::group('risk-hwm-rebase', ['Risk', 'Db', 'Util'], static function (): void {
     T::eq('halt', $sv['action'], 'hwm rebase: the absolute equity_floor still halts');
     T::eq('equity_floor', $sv['reason'], 'hwm rebase: reason equity_floor');
 });
+// ---------------------------------------------------------------- networks --
+// Binance Demo Trading (demo.binance.com) is a separate host from the old Spot
+// testnet. Sending demo keys to testnet.binance.vision is what produces
+// "-2015 Invalid API-key, IP, or permissions for action".
+T::group('networks', ['Binance', 'Exchange', 'Db'], static function (): void {
+    T::eq(Binance::NET_PROD, Binance::normalizeNetwork(false), 'legacy false -> prod');
+    T::eq(Binance::NET_TESTNET, Binance::normalizeNetwork(true), 'legacy true -> testnet');
+    T::eq(Binance::NET_PROD, Binance::normalizeNetwork('live'), 'live -> prod');
+    T::eq(Binance::NET_PROD, Binance::normalizeNetwork('paper'), 'paper -> prod (public data only)');
+    T::eq(Binance::NET_DEMO, Binance::normalizeNetwork('demo'), 'demo -> demo');
+    T::eq(Binance::NET_DEMO, Binance::normalizeNetwork(' DEMO '), 'demo is case/space insensitive');
+    T::eq(Binance::NET_TESTNET, Binance::normalizeNetwork('testnet'), 'testnet -> testnet');
+    T::eq(Binance::NET_PROD, Binance::normalizeNetwork('nonsense'), 'unknown -> prod');
+
+    $prod = new Binance('k', 's', 'live');
+    $demo = new Binance('k', 's', 'demo');
+    $test = new Binance('k', 's', 'testnet');
+
+    T::eq('https://api.binance.com', $prod->tradeUrl(), 'prod trade url');
+    T::eq('https://demo-api.binance.com', $demo->tradeUrl(), 'demo trade url');
+    T::eq('https://testnet.binance.vision', $test->tradeUrl(), 'testnet trade url');
+
+    // Only the live network has a separate read-only market-data host; demo and
+    // testnet must serve their own data or prices would not match their books.
+    T::eq('https://data-api.binance.vision', $prod->dataUrl(), 'prod data url is data-api');
+    T::eq('https://demo-api.binance.com', $demo->dataUrl(), 'demo data url is the demo host');
+    T::eq('https://testnet.binance.vision', $test->dataUrl(), 'testnet data url is the testnet host');
+
+    T::eq(false, $prod->isSimulated(), 'live is real money');
+    T::eq(true, $demo->isSimulated(), 'demo is simulated');
+    T::eq(true, $test->isSimulated(), 'testnet is simulated');
+    T::eq(false, $demo->isTestnet(), 'demo is not the testnet');
+
+    // factory: demo behaves like live/testnet (needs keys, yields a LiveExchange)
+    $db = freshDb('networks');
+    $threw = '';
+    try {
+        Exchange::factory(['mode' => 'demo', 'api_key' => '', 'api_secret' => ''], $db);
+    } catch (Throwable $e) {
+        $threw = $e->getMessage();
+    }
+    T::strContains($threw, 'requires a Binance API key', 'demo mode without keys is refused');
+
+    $ex = Exchange::factory(['mode' => 'demo', 'api_key' => 'k', 'api_secret' => 's'], $db);
+    T::eq('demo', $ex->mode(), 'factory returns a demo exchange');
+    T::ok($ex instanceof LiveExchange, 'demo uses the keyed LiveExchange');
+    T::eq('https://demo-api.binance.com', $ex->api()->tradeUrl(), 'demo exchange points at the demo host');
+
+    $threw = '';
+    try {
+        Exchange::factory(['mode' => 'sandbox', 'api_key' => 'k', 'api_secret' => 's'], $db);
+    } catch (Throwable $e) {
+        $threw = $e->getMessage();
+    }
+    T::strContains($threw, 'paper, demo, testnet or live', 'unknown mode names the valid ones');
+
+    // config + settings validation must both accept demo
+    if (function_exists('trader_config_merge')) {
+        $m = trader_config_merge(['mode' => 'demo']);
+        T::eq('demo', $m['mode'], 'config keeps mode demo');
+        $m = trader_config_merge(['mode' => ' DEMO ']);
+        T::eq('demo', $m['mode'], 'config normalises mode case/space');
+        $m = trader_config_merge(['mode' => 'bogus']);
+        T::eq('paper', $m['mode'], 'config falls back to paper on an unknown mode');
+    }
+    if (class_exists('Risk', false)) {
+        list($cfg, $errors) = Risk::validateConfig(['mode' => 'demo'], ['mode' => 'paper']);
+        T::eq('demo', $cfg['mode'], 'validateConfig accepts demo');
+        T::eq(0, count(array_filter($errors, static function ($e) { return strpos($e, 'mode') !== false; })), 'no mode error for demo');
+    }
+});
 
 /* ============================================================ summary */
 
