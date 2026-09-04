@@ -266,3 +266,16 @@ svg.bar rect { fill: var(--accent); }
   label.check.tall { padding-top: 0; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* ---- engines (docs/DESIGN-ENGINES.md §10)
+   Visibility is a CLASS, never an inline style attribute: the CSP forbids inline styles and
+   assets/panel.js toggles .is-hidden on the Settings engine selector's change event. */
+.is-hidden { display: none; }
+.engine-group { margin: 0 0 4px; }
+.engine-group > .flash { margin-top: 4px; }
+.engine-card h2 { gap: .4rem; }
+.engine-kv { align-items: start; gap: 10px 14px; }
+.engine-kv > dl, .engine-kv > div { min-width: 0; }
+.inline-group { display: inline-flex; align-items: center; gap: 8px; }
+.btn-mini { padding: 2px 8px; font-size: .78rem; line-height: 1.5; }
+table.tbl td form.inline { margin: 0; }

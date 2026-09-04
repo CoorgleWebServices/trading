@@ -33,6 +33,17 @@ final class Risk
     const ADAPT_WIN_LOW = 40.0;
     const ADAPT_WIN_HIGH = 60.0;
     const ADAPT_EXPECTANCY_LOW = -0.005;
+    /** Engines (DESIGN-ENGINES.md §2); anything else is treated as 'signal'. */
+    const ENGINES = ['signal', 'grid', 'pmm'];
+    /** Hard ceiling on simultaneously open engine orders (engine_max_orders). */
+    const ENGINE_MAX_ORDERS_CAP = 20;
+    /** Grid rung count bounds. */
+    const GRID_LEVELS_MIN = 1;
+    const GRID_LEVELS_MAX = 20;
+    /** Rung spacing must clear the round trip by this margin, in percent. */
+    const GRID_SPACING_MARGIN = 0.1;
+    /** Default quote per engine order when the key is absent. */
+    const ENGINE_ORDER_USDT_DEFAULT = 1.30;
 
     /* ------------------------------------------------------------ survival */
 
@@ -126,10 +137,21 @@ final class Risk
 
     /**
      * First blocking reason for a NEW entry, checked in the documented order.
+     *
+     * $engine selects the rule set (DESIGN-ENGINES.md §9). `signal` (the default,
+     * so every existing 5-argument-free call keeps its behaviour) applies every
+     * historical block. The continuously quoting engines `grid` and `pmm` ignore
+     * the signal-engine concepts — cooldown, max_trades, max_orders_hour and the
+     * consecutive-loss lockout — because they are not "entries"; they are stopped
+     * only by the capital reasons: halted, disabled, paused (daily / weekly cap),
+     * api_paused and insufficient_quote.
+     *
      * @return string ''|halted|disabled|paused:<reason>|api_paused|cooldown|daily_cap|weekly_cap|max_trades|max_orders_hour|consecutive_losses|insufficient_quote
      */
-    public static function entryBlockReason(array $cfg, Db $db, float $quoteFree, float $equity): string
+    public static function entryBlockReason(array $cfg, Db $db, float $quoteFree, float $equity, string $engine = 'signal'): string
     {
+        $continuous = self::isContinuousEngine($engine);
+
         if (self::isHalted($db)) {
             return 'halted';
         }
@@ -142,7 +164,7 @@ final class Risk
         if (self::isFuture((string) $db->getState('api_paused_until', ''))) {
             return 'api_paused';
         }
-        if (self::isFuture((string) $db->getState('cooldown_until', ''))) {
+        if (!$continuous && self::isFuture((string) $db->getState('cooldown_until', ''))) {
             return 'cooldown';
         }
         if (self::dailyCapHit($cfg, $db, $equity)) {
@@ -151,29 +173,59 @@ final class Risk
         if (self::weeklyCapHit($cfg, $db, $equity)) {
             return 'weekly_cap';
         }
-        $todayStart = Util::todayUtc() . 'T00:00:00Z';
-        if ($db->entriesSince($todayStart, self::mode($cfg)) >= self::effectiveMaxTrades($cfg, $db)) {
-            return 'max_trades';
-        }
-        $hourAgo = Util::nowIso(time() - 3600);
-        if ($db->ordersSince($hourAgo, self::mode($cfg)) >= self::i($cfg, 'max_orders_per_hour', 2)) {
-            return 'max_orders_hour';
-        }
-        $losses = (int) $db->getState('consecutive_losses', '0');
-        if ($losses >= self::i($cfg, 'max_consecutive_losses', 3)) {
-            $lastLoss = (string) $db->getState('last_loss_at', '');
-            if ($lastLoss === '' || substr($lastLoss, 0, 10) === Util::todayUtc()) {
-                return 'consecutive_losses';
+        if (!$continuous) {
+            $todayStart = Util::todayUtc() . 'T00:00:00Z';
+            if ($db->entriesSince($todayStart, self::mode($cfg)) >= self::effectiveMaxTrades($cfg, $db)) {
+                return 'max_trades';
+            }
+            $hourAgo = Util::nowIso(time() - 3600);
+            if ($db->ordersSince($hourAgo, self::mode($cfg)) >= self::i($cfg, 'max_orders_per_hour', 2)) {
+                return 'max_orders_hour';
+            }
+            $losses = (int) $db->getState('consecutive_losses', '0');
+            if ($losses >= self::i($cfg, 'max_consecutive_losses', 3)) {
+                $lastLoss = (string) $db->getState('last_loss_at', '');
+                if ($lastLoss === '' || substr($lastLoss, 0, 10) === Util::todayUtc()) {
+                    return 'consecutive_losses';
+                }
             }
         }
         if (!is_finite($quoteFree) || $quoteFree <= 0) {
             return 'insufficient_quote';
+        }
+        if ($continuous) {
+            // an engine needs enough free quote for one order of its own size
+            $need = max(self::MIN_GENERIC_SIZE, self::engineOrderUsdt($cfg, $engine));
+            return $quoteFree < $need ? 'insufficient_quote' : '';
         }
         $size = min(self::f($cfg, 'trade_usdt', 6.5), self::SIZE_FRACTION * $quoteFree);
         if ($size < self::MIN_GENERIC_SIZE || $quoteFree - $size < self::QUOTE_RESERVE) {
             return 'insufficient_quote';
         }
         return '';
+    }
+
+    /** Normalised engine name from the config: signal | grid | pmm. */
+    public static function engineName(array $cfg): string
+    {
+        $e = strtolower(trim((string) ($cfg['engine'] ?? 'signal')));
+        return in_array($e, self::ENGINES, true) ? $e : 'signal';
+    }
+
+    /** true for the continuously quoting engines (grid, pmm). */
+    public static function isContinuousEngine(string $engine): bool
+    {
+        $e = strtolower(trim($engine));
+        return $e === 'grid' || $e === 'pmm';
+    }
+
+    /** Quote per order for one engine (grid_order_usdt / pmm_order_usdt). */
+    public static function engineOrderUsdt(array $cfg, string $engine): float
+    {
+        $e   = strtolower(trim($engine));
+        $key = $e === 'pmm' ? 'pmm_order_usdt' : 'grid_order_usdt';
+        $v   = self::f($cfg, $key, self::ENGINE_ORDER_USDT_DEFAULT);
+        return $v > 0 ? $v : self::ENGINE_ORDER_USDT_DEFAULT;
     }
 
     /* -------------------------------------------------------------- sizing */
@@ -460,14 +512,21 @@ final class Risk
     /* ---------------------------------------------------------- validation */
 
     /**
-     * Sanitise every §3 key found in $in on top of $current. Invalid values are
-     * reported in errors[] and the current value is kept.
-     * @return array [cfg, errors[]]
+     * Sanitise every DESIGN.md §3 and DESIGN-ENGINES.md §2 key found in $in on top
+     * of $current. Invalid values are reported in errors[] and the current value is
+     * kept; configurations that are legal but dangerous are reported in warnings[]
+     * and ARE applied (the panel shows them next to the saved settings).
+     *
+     * The third element is additive: `list($cfg, $errors) = Risk::validateConfig(...)`
+     * keeps working unchanged.
+     *
+     * @return array [cfg, errors[], warnings[]]
      */
     public static function validateConfig(array $in, array $current): array
     {
-        $cfg    = $current;
-        $errors = [];
+        $cfg      = $current;
+        $errors   = [];
+        $warnings = [];
 
         $numeric = [
             'trade_usdt'                  => ['f', 1.0, 100000.0],
@@ -496,6 +555,18 @@ final class Risk
             'fee_pct'                     => ['f', 0.0, 1.0],
             'paper_start_usdt'            => ['f', 1.0, 1000000.0],
             'recv_window'                 => ['i', 1000, 60000],
+            // engines (DESIGN-ENGINES.md §2)
+            'grid_levels'                 => ['i', self::GRID_LEVELS_MIN, self::GRID_LEVELS_MAX],
+            'grid_spacing_pct'            => ['f', 0.01, 50.0],
+            'grid_order_usdt'             => ['f', self::MIN_GENERIC_SIZE, 100000.0],
+            'grid_range_up_pct'           => ['f', 0.1, 500.0],
+            'grid_range_down_pct'         => ['f', 0.1, 99.0],
+            'pmm_spread_pct'              => ['f', 0.0, 50.0, true],
+            'pmm_order_usdt'              => ['f', self::MIN_GENERIC_SIZE, 100000.0],
+            'pmm_refresh_sec'             => ['i', 5, 86400],
+            'pmm_target_base_pct'         => ['f', 0.0, 100.0],
+            'pmm_max_base_pct'            => ['f', 1.0, 100.0],
+            'engine_max_orders'           => ['i', 1, self::ENGINE_MAX_ORDERS_CAP],
         ];
         foreach ($numeric as $key => $spec) {
             if (!array_key_exists($key, $in)) {
@@ -533,7 +604,7 @@ final class Risk
             }
         }
 
-        foreach (['enabled', 'adaptive', 'force_https'] as $key) {
+        foreach (['enabled', 'adaptive', 'force_https', 'allow_live_engines', 'grid_exit_liquidates', 'post_only'] as $key) {
             if (array_key_exists($key, $in)) {
                 $cfg[$key] = self::toBool($in[$key]);
             }
@@ -598,6 +669,26 @@ final class Risk
                 } else {
                     $cfg['symbols'] = array_keys($clean);
                 }
+            }
+        }
+
+        if (array_key_exists('engine', $in)) {
+            $eng = strtolower(trim((string) $in['engine']));
+            if (in_array($eng, self::ENGINES, true)) {
+                $cfg['engine'] = $eng;
+            } else {
+                $errors[] = 'engine must be ' . implode(', ', self::ENGINES);
+            }
+        }
+
+        if (array_key_exists('engine_symbol', $in)) {
+            $sym     = strtoupper(trim((string) $in['engine_symbol']));
+            $okChars = preg_match('/^[A-Z0-9]{3,20}$/', $sym) === 1;
+            $okQuote = strlen($sym) > strlen($quote) && substr($sym, -strlen($quote)) === $quote;
+            if ($okChars && $okQuote) {
+                $cfg['engine_symbol'] = $sym;
+            } else {
+                $errors[] = 'engine_symbol must be uppercase and end with ' . $quote;
             }
         }
 
@@ -670,9 +761,10 @@ final class Risk
                 $cfg['take_profit_pct'] = $minTp;
             }
         }
-        if ($tpMax < (float) $cfg['take_profit_pct']) {
+        $tpEff = (float) ($cfg['take_profit_pct'] ?? $tp);
+        if ($tpMax < $tpEff) {
             $errors[] = 'take_profit_max_pct must be >= take_profit_pct';
-            $cfg['take_profit_max_pct'] = (float) $cfg['take_profit_pct'];
+            $cfg['take_profit_max_pct'] = $tpEff;
         }
         if ((float) ($cfg['atr_min_pct'] ?? 0.3) >= (float) ($cfg['atr_max_pct'] ?? 1.5)) {
             $errors[] = 'atr_min_pct must be lower than atr_max_pct';
@@ -694,7 +786,138 @@ final class Risk
             $cfg['cooldown_after_2_losses_min'] = max((int) ($current['cooldown_after_2_losses_min'] ?? 180), (int) $cfg['cooldown_after_loss_min']);
         }
 
-        return [$cfg, $errors];
+        /* ---- engine cross-field rules (DESIGN-ENGINES.md §2) ---- */
+        $engine    = self::engineName($cfg);
+        // only the SELECTED engine is cross-checked: the settings form posts every
+        // grid_*/pmm_* key on every save (index.php settings_keys(); the non-selected
+        // groups are hidden by class, not disabled), so keying this off key presence
+        // would block a signal-engine user from saving anything (DESIGN-ENGINES.md §2).
+        $checkGrid = $engine === 'grid';
+        $checkPmm  = $engine === 'pmm';
+        $sizeKeys = [];
+
+        if ($checkGrid) {
+            // a rung must earn more than the round trip it costs: this is an ERROR, not a warning
+            $spacing    = self::f($cfg, 'grid_spacing_pct', 0.60);
+            $minSpacing = 2.0 * $fee + self::GRID_SPACING_MARGIN;
+            if ($spacing < $minSpacing - 1e-9) {
+                $errors[] = 'grid_spacing_pct must be at least 2x fee_pct + '
+                    . self::fmtBound(self::GRID_SPACING_MARGIN) . ' (' . self::fmtBound($minSpacing) . '%)';
+                $keep = self::f($current, 'grid_spacing_pct', $minSpacing);
+                $cfg['grid_spacing_pct'] = $keep >= $minSpacing ? $keep : $minSpacing;
+            }
+            $levels = self::i($cfg, 'grid_levels', 6);
+            $maxOrd = self::i($cfg, 'engine_max_orders', 12);
+            if ($levels > $maxOrd) {
+                $warnings[] = 'grid_levels (' . $levels . ') is above engine_max_orders (' . $maxOrd
+                    . '); the ladder will be capped at ' . $maxOrd . ' live orders';
+            }
+            $sizeKeys[] = 'grid_order_usdt';
+        }
+
+        if ($checkPmm) {
+            $target  = self::f($cfg, 'pmm_target_base_pct', 50.0);
+            $maxBase = self::f($cfg, 'pmm_max_base_pct', 80.0);
+            if ($maxBase <= $target) {
+                $errors[] = 'pmm_max_base_pct must be greater than pmm_target_base_pct';
+                $cfg['pmm_target_base_pct'] = self::f($current, 'pmm_target_base_pct', 50.0);
+                $cfg['pmm_max_base_pct']    = self::f($current, 'pmm_max_base_pct', 80.0);
+            }
+            $sizeKeys[] = 'pmm_order_usdt';
+        }
+
+        // order size vs the symbol's filters: an error when the filters are known, a warning otherwise
+        if ($sizeKeys !== []) {
+            $ref     = self::engineSymbolReference($cfg);
+            $refName = $ref['symbol'] !== '' ? $ref['symbol'] : 'the engine symbol';
+            foreach ($sizeKeys as $key) {
+                $size = self::f($cfg, $key, self::ENGINE_ORDER_USDT_DEFAULT);
+                if ($ref['info'] !== null && $ref['price'] > 0) {
+                    $required = self::requiredSize($ref['info'], $ref['price'], $fee);
+                    if ($size < $required - 1e-9) {
+                        $errors[] = $key . ' must be at least the required size for ' . $refName
+                            . ' (' . self::fmtBound($required) . ' ' . $quote . ')';
+                    }
+                } else {
+                    $warnings[] = $key . ' could not be checked against ' . $refName
+                        . ' (no symbol info yet); make sure it clears minNotional';
+                }
+            }
+        }
+
+        if ($checkGrid) {
+            $ladder    = self::f($cfg, 'grid_order_usdt', self::ENGINE_ORDER_USDT_DEFAULT) * (float) self::i($cfg, 'grid_levels', 6);
+            $quoteFree = self::lastQuoteFree();
+            if ($quoteFree <= 0) {
+                $warnings[] = 'the full ladder costs ' . self::fmtBound($ladder) . ' ' . $quote
+                    . '; the free ' . $quote . ' balance is not known yet (no equity sample),'
+                    . ' so make sure the account holds at least that much before enabling the engine';
+            } elseif ($ladder > 0.9 * $quoteFree) {
+                $warnings[] = 'the full ladder costs ' . self::fmtBound($ladder) . ' ' . $quote
+                    . ', more than 90% of the free ' . $quote . ' (' . self::fmtBound($quoteFree)
+                    . '); the lower rungs will not be funded';
+            }
+        }
+
+        if ($engine === 'grid' || $engine === 'pmm') {
+            if (self::mode($cfg) === 'live' && !self::b($cfg, 'allow_live_engines', false)) {
+                $warnings[] = 'engine ' . $engine . ' is saved but will place no order in live mode'
+                    . ' until allow_live_engines is enabled';
+            }
+            if ($engine === 'pmm') {
+                $warnings[] = 'pmm is expected to LOSE money at VIP0 fees: a round trip costs '
+                    . self::fmtBound(2.0 * $fee) . '% while typical spreads on the majors are 0.01-0.05%';
+            }
+        }
+
+        return [$cfg, $errors, $warnings];
+    }
+
+    /**
+     * Symbol info and last known price for the configured engine symbol, read
+     * best-effort from the cached state (`symbol_info`, `symbol_metrics`) of the
+     * open database. Returns ['symbol'=>string, 'info'=>?array, 'price'=>float];
+     * info is null whenever nothing is cached — the validator then downgrades the
+     * filter check to a warning instead of inventing a limit.
+     */
+    private static function engineSymbolReference(array $cfg): array
+    {
+        $out = ['symbol' => strtoupper(trim((string) ($cfg['engine_symbol'] ?? ''))), 'info' => null, 'price' => 0.0];
+        if ($out['symbol'] === '' || !defined('TRADER_ROOT')) {
+            return $out;
+        }
+        try {
+            $db   = Db::get();
+            $all  = $db->getStateJson('symbol_info', null);
+            if (is_array($all) && isset($all[$out['symbol']]) && is_array($all[$out['symbol']])) {
+                $out['info'] = $all[$out['symbol']];
+            }
+            $metrics = $db->getStateJson('symbol_metrics', null);
+            if (is_array($metrics) && isset($metrics[$out['symbol']]['price']) && is_numeric($metrics[$out['symbol']]['price'])) {
+                $out['price'] = (float) $metrics[$out['symbol']]['price'];
+            }
+        } catch (Throwable $e) {
+            return ['symbol' => $out['symbol'], 'info' => null, 'price' => 0.0];
+        }
+        return $out;
+    }
+
+    /** Free quote of the newest equity sample, or 0.0 when unknown (best-effort). */
+    private static function lastQuoteFree(): float
+    {
+        if (!defined('TRADER_ROOT')) {
+            return 0.0;
+        }
+        try {
+            $rows = Db::get()->equitySeries(1);
+            $row  = $rows === [] ? null : $rows[count($rows) - 1];
+            if (is_array($row) && isset($row['quote_free']) && is_numeric($row['quote_free'])) {
+                return (float) $row['quote_free'];
+            }
+        } catch (Throwable $e) {
+            return 0.0;
+        }
+        return 0.0;
     }
 
     /* ------------------------------------------------------------- helpers */
@@ -747,7 +970,8 @@ final class Risk
         if ($cap <= 0 || $ref <= 0) {
             return false;
         }
-        $pnl = $db->realisedPnl(Util::todayUtc() . 'T00:00:00Z', self::mode($cfg));
+        $since = Util::todayUtc() . 'T00:00:00Z';
+        $pnl   = $db->realisedPnl($since, self::mode($cfg)) + $db->cyclePnl($since, self::mode($cfg));
         return $pnl <= -($ref * $cap / 100.0);
     }
 
@@ -758,7 +982,8 @@ final class Risk
         if ($cap <= 0 || $ref <= 0) {
             return false;
         }
-        $pnl = $db->realisedPnl(Util::nowIso(time() - 7 * 86400), self::mode($cfg));
+        $since = Util::nowIso(time() - 7 * 86400);
+        $pnl   = $db->realisedPnl($since, self::mode($cfg)) + $db->cyclePnl($since, self::mode($cfg));
         return $pnl <= -($ref * $cap / 100.0);
     }
 

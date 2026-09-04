@@ -288,6 +288,127 @@ final class Util
         return $out === '' ? '0' : $out;
     }
 
+    /**
+     * Exact rounding of a price to a multiple of $tickSize (Binance PRICE_FILTER tickSize),
+     * mirroring floorToStep(): bcmath when the extension is loaded, integer math otherwise.
+     *
+     * $dir is 'down' (floor, used for BUY prices), 'up' (ceil, used for SELL prices) or
+     * 'nearest' (half away from zero). Buy prices round down and sell prices round up so a
+     * post-only quote always stays passive.
+     *
+     * The result is a plain decimal string carrying exactly the tick's number of decimals
+     * ("0.00002", "123.45", "6"): never exponent notation, never a negative zero. A
+     * non-finite or non-positive price yields zero at the tick's precision; a zero or
+     * negative tick returns the price unchanged (as a plain decimal string).
+     */
+    public static function roundToTick(float $price, string $tickSize, string $dir = 'nearest'): string
+    {
+        $t = self::toDecimalString($tickSize);
+        $d = self::decimalsOf($t);
+        if (!is_finite($price) || $price <= 0.0) {
+            return self::padDecimals('0', $d);
+        }
+        $p = self::toDecimalString($price);
+        if ($t === '0' || $t[0] === '-') {
+            return $p;
+        }
+        if (extension_loaded('bcmath')) {
+            return self::roundToTickBcmath($p, $t, $dir);
+        }
+        return self::roundToTickInteger($p, $t, $dir);
+    }
+
+    /** 'down' | 'up' | 'nearest'; anything unrecognised is treated as 'nearest'. */
+    private static function roundDir(string $dir): string
+    {
+        $d = strtolower(trim($dir));
+        if ($d === 'down' || $d === 'floor' || $d === 'd') {
+            return 'down';
+        }
+        if ($d === 'up' || $d === 'ceil' || $d === 'u') {
+            return 'up';
+        }
+        return 'nearest';
+    }
+
+    /** bcmath implementation of roundToTick; inputs must be plain positive decimal strings. */
+    public static function roundToTickBcmath(string $p, string $t, string $dir): string
+    {
+        $dir = self::roundDir($dir);
+        $p   = self::toDecimalString($p);
+        $t   = self::toDecimalString($t);
+        $d   = self::decimalsOf($t);
+        $e   = max($d, self::decimalsOf($p));
+        if (bccomp($t, '0', $e) <= 0) {
+            return self::trimZeros($p);
+        }
+        $n    = bcdiv($p, $t, 0);            // truncates toward zero == floor for positive values
+        $down = bcmul($n, $t, $e);
+        $rem  = bcsub($p, $down, $e);
+        $res  = $down;
+        if (bccomp($rem, '0', $e) > 0
+            && ($dir === 'up' || ($dir === 'nearest' && bccomp(bcmul($rem, '2', $e), $t, $e) >= 0))) {
+            $res = bcadd($down, $t, $e);
+        }
+        return self::padDecimals(self::trimZeros($res), $d);
+    }
+
+    /** Pure-integer implementation of roundToTick (no extension needed); inputs are plain positive decimal strings. */
+    public static function roundToTickInteger(string $p, string $t, string $dir): string
+    {
+        $dir = self::roundDir($dir);
+        $p   = self::toDecimalString($p);
+        $t   = self::toDecimalString($t);
+        $d   = self::decimalsOf($t);
+        $e   = max($d, self::decimalsOf($p));   // exact: both strings fit in $e decimals
+        $pi  = self::scaleToInt($p, $e);
+        $ti  = self::scaleToInt($t, $e);
+        if ($ti === '0') {
+            return self::trimZeros($p);
+        }
+        if (strlen($ti) > 18) {
+            // tick larger than 10^18 units — not a real exchange filter; be conservative
+            throw new InvalidArgumentException('Tick too large for integer arithmetic: ' . $t);
+        }
+        $tn = (int) $ti;
+        if (strlen($pi) <= 18) {
+            $pn  = (int) $pi;
+            $r   = $pn % $tn;
+            $res = $pn - $r;
+            if ($r > 0 && ($dir === 'up' || ($dir === 'nearest' && ($tn - $r) <= $r))) {
+                $res += $tn;
+            }
+            return self::padDecimals(self::unscaleInt((string) $res, $e), $d);
+        }
+        $r   = self::strMod($pi, $tn);
+        $res = self::strSubSmall($pi, $r);
+        if ($r > 0 && ($dir === 'up' || ($dir === 'nearest' && ($tn - $r) <= $r))) {
+            $res = self::strAddSmall($res, $tn);
+        }
+        return self::padDecimals(self::unscaleInt($res, $e), $d);
+    }
+
+    /** Non-negative digit string plus a non-negative int (carry propagated, no overflow). */
+    public static function strAddSmall(string $digits, int $add): string
+    {
+        $out   = $digits;
+        $carry = $add;
+        for ($i = strlen($out) - 1; $i >= 0 && $carry > 0; $i--) {
+            $cur   = (ord($out[$i]) - 48) + ($carry % 10);
+            $carry = intdiv($carry, 10);
+            if ($cur > 9) {
+                $cur -= 10;
+                $carry++;
+            }
+            $out[$i] = chr(48 + $cur);
+        }
+        if ($carry > 0) {
+            $out = (string) $carry . $out;
+        }
+        $out = ltrim($out, '0');
+        return $out === '' ? '0' : $out;
+    }
+
     /* ------------------------------------------------------------- formatting */
 
     /** sprintf('%.{d}F') with trailing zeros trimmed; never exponent notation. */

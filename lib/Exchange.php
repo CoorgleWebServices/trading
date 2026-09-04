@@ -230,6 +230,36 @@ final class LiveExchange implements ExchangeInterface
         return Binance::normalizeOrder($raw, $info, $this->bnbPriceFor($raw, $info));
     }
 
+    // ---- limit orders (DESIGN-ENGINES.md §3)
+
+    /** LIMIT (GTC) or LIMIT_MAKER when $postOnly; $qtyStr/$priceStr are pre-rounded exact strings. */
+    public function limitOrder(string $symbol, string $side, string $qtyStr, string $priceStr, array $info, string $clientId, bool $postOnly): array
+    {
+        $raw = $this->api->limitOrder($symbol, $side, $qtyStr, $priceStr, $clientId, $postOnly);
+        if (count($info) === 0) {
+            $info = $this->infoFor($symbol);
+        }
+        return Binance::normalizeOrder($raw, $info, $this->bnbPriceFor($raw, $info));
+    }
+
+    /** DELETE /api/v3/order. A -2011 (already filled or gone) is reported, not thrown. */
+    public function cancelOrder(string $symbol, string $clientId): array
+    {
+        return $this->api->cancelOrder($symbol, $clientId);
+    }
+
+    /** DELETE /api/v3/openOrders: cancels every resting order of $symbol. */
+    public function cancelAllOrders(string $symbol): array
+    {
+        return $this->api->cancelAllOrders($symbol);
+    }
+
+    /** GET /api/v3/openOrders?symbol=… (symbol is always sent: unfiltered costs weight 80). */
+    public function openOrders(string $symbol): array
+    {
+        return $this->api->openOrders($symbol);
+    }
+
     // ---- helpers
 
     private function infoFor(string $symbol): array
@@ -291,6 +321,15 @@ final class PaperExchange implements ExchangeInterface
 {
     const STATE_KEY = 'paper_balances';
 
+    /** Resting limit orders, persisted so a ladder survives between cron ticks. */
+    const ORDERS_KEY = 'paper_orders';
+
+    /** Quantities and notionals below this are treated as zero. */
+    const EPS = 1.0e-12;
+
+    /** Terminal orders retained for getOrder() before the oldest are dropped. */
+    const KEEP_TERMINAL = 300;
+
     /** @var MarketDataInterface */
     private $md;
     /** @var Db */
@@ -305,6 +344,10 @@ final class PaperExchange implements ExchangeInterface
     private $balances = [];
     /** @var int */
     private $seq = 0;
+    /** @var array clientId => resting/terminal limit order row */
+    private $orders = [];
+    /** @var bool reentrancy guard: matching reads the book, the book triggers matching */
+    private $matching = false;
 
     public function __construct(MarketDataInterface $md, Db $db, float $feePct, float $startUsdt, string $quote = 'USDT')
     {
@@ -335,11 +378,13 @@ final class PaperExchange implements ExchangeInterface
         return $this->fee * 100.0;
     }
 
-    /** Resets balances to the starting quote amount. */
+    /** Resets balances to the starting quote amount and forgets every simulated order. */
     public function reset(): void
     {
         $this->balances = [$this->quote => $this->startUsdt];
+        $this->orders   = [];
         $this->save();
+        $this->saveOrders();
     }
 
     /** @return array [asset => free] */
@@ -384,11 +429,19 @@ final class PaperExchange implements ExchangeInterface
 
     public function account(): array
     {
+        $this->matchOrders();
         $balances = [];
-        foreach ($this->balances as $asset => $free) {
-            $free = (float)$free;
-            if ($free > 0.0) {
-                $balances[(string)$asset] = ['free' => $free, 'locked' => 0.0];
+        $assets   = array_keys($this->balances);
+        foreach (array_keys($this->lockedAll()) as $a) {
+            if (!in_array($a, $assets, true)) {
+                $assets[] = $a;
+            }
+        }
+        foreach ($assets as $asset) {
+            $free   = $this->balanceOf((string)$asset);
+            $locked = $this->lockedOf((string)$asset);
+            if ($free > 0.0 || $locked > 0.0) {
+                $balances[(string)$asset] = ['free' => $free, 'locked' => $locked];
             }
         }
         return [
@@ -526,9 +579,13 @@ final class PaperExchange implements ExchangeInterface
         return $result;
     }
 
-    /** Returns the recorded fill for a paper order, or null when the order was never filled here. */
+    /** Returns the state of a paper order (limit orders first), or null when this exchange never saw it. */
     public function getOrder(string $symbol, string $clientId): ?array
     {
+        $this->matchOrders();
+        if (isset($this->orders[$clientId])) {
+            return $this->normalise($this->orders[$clientId]);
+        }
         try {
             $st = $this->db->pdo()->prepare('SELECT status, raw FROM orders WHERE client_id = ? AND mode = ? LIMIT 1');
             $st->execute([$clientId, 'paper']);
@@ -548,10 +605,220 @@ final class PaperExchange implements ExchangeInterface
         return $result;
     }
 
+    // ---- limit orders (DESIGN-ENGINES.md §11: a resting order fills when the book crosses it)
+
+    /**
+     * Post one LIMIT (GTC) or LIMIT_MAKER order. $qtyStr/$priceStr are the exact pre-rounded
+     * decimal strings (Util::floorToStep / Util::roundToTick) the real API is sent.
+     *
+     * A post-only order that would cross the book is rejected with -2010 "would immediately
+     * match and take" — the rejection DESIGN-ENGINES.md §3 calls normal. A plain LIMIT that
+     * crosses fills at once. Everything else rests until the book reaches it, and the funds it
+     * needs are locked exactly as the exchange locks them.
+     */
+    public function limitOrder(string $symbol, string $side, string $qtyStr, string $priceStr, array $info, string $clientId, bool $postOnly): array
+    {
+        $symbol = strtoupper($symbol);
+        $side   = strtoupper(trim($side)) === 'SELL' ? 'SELL' : 'BUY';
+        $qty    = (float)$qtyStr;
+        $price  = (float)$priceStr;
+        $base   = $this->baseOf($symbol, $info);
+        if ($qty <= 0.0 || $price <= 0.0) {
+            throw new BinanceException('Paper ' . $side . ' ' . $symbol . ': quantity and price must be positive', -1013, 400);
+        }
+        if (isset($this->orders[$clientId])) {
+            throw new BinanceException('Duplicate order sent.', -2010, 400);
+        }
+        $minQty = (float)($info['minQty'] ?? 0);
+        if ($minQty > 0.0 && $qty + self::EPS < $minQty) {
+            throw new BinanceException('Filter failure: LOT_SIZE', -1013, 400);
+        }
+        $minNotional = (float)($info['minNotional'] ?? 0);
+        if ($minNotional > 0.0 && $qty * $price + 1e-9 < $minNotional) {
+            throw new BinanceException('Filter failure: NOTIONAL', -1013, 400);
+        }
+
+        $book    = $this->bookOf($symbol);
+        $crosses = $book !== null
+            && ($side === 'BUY' ? ($book['ask'] <= $price + self::EPS) : ($book['bid'] + self::EPS >= $price));
+        if ($crosses && $postOnly) {
+            throw new BinanceException('Order would immediately match and take.', -2010, 400);
+        }
+
+        // lock the funds the resting order needs, exactly like the exchange does
+        if ($side === 'BUY') {
+            $need = $qty * $price;
+            if ($this->balanceOf($this->quote) + 1e-9 < $need) {
+                throw new BinanceException('Account has insufficient balance for requested action.', -2010, 400);
+            }
+            $this->balances[$this->quote] = $this->balanceOf($this->quote) - $need;
+        } else {
+            if ($this->balanceOf($base) + 1e-9 < $qty) {
+                throw new BinanceException('Account has insufficient balance for requested action.', -2010, 400);
+            }
+            $this->balances[$base] = $this->balanceOf($base) - $qty;
+        }
+        $this->save();
+
+        $now = Util::nowMs();
+        $this->orders[$clientId] = [
+            'client_id'    => $clientId,
+            'order_id'     => $this->nextOrderId(),
+            'symbol'       => $symbol,
+            'base'         => $base,
+            'side'         => $side,
+            'type'         => $postOnly ? 'LIMIT_MAKER' : 'LIMIT',
+            'price'        => $price,
+            'price_str'    => $priceStr,
+            'qty'          => $qty,
+            'qty_str'      => $qtyStr,
+            'step'         => (string)($info['stepSize'] ?? '0.00000001'),
+            'status'       => 'NEW',
+            'executed_qty' => 0.0,
+            'cum_quote'    => 0.0,
+            'net_qty'      => 0.0,
+            'dust_qty'     => 0.0,
+            'fee'          => 0.0,
+            'fee_asset'    => '',
+            'proceeds'     => 0.0,
+            'time'         => $now,
+        ];
+        if ($crosses) {
+            $this->fillOrder($clientId);   // a plain LIMIT that crosses takes immediately
+        }
+        $this->saveOrders();
+        return $this->normalise($this->orders[$clientId]);
+    }
+
+    /** DELETE /api/v3/order. An order that already filled or vanished answers -2011, like Binance. */
+    public function cancelOrder(string $symbol, string $clientId): array
+    {
+        $this->matchOrders();
+        if (!isset($this->orders[$clientId]) || $this->orders[$clientId]['status'] !== 'NEW') {
+            throw new BinanceException('Unknown order sent.', -2011, 400);
+        }
+        $this->releaseOrder($clientId);
+        $this->orders[$clientId]['status'] = 'CANCELED';
+        $this->saveOrders();
+        return $this->rawOrder($this->orders[$clientId]);
+    }
+
+    /** DELETE /api/v3/openOrders: cancels every resting order of $symbol. */
+    public function cancelAllOrders(string $symbol): array
+    {
+        $this->matchOrders();
+        $symbol = strtoupper($symbol);
+        $out    = [];
+        foreach ($this->orders as $cid => $o) {
+            if ($o['status'] !== 'NEW' || $o['symbol'] !== $symbol) {
+                continue;
+            }
+            $this->releaseOrder((string)$cid);
+            $this->orders[$cid]['status'] = 'CANCELED';
+            $out[] = $this->rawOrder($this->orders[$cid]);
+        }
+        if (count($out) > 0) {
+            $this->saveOrders();
+        }
+        return $out;
+    }
+
+    /**
+     * GET /api/v3/openOrders?symbol=… normalised to the DESIGN-ENGINES.md §3 shape:
+     * [clientOrderId => ['order_id','symbol','side','price','orig_qty','executed_qty','status','time']].
+     */
+    public function openOrders(string $symbol): array
+    {
+        $this->matchOrders();
+        $symbol = strtoupper($symbol);
+        $out    = [];
+        foreach ($this->orders as $o) {
+            if ($o['symbol'] !== $symbol || ($o['status'] !== 'NEW' && $o['status'] !== 'PARTIALLY_FILLED')) {
+                continue;
+            }
+            $out[(string)$o['client_id']] = [
+                'order_id'     => (string)$o['order_id'],
+                'symbol'       => (string)$o['symbol'],
+                'side'         => (string)$o['side'],
+                'price'        => (float)$o['price'],
+                'orig_qty'     => (float)$o['qty'],
+                'executed_qty' => (float)$o['executed_qty'],
+                'status'       => (string)$o['status'],
+                'time'         => (int)$o['time'],
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Fill every resting order the book has crossed: BUY when ask <= price, SELL when bid >= price.
+     * Idempotent — a filled order is never matched twice. Runs lazily from the market-data and
+     * account calls, so a caller only has to move the price and tick again.
+     *
+     * @return int number of orders filled by this pass
+     */
+    public function matchOrders(): int
+    {
+        if ($this->matching) {
+            return 0;
+        }
+        $this->matching = true;
+        $filled = 0;
+        try {
+            foreach ($this->orders as $cid => $o) {
+                if ($o['status'] !== 'NEW') {
+                    continue;
+                }
+                $book = $this->bookOf((string)$o['symbol']);
+                if ($book === null) {
+                    continue;
+                }
+                if ($o['side'] === 'BUY' ? ($book['ask'] <= $o['price'] + self::EPS) : ($book['bid'] + self::EPS >= $o['price'])) {
+                    $this->fillOrder((string)$cid);
+                    $filled++;
+                }
+            }
+        } finally {
+            $this->matching = false;
+        }
+        if ($filled > 0) {
+            $this->saveOrders();
+        }
+        return $filled;
+    }
+
+    /** Number of orders still resting (optionally for one symbol only). */
+    public function openOrderCount(string $symbol = ''): int
+    {
+        $symbol = strtoupper($symbol);
+        $n = 0;
+        foreach ($this->orders as $o) {
+            if ($o['status'] === 'NEW' && ($symbol === '' || $o['symbol'] === $symbol)) {
+                $n++;
+            }
+        }
+        return $n;
+    }
+
+    /** Quote/base funds currently locked by resting orders. */
+    public function lockedOf(string $asset): float
+    {
+        $all = $this->lockedAll();
+        return isset($all[$asset]) ? $all[$asset] : 0.0;
+    }
+
     // ---- internals
 
     private function load(): void
     {
+        $stored = $this->db->getStateJson(self::ORDERS_KEY, null);
+        if (is_array($stored)) {
+            foreach ($stored as $cid => $row) {
+                if (is_array($row) && isset($row['client_id'])) {
+                    $this->orders[(string)$cid] = $row;
+                }
+            }
+        }
         $stored = $this->db->getStateJson(self::STATE_KEY, null);
         if (is_array($stored) && count($stored) > 0) {
             $this->balances = [];
@@ -574,6 +841,157 @@ final class PaperExchange implements ExchangeInterface
         }
         $this->balances = $clean;
         $this->db->setState(self::STATE_KEY, $clean);
+    }
+
+    /** Persists the simulated order book, keeping the resting orders and the newest terminal ones. */
+    private function saveOrders(): void
+    {
+        $live = [];
+        $done = [];
+        foreach ($this->orders as $cid => $o) {
+            if ($o['status'] === 'NEW' || $o['status'] === 'PARTIALLY_FILLED') {
+                $live[(string)$cid] = $o;
+            } else {
+                $done[(string)$cid] = $o;
+            }
+        }
+        if (count($done) > self::KEEP_TERMINAL) {
+            $done = array_slice($done, -self::KEEP_TERMINAL, null, true);
+        }
+        $this->orders = $live + $done;
+        $this->db->setState(self::ORDERS_KEY, $this->orders);
+    }
+
+    /**
+     * Fill a resting order completely at its own price, with the fee and dust accounting of the
+     * market fills: a BUY pays its commission in the base asset (so the sellable quantity is
+     * floored to the step and the remainder is dust), a SELL pays it in the quote asset.
+     */
+    private function fillOrder(string $clientId): void
+    {
+        $o = $this->orders[$clientId];
+        if ($o['status'] !== 'NEW') {
+            return;
+        }
+        $qty   = (float)$o['qty'];
+        $price = (float)$o['price'];
+        if ($o['side'] === 'BUY') {
+            // the quote was taken out of free at placement and is spent here
+            $spent      = $qty * $price;
+            $commission = $qty * $this->fee;
+            $net        = $qty - $commission;
+            $sellable   = (float)Util::floorToStep(self::roundStr($net), (string)$o['step']);
+            $this->balances[$o['base']] = $this->balanceOf((string)$o['base']) + $net;
+            $o['cum_quote'] = $spent;
+            $o['net_qty']   = $sellable;
+            $o['dust_qty']  = max(0.0, $net - $sellable);
+            $o['fee']       = $commission * $price;
+            $o['fee_asset'] = (string)$o['base'];
+            $o['proceeds']  = $spent;
+        } else {
+            // the base was taken out of free at placement and is delivered here
+            $gross   = $qty * $price;
+            $feeUsdt = $gross * $this->fee;
+            $this->balances[$this->quote] = $this->balanceOf($this->quote) + ($gross - $feeUsdt);
+            $o['cum_quote'] = $gross;
+            $o['net_qty']   = $qty;
+            $o['dust_qty']  = 0.0;
+            $o['fee']       = $feeUsdt;
+            $o['fee_asset'] = $this->quote;
+            $o['proceeds']  = $gross - $feeUsdt;
+        }
+        $o['executed_qty'] = $qty;
+        $o['status']       = 'FILLED';
+        $this->orders[$clientId] = $o;
+        $this->save();
+    }
+
+    /** Give the funds a resting order still locks back to the free balance. */
+    private function releaseOrder(string $clientId): void
+    {
+        $o = $this->orders[$clientId];
+        if ($o['side'] === 'BUY') {
+            $this->balances[$this->quote] = $this->balanceOf($this->quote) + (float)$o['qty'] * (float)$o['price'];
+        } else {
+            $this->balances[$o['base']] = $this->balanceOf((string)$o['base']) + (float)$o['qty'];
+        }
+        $this->save();
+    }
+
+    /**
+     * Funds locked by the resting orders, derived rather than stored so the locked amounts can
+     * never drift away from the orders that cause them.
+     *
+     * @return array [asset => locked]
+     */
+    private function lockedAll(): array
+    {
+        $out = [];
+        foreach ($this->orders as $o) {
+            if ($o['status'] !== 'NEW' && $o['status'] !== 'PARTIALLY_FILLED') {
+                continue;
+            }
+            if ($o['side'] === 'BUY') {
+                $asset  = $this->quote;
+                $amount = (float)$o['qty'] * (float)$o['price'];
+            } else {
+                $asset  = (string)$o['base'];
+                $amount = (float)$o['qty'];
+            }
+            $out[$asset] = (isset($out[$asset]) ? $out[$asset] : 0.0) + $amount;
+        }
+        return $out;
+    }
+
+    /** Normalised order state in the Binance::normalizeOrder() shape EngineOrders books. */
+    private function normalise(array $o): array
+    {
+        return [
+            'qty'       => (float)$o['net_qty'],
+            'dust_qty'  => (float)$o['dust_qty'],
+            'price'     => (float)$o['price'],
+            'quote'     => (float)$o['proceeds'],
+            'fee_usdt'  => (float)$o['fee'],
+            'fee_asset' => (string)$o['fee_asset'],
+            'order_id'  => (string)$o['order_id'],
+            'status'    => (string)$o['status'],
+            'raw'       => $this->rawOrder($o),
+        ];
+    }
+
+    /** Raw Binance order row (every number an exact decimal string, never an exponent). */
+    private function rawOrder(array $o): array
+    {
+        return [
+            'symbol'              => (string)$o['symbol'],
+            'orderId'             => (string)$o['order_id'],
+            'clientOrderId'       => (string)$o['client_id'],
+            'price'               => (string)$o['price_str'],
+            'origQty'             => (string)$o['qty_str'],
+            'executedQty'         => self::roundStr((float)$o['executed_qty']),
+            'cummulativeQuoteQty' => self::roundStr((float)$o['cum_quote']),
+            'status'              => (string)$o['status'],
+            'timeInForce'         => 'GTC',
+            'type'                => (string)$o['type'],
+            'side'                => (string)$o['side'],
+            'time'                => (int)$o['time'],
+            'updateTime'          => (int)$o['time'],
+            'isWorking'           => true,
+            'paper'               => true,
+        ];
+    }
+
+    /** Book of $symbol, or null when there is no usable price for it. */
+    private function bookOf(string $symbol): ?array
+    {
+        try {
+            $b = $this->md->bookTicker($symbol);
+        } catch (Throwable $e) {
+            return null;
+        }
+        $bid = (float)($b['bid'] ?? 0);
+        $ask = (float)($b['ask'] ?? 0);
+        return ($bid > 0.0 && $ask > 0.0) ? ['bid' => $bid, 'ask' => $ask] : null;
     }
 
     private function balanceOf(string $asset): float

@@ -49,7 +49,7 @@ register_shutdown_function(static function () use ($tmpRoot): void {
 
 /* ------------------------------------------------------------ lib loading */
 
-$libs = ['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'Bot'];
+$libs = ['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'EngineOrders', 'EngineGrid', 'EnginePmm', 'Bot', 'Panel'];
 $missing = [];
 foreach ($libs as $lib) {
     $file = $PROJECT . '/lib/' . $lib . '.php';
@@ -1410,6 +1410,881 @@ T::group('networks', ['Binance', 'Exchange', 'Db'], static function (): void {
         T::eq('demo', $cfg['mode'], 'validateConfig accepts demo');
         T::eq(0, count(array_filter($errors, static function ($e) { return strpos($e, 'mode') !== false; })), 'no mode error for demo');
     }
+});
+
+/* ============================================================ engines (DESIGN-ENGINES.md §11) */
+
+/** Config for the grid / pmm engines on SOLUSDT (step 0.001, tick 0.01, minNotional 5). */
+function engineCfg(array $over = []): array
+{
+    return cfg(array_merge([
+        'enabled'              => true,
+        'mode'                 => 'paper',
+        'symbols'              => ['SOLUSDT'],
+        'engine'               => 'grid',
+        'engine_symbol'        => 'SOLUSDT',
+        'allow_live_engines'   => false,
+        'post_only'            => true,
+        'engine_max_orders'    => 12,
+        'grid_levels'          => 3,
+        'grid_spacing_pct'     => 0.60,
+        'grid_order_usdt'      => 6.5,
+        'grid_range_up_pct'    => 4.0,
+        'grid_range_down_pct'  => 6.0,
+        'grid_exit_liquidates' => false,
+        'pmm_spread_pct'       => 0.25,
+        'pmm_order_usdt'       => 6.5,
+        'pmm_refresh_sec'      => 600,
+        'pmm_target_base_pct'  => 50,
+        'pmm_max_base_pct'     => 80,
+        'paper_start_usdt'     => 200.0,
+        'adaptive'             => false,
+        'max_trades_per_day'   => 50,
+        'max_orders_per_hour'  => 500,
+    ], $over));
+}
+
+/**
+ * Scripted book for the engine groups: mid 130.00 on SOLUSDT, no klines (the engines never
+ * look at candles). The clock is aligned with the wall clock because EnginePmm ages its
+ * quotes against time(): $ms is "now minus a few seconds", so a quote it writes really is
+ * that many seconds old.
+ */
+function engineMd(?int $serverMs = null): FakeMarketData
+{
+    $md = new FakeMarketData([], $serverMs === null ? (time() - 10) * 1000 : $serverMs);
+    $md->setPrice('SOLUSDT', 129.98, 130.02);
+    return $md;
+}
+
+/** Grid rung price: anchor × (1 − i × spacing), rounded down to the tick. */
+function gridRung(float $anchor, int $i, float $spacingPct = 0.60): float
+{
+    return (float) Util::roundToTick($anchor * (1.0 - $i * $spacingPct / 100.0), '0.01000000', 'down');
+}
+
+T::group('util-tick', ['Util'], static function (): void {
+    // tickSize 0.00001 (DOGEUSDT): exact strings at the tick's precision, never an exponent
+    T::eq('0.12345', Util::roundToTick(0.123456, '0.00001000', 'down'), 'roundToTick down @0.00001');
+    T::eq('0.12346', Util::roundToTick(0.123456, '0.00001000', 'up'), 'roundToTick up @0.00001');
+    T::eq('0.12346', Util::roundToTick(0.123456, '0.00001000', 'nearest'), 'roundToTick nearest rounds up @0.00001');
+    T::eq('0.12345', Util::roundToTick(0.123451, '0.00001000', 'nearest'), 'roundToTick nearest rounds down @0.00001');
+    T::eq('0.12345', Util::roundToTick(0.12345, '0.00001000', 'down'), 'a price already on the tick is unchanged (down)');
+    T::eq('0.12345', Util::roundToTick(0.12345, '0.00001000', 'up'), 'a price already on the tick is unchanged (up)');
+    T::eq('0.20000', Util::roundToTick(0.2, '0.00001000', 'down'), 'trailing zeros pad to the tick precision');
+    T::eq('0.00005', Util::roundToTick(0.00005, '0.00001000', 'down'), 'a tiny price never becomes an exponent');
+
+    // tickSize 1: integer prices, no decimal point at all
+    T::eq('123', Util::roundToTick(123.4, '1', 'down'), 'roundToTick down @1');
+    T::eq('124', Util::roundToTick(123.4, '1', 'up'), 'roundToTick up @1');
+    T::eq('123', Util::roundToTick(123.4, '1', 'nearest'), 'roundToTick nearest down @1');
+    T::eq('124', Util::roundToTick(123.6, '1', 'nearest'), 'roundToTick nearest up @1');
+    T::eq('123', Util::roundToTick(123.0, '1.00000000', 'up'), 'an exact integer price is unchanged @1');
+
+    // 0.01 (SOLUSDT) — the tick the grid group prices against
+    T::eq('129.22', Util::roundToTick(130.0 * 0.994, '0.01000000', 'down'), 'grid rung 1 rounds down to the tick');
+    T::eq('130.11', Util::roundToTick(130.1052, '0.01000000', 'up'), 'a sell price rounds up to the tick');
+
+    // exponent-free output is the whole point (PHP prints 5.0E-5 for a plain cast)
+    foreach ([0.00005, 0.0000001, 1.0e-8, 123456789.12345678] as $p) {
+        foreach (['0.00000001', '0.00001000', '1'] as $tick) {
+            foreach (['down', 'up', 'nearest'] as $dir) {
+                $s = Util::roundToTick((float) $p, $tick, $dir);
+                if (stripos($s, 'e') !== false) {
+                    T::ok(false, 'roundToTick never emits exponent notation', $p . ' ' . $tick . ' ' . $dir . ' => ' . $s);
+                    return;
+                }
+                if (Util::decimalsOf($tick) !== (strpos($s, '.') === false ? 0 : strlen(substr($s, strpos($s, '.') + 1)))) {
+                    T::ok(false, 'roundToTick keeps the tick precision', $p . ' ' . $tick . ' ' . $dir . ' => ' . $s);
+                    return;
+                }
+            }
+        }
+    }
+    T::ok(true, 'roundToTick never emits exponent notation and always keeps the tick precision');
+
+    // degenerate inputs must not produce garbage that could reach the API
+    T::eq('0.00', Util::roundToTick(0.0, '0.01000000', 'down'), 'a zero price yields zero at the tick precision');
+    T::eq('0.00', Util::roundToTick(-1.0, '0.01000000', 'up'), 'a negative price yields zero at the tick precision');
+    T::eq('0.00', Util::roundToTick(INF, '0.01000000', 'nearest'), 'a non-finite price yields zero at the tick precision');
+    // buys round down and sells round up: a post-only quote always stays passive
+    T::ok((float) Util::roundToTick(129.229, '0.01000000', 'down') <= 129.229, 'a BUY price never rounds up into the book');
+    T::ok((float) Util::roundToTick(130.101, '0.01000000', 'up') >= 130.101, 'a SELL price never rounds down into the book');
+});
+
+T::group('engine-orders', ['EngineOrders', 'FakePaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    $db   = freshDb('engine-orders');
+    $md   = engineMd(FakeMarketData::SERVER_TIME_MS);
+    $ex   = new FakePaperExchange($md, 0.1, 200.0);
+    $info = FakeMarketData::infoRow('SOLUSDT');
+    $cfg  = engineCfg();
+    $t0   = FakeMarketData::SERVER_TIME_MS;
+    $o    = new EngineOrders($cfg, $db, $ex, $info, $t0);
+
+    // ---- place
+    $row = $o->place('BUY', 129.22, 6.5, 'grid_buy', 1);
+    T::ok($row !== null, 'place returns the stored row');
+    if ($row === null) {
+        return;
+    }
+    T::eq('NEW', (string) $row['status'], 'a resting buy is NEW');
+    T::eq('BUY', (string) $row['side'], 'side stored');
+    T::eq(1, (int) $row['level'], 'level stored');
+    T::eq('grid_buy', (string) $row['purpose'], 'purpose stored');
+    T::near(129.22, (float) $row['price'], 1e-9, 'price rounded down to the tick');
+    T::near(0.05, (float) $row['qty'], 1e-9, 'quantity floored to the step');
+    T::eq(1, count($ex->openOrders('SOLUSDT')), 'the order rests on the exchange');
+    T::near(6.461, $ex->locked('USDT'), 1e-9, 'the resting buy locks its quote');
+    T::near(193.539, $ex->free('USDT'), 1e-9, 'the locked quote left the free balance');
+
+    // ---- sync while nothing has crossed
+    $s = $o->sync('SOLUSDT');
+    T::eq(0, count($s['filled']), 'sync books no fill while the order rests');
+    T::eq(1, count($s['open']), 'sync reports the resting order');
+    T::eq(0, (int) $s['cancelled'], 'sync cancels nothing');
+
+    // ---- the scripted book crosses the rung: the fill books a lot
+    $md->setPrice('SOLUSDT', 129.10, 129.15);
+    $s = $o->sync('SOLUSDT');
+    T::eq(1, count($s['filled']), 'sync books the fill once the ask crosses the rung');
+    T::eq(0, count($s['open']), 'nothing rests any more');
+    $lots = $db->openLots('SOLUSDT', 'paper', 'grid');
+    T::eq(1, count($lots), 'a BUY fill inserts one FIFO lot');
+    if ($lots !== []) {
+        // 0.05 SOL bought at 129.22 = 6.461 USDT, 0.1 % commission in SOL leaves 0.04995 SOL;
+        // the cost basis stays the full quote spent, so lot.price = 6.461 / 0.04995.
+        T::near(0.04995, (float) $lots[0]['qty'], 1e-12, 'the lot holds the quantity net of the base commission');
+        T::near(6.461 / 0.04995, (float) $lots[0]['price'], 1e-9, 'lot.price is the fee-inclusive cost basis');
+        T::eq(1, (int) $lots[0]['level'], 'the lot keeps its rung');
+    }
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM trades WHERE side = 'BUY'"), 'the fill writes one BUY trade');
+    T::near(0.04995, $ex->free('SOL'), 1e-12, 'the base landed in the wallet');
+    T::near(0.0, $ex->locked('USDT'), 1e-12, 'the lock was consumed by the fill');
+    $stored = $db->engineOrder((string) $row['client_id']);
+    T::ok($stored !== null && (string) $stored['status'] === 'FILLED', 'the engine order is FILLED');
+
+    // ---- idempotency: a repeated sync books nothing more
+    $s = $o->sync('SOLUSDT');
+    T::eq(0, count($s['filled']), 'a repeated sync books no second fill');
+    T::eq(1, count($db->openLots('SOLUSDT', 'paper', 'grid')), 'a repeated sync creates no second lot');
+    T::eq(1, countRows($db, 'SELECT COUNT(*) FROM trades'), 'a repeated sync creates no second trade');
+
+    // ---- a second rung fills, so FIFO has two lots to consume
+    $r2 = $o->place('BUY', 128.44, 6.5, 'grid_buy', 2);
+    T::ok($r2 !== null, 'second rung placed');
+    $md->setPrice('SOLUSDT', 128.30, 128.35);
+    $s = $o->sync('SOLUSDT');
+    T::eq(1, count($s['filled']), 'the second rung fills when the ask reaches it');
+    T::eq(2, count($db->openLots('SOLUSDT', 'paper', 'grid')), 'two lots in inventory');
+
+    // ---- a SELL consumes the lots FIFO and writes one cycle per slice
+    $inv = 0.0;
+    foreach ($db->openLots('SOLUSDT', 'paper', 'grid') as $l) {
+        $inv += (float) $l['remaining'];
+    }
+    $sellQty = (float) Util::floorToStep($inv, '0.00100000');
+    $r3 = $o->place('SELL', 130.11, 130.11 * $sellQty * (1.0 + 1e-9), 'grid_sell', 1);
+    T::ok($r3 !== null && (float) $r3['qty'] === $sellQty, 'the sell is sized from the inventory');
+    $md->setPrice('SOLUSDT', 130.20, 130.25);
+    $s = $o->sync('SOLUSDT');
+    T::eq(1, count($s['filled']), 'the sell fills when the bid reaches it');
+    $cycles = $db->cycles(10, 'paper', 'grid');
+    T::eq(2, count($cycles), 'one cycle per consumed lot slice (FIFO)');
+    if (count($cycles) === 2) {
+        // cycles() is newest first, and both closed in the same call: the FIFO order is by id
+        $first = $cycles[1];
+        T::near(6.461 / 0.04995, (float) $first['buy_price'], 1e-9, 'the first cycle consumed the oldest lot');
+        T::eq(1, (int) $first['level'], 'the cycle carries the lot rung');
+        foreach ($cycles as $c) {
+            // pnl = net proceeds − lot cost: the sell fee is taken in USDT, the buy fee is
+            // already inside lot.price, so the identity below is exact.
+            $expect = (float) $c['qty'] * ((float) $c['sell_price'] * 0.999 - (float) $c['buy_price']);
+            T::near($expect, (float) $c['pnl_usdt'], 1e-9, 'cycle pnl = qty × (sell × (1 − fee) − fee-inclusive buy)');
+            T::ok((float) $c['pnl_usdt'] > 0.0, 'a rung sold one spacing up is profitable', (string) $c['pnl_usdt']);
+        }
+    }
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM trades WHERE side = 'SELL'"), 'one SELL trade for the whole fill');
+    $left = 0.0;
+    foreach ($db->openLots('SOLUSDT', 'paper', 'grid') as $l) {
+        $left += (float) $l['remaining'];
+    }
+    T::ok($left < 0.001, 'only sub-step dust is left in inventory', (string) $left);
+
+    // ---- cancel
+    $r4 = $o->place('BUY', 127.00, 6.5, 'grid_buy', 3);
+    T::ok($r4 !== null, 'a rung to cancel was placed');
+    $lockedBefore = $ex->locked('USDT');
+    T::ok($lockedBefore > 0.0, 'the rung locks its quote');
+    T::ok($o->cancel((string) $r4['client_id']), 'cancel reports the order left the book');
+    $after = $db->engineOrder((string) $r4['client_id']);
+    T::ok($after !== null && (string) $after['status'] === 'CANCELED', 'the cancelled order is CANCELED locally');
+    T::eq(0, $ex->openOrderCount('SOLUSDT'), 'nothing rests on the exchange after the cancel');
+    T::near(0.0, $ex->locked('USDT'), 1e-12, 'cancelling releases the locked quote');
+
+    // ---- an order on the exchange that we do not track is cancelled: the engine owns the book
+    $ex->limitOrder('SOLUSDT', 'BUY', '0.050', '120.00', $info, 'foreign-order-1', true);
+    T::eq(1, $ex->openOrderCount('SOLUSDT'), 'the foreign order rests');
+    $s = $o->sync('SOLUSDT');
+    T::eq(0, $ex->openOrderCount('SOLUSDT'), 'sync cancels the untracked exchange order');
+    T::ok((int) $s['cancelled'] >= 1, 'sync counts the untracked order it cancelled');
+    T::eq(null, $db->engineOrder('foreign-order-1'), 'the untracked order is never adopted locally');
+
+    // ---- cancelAll
+    $o->place('BUY', 127.00, 6.5, 'grid_buy', 3);
+    $o->place('BUY', 126.00, 6.5, 'grid_buy', 4);
+    T::eq(2, count($db->openEngineOrders('SOLUSDT')), 'two rungs live before cancelAll');
+    T::eq(2, $o->cancelAll('SOLUSDT', 'test'), 'cancelAll reports both orders');
+    T::eq(0, count($db->openEngineOrders('SOLUSDT')), 'no live rows after cancelAll');
+    T::eq(0, $ex->openOrderCount('SOLUSDT'), 'no resting orders after cancelAll');
+});
+
+T::group('engine-grid', ['Bot', 'EngineGrid', 'FakePaperExchange', 'FakeMarketData'], static function (): void {
+    $db  = freshDb('engine-grid');
+    $md  = engineMd(FakeMarketData::SERVER_TIME_MS);
+    $ex  = new FakePaperExchange($md, 0.1, 200.0);
+    $cfg = engineCfg();
+    $t0  = FakeMarketData::SERVER_TIME_MS;
+
+    // ---- the ladder is built below the mid, one rung per tick
+    $r = (new Bot($cfg, $db, $ex, $t0))->tick();
+    T::eq('ok', $r['status'], 'grid tick1 ok', $r['summary']);
+    T::near(130.0, (float) $db->getState('grid_anchor', '0'), 1e-9, 'the first tick anchors on the mid');
+    T::eq('SOLUSDT', (string) $db->getState('grid_symbol', ''), 'the anchor records its symbol');
+    for ($i = 1; $i <= 2; $i++) {
+        (new Bot($cfg, $db, $ex, $t0 + $i * 60000))->tick();
+    }
+    $live = $db->openEngineOrders('SOLUSDT');
+    T::eq(3, count($live), 'three ticks build three rungs (one order per side per tick)');
+    $prices = [];
+    foreach ($live as $l) {
+        T::eq('BUY', (string) $l['side'], 'every rung of a fresh ladder is a buy');
+        T::ok((float) $l['price'] < 129.98, 'a rung is posted strictly below the bid', (string) $l['price']);
+        $prices[(int) $l['level']] = (float) $l['price'];
+    }
+    T::near(gridRung(130.0, 1), isset($prices[1]) ? $prices[1] : 0.0, 1e-9, 'rung 1 = anchor × (1 − 1 × spacing)');
+    T::near(gridRung(130.0, 2), isset($prices[2]) ? $prices[2] : 0.0, 1e-9, 'rung 2 = anchor × (1 − 2 × spacing)');
+    T::near(gridRung(130.0, 3), isset($prices[3]) ? $prices[3] : 0.0, 1e-9, 'rung 3 = anchor × (1 − 3 × spacing)');
+    T::eq(3, $ex->openOrderCount('SOLUSDT'), 'the whole ladder rests on the exchange');
+
+    // ---- a buy fill produces a sell one rung up
+    $md->setPrice('SOLUSDT', 129.15, 129.20);
+    $r = (new Bot($cfg, $db, $ex, $t0 + 3 * 60000))->tick();
+    T::eq('ok', $r['status'], 'grid tick4 ok', $r['summary']);
+    T::strContains($r['summary'], 'engine fill(s) booked', 'the rung fill is booked by the tick');
+    T::eq(1, count($db->openLots('SOLUSDT', 'paper', 'grid')), 'the filled rung became a lot');
+    $sell = null;
+    foreach ($db->openEngineOrders('SOLUSDT') as $l) {
+        if ((string) $l['side'] === 'SELL') {
+            $sell = $l;
+        }
+    }
+    T::ok($sell !== null, 'a sell was posted for the new lot');
+    if ($sell !== null) {
+        $lot = $db->openLots('SOLUSDT', 'paper', 'grid')[0];
+        $want = max((float) $lot['price'] * 1.006, 130.0);
+        T::near((float) Util::roundToTick($want, '0.01000000', 'up'), (float) $sell['price'], 1e-9,
+            'the sell sits one spacing above the lot, never below its own rung');
+        T::ok((float) $sell['price'] > 129.20, 'the sell is posted strictly above the ask', (string) $sell['price']);
+    }
+
+    // ---- the round trip: the completed cycle earns the spacing minus the round-trip fees
+    $md->setPrice('SOLUSDT', 130.20, 130.25);
+    $r = (new Bot($cfg, $db, $ex, $t0 + 4 * 60000))->tick();
+    T::eq('ok', $r['status'], 'grid tick5 ok', $r['summary']);
+    $cycles = $db->cycles(5, 'paper', 'grid');
+    T::eq(1, count($cycles), 'the round trip wrote one cycle');
+    if ($cycles !== []) {
+        $c   = $cycles[0];
+        $rel = (float) $c['pnl_usdt'] / ((float) $c['qty'] * (float) $c['buy_price']) * 100.0;
+        T::ok((float) $c['pnl_usdt'] > 0.0, 'the cycle is profitable', (string) $c['pnl_usdt']);
+        // spacing 0.60 %, round-trip fee 0.20 %. The engine sells one spacing above the
+        // FEE-INCLUSIVE lot cost, so the realised margin lands between spacing − 2 × fee and
+        // spacing − fee; the tick rounding moves it by another 0.01 / 130 = 0.008 %.
+        T::near(0.60 - 0.20, $rel, 0.15, 'cycle pnl ≈ spacing − round-trip fees (percent of cost)');
+        T::ok($rel >= 0.60 - 0.20 - 1e-9, 'the round trip clears the fee floor', (string) $rel);
+        T::ok($rel <= 0.60 + 1e-9, 'the round trip never earns more than the spacing', (string) $rel);
+    }
+    $stats = $db->engineStats('paper', 'grid');
+    T::eq(1, (int) $stats['cycles'], 'engineStats counts the cycle');
+    T::eq(1, (int) $stats['wins'], 'engineStats counts the win');
+
+    // ---- the order cap holds
+    $db2  = freshDb('engine-grid-cap');
+    $md2  = engineMd(FakeMarketData::SERVER_TIME_MS);
+    $ex2  = new FakePaperExchange($md2, 0.1, 200.0);
+    $cfg2 = engineCfg(['engine_max_orders' => 2]);
+    for ($i = 0; $i < 4; $i++) {
+        (new Bot($cfg2, $db2, $ex2, $t0 + $i * 60000))->tick();
+    }
+    T::eq(2, count($db2->openEngineOrders('SOLUSDT')), 'the ladder stops at engine_max_orders');
+    T::eq(2, $ex2->openOrderCount('SOLUSDT'), 'the exchange never sees more than the cap');
+    T::eq('grid:idle', (string) $db2->getState('no_trade_reason', ''), 'a capped tick is idle, not an error');
+
+    // ---- range exit cancels everything and pauses until a manual re-anchor
+    $md->setPrice('SOLUSDT', 136.00, 136.05);   // mid 136.025 > 130 × 1.04
+    $r = (new Bot($cfg, $db, $ex, $t0 + 5 * 60000))->tick();
+    T::eq('ok', $r['status'], 'grid range-exit tick ok', $r['summary']);
+    T::strContains($r['summary'], 'range_exit', 'the tick reports the range exit');
+    T::eq(0, count($db->openEngineOrders('SOLUSDT')), 'the range exit cancelled every local row');
+    T::eq(0, $ex->openOrderCount('SOLUSDT'), 'the range exit cleared the exchange book');
+    T::eq('grid_range_exit', (string) $db->getState('pause_reason', ''), 'pause_reason is grid_range_exit');
+    T::eq('grid_range_exit', (string) $db->getState('grid_paused_reason', ''), 'the grid records its own pause');
+    T::ok(Util::isoToTs((string) $db->getState('paused_until', '')) > time() + 86400, 'the pause runs far into the future');
+
+    // a paused grid quotes nothing at all
+    $r = (new Bot($cfg, $db, $ex, $t0 + 6 * 60000))->tick();
+    T::eq(0, $ex->openOrderCount('SOLUSDT'), 'a paused grid posts nothing');
+    T::strContains((string) $db->getState('no_trade_reason', ''), 'grid_range_exit', 'the pause reason is reported');
+
+    // ---- re-anchor resumes
+    $bot = new Bot($cfg, $db, $ex, $t0 + 7 * 60000);
+    $bot->reanchorGrid();
+    T::near(136.025, (float) $db->getState('grid_anchor', '0'), 1e-6, 're-anchor re-centres on the current mid');
+    T::eq('', (string) $db->getState('grid_paused_reason', ''), 're-anchor clears the grid pause');
+    T::eq('', (string) $db->getState('paused_until', ''), 're-anchor clears paused_until');
+    $r = (new Bot($cfg, $db, $ex, $t0 + 8 * 60000))->tick();
+    T::eq('ok', $r['status'], 'the tick after a re-anchor is ok', $r['summary']);
+    T::ok(count($db->openEngineOrders('SOLUSDT')) > 0, 'the grid quotes again after a re-anchor');
+});
+
+T::group('engine-pmm', ['Bot', 'EnginePmm', 'FakePaperExchange', 'FakeMarketData'], static function (): void {
+    // EnginePmm ages its quotes against time(), so this group runs on a wall-clock-aligned fake clock.
+    $t0 = (time() - 10) * 1000;
+
+    // ---- a bid and an ask around the mid at the configured spread
+    $db  = freshDb('engine-pmm');
+    $md  = engineMd($t0);
+    $ex  = new FakePaperExchange($md, 0.1, 130.0);
+    $ex->setBalance('SOL', 1.0);                     // 130 USDT of base ⇒ basePct = 50 % = the target
+    $cfg = engineCfg(['engine' => 'pmm']);
+    $r   = (new Bot($cfg, $db, $ex, $t0))->tick();
+    T::eq('ok', $r['status'], 'pmm tick1 ok', $r['summary']);
+    $live = [];
+    foreach ($db->openEngineOrders('SOLUSDT') as $o) {
+        $live[(string) $o['side']] = $o;
+    }
+    T::eq(2, count($live), 'pmm quotes both sides in one tick');
+    T::ok(isset($live['BUY']), 'a bid is posted');
+    T::ok(isset($live['SELL']), 'an ask is posted');
+    if (isset($live['BUY'])) {
+        T::near((float) Util::roundToTick(130.0 * 0.9975, '0.01000000', 'down'), (float) $live['BUY']['price'], 1e-9,
+            'the bid sits half the spread below the mid, rounded down');
+        T::eq('pmm_bid', (string) $live['BUY']['purpose'], 'the bid is tagged pmm_bid');
+        T::ok((float) $live['BUY']['price'] < 129.98, 'the bid stays below the book bid (post-only)');
+    }
+    if (isset($live['SELL'])) {
+        T::near((float) Util::roundToTick(130.0 * 1.0025, '0.01000000', 'up'), (float) $live['SELL']['price'], 1e-9,
+            'the ask sits half the spread above the mid, rounded up');
+        T::eq('pmm_ask', (string) $live['SELL']['purpose'], 'the ask is tagged pmm_ask');
+        T::ok((float) $live['SELL']['price'] > 130.02, 'the ask stays above the book ask (post-only)');
+    }
+    T::eq(2, $ex->openOrderCount('SOLUSDT'), 'both quotes rest on the exchange');
+
+    // ---- a young quote is kept, not re-posted
+    $bidCid = isset($live['BUY']) ? (string) $live['BUY']['client_id'] : '';
+    $before = countRows($db, 'SELECT COUNT(*) FROM engine_orders');
+    (new Bot($cfg, $db, $ex, $t0 + 1000))->tick();
+    T::eq($before, countRows($db, 'SELECT COUNT(*) FROM engine_orders'), 'a quote younger than pmm_refresh_sec is left alone');
+    T::eq(2, count($db->openEngineOrders('SOLUSDT')), 'both quotes are still live');
+
+    // ---- a quote older than pmm_refresh_sec is cancelled and replaced
+    $r = (new Bot(engineCfg(['engine' => 'pmm', 'pmm_refresh_sec' => 5]), $db, $ex, $t0 + 2000))->tick();
+    T::eq('ok', $r['status'], 'pmm refresh tick ok', $r['summary']);
+    T::strContains($r['summary'], 'refreshed=', 'the tick reports the refresh');
+    $old = $bidCid !== '' ? $db->engineOrder($bidCid) : null;
+    T::ok($old !== null && (string) $old['status'] === 'CANCELED', 'the stale bid was cancelled');
+    $stillBid = false;
+    foreach ($db->openEngineOrders('SOLUSDT') as $o) {
+        if ((string) $o['side'] === 'BUY') {
+            $stillBid = true;
+            T::ok((string) $o['client_id'] !== $bidCid, 'the stale bid was replaced by a fresh order');
+        }
+    }
+    T::ok($stillBid, 'pmm keeps a bid on the book after the refresh');
+
+    // ---- inventory skew: above pmm_max_base_pct the engine stops bidding
+    $db2 = freshDb('engine-pmm-max');
+    $md2 = engineMd($t0);
+    $ex2 = new FakePaperExchange($md2, 0.1, 20.0);
+    $ex2->setBalance('SOL', 1.0);                    // 130 of base vs 20 quote ⇒ basePct ≈ 86.7 % > 80 %
+    $r = (new Bot(engineCfg(['engine' => 'pmm']), $db2, $ex2, $t0))->tick();
+    T::eq('ok', $r['status'], 'pmm max-inventory tick ok', $r['summary']);
+    T::strContains($r['summary'], 'not bidding', 'the tick says why it is not bidding');
+    $sides = [];
+    foreach ($db2->openEngineOrders('SOLUSDT') as $o) {
+        $sides[] = (string) $o['side'];
+    }
+    T::eq(['SELL'], $sides, 'above pmm_max_base_pct only the ask is quoted');
+
+    // ---- inventory below the exchange filters: no ask, whatever the skew says
+    $db3 = freshDb('engine-pmm-dust');
+    $md3 = engineMd($t0);
+    $ex3 = new FakePaperExchange($md3, 0.1, 10.0);
+    $ex3->setBalance('SOL', 0.03);                   // 3.9 USDT of base: over the min ratio, under minNotional 5
+    $r = (new Bot(engineCfg(['engine' => 'pmm']), $db3, $ex3, $t0))->tick();
+    T::eq('ok', $r['status'], 'pmm dust-inventory tick ok', $r['summary']);
+    T::strContains($r['summary'], 'below the filters', 'the tick says the inventory is below the filters');
+    $sides = [];
+    foreach ($db3->openEngineOrders('SOLUSDT') as $o) {
+        $sides[] = (string) $o['side'];
+    }
+    T::eq(['BUY'], $sides, 'an inventory below the filters is never offered');
+});
+
+T::group('engine-guard', ['Bot', 'EngineGrid', 'FakePaperExchange', 'FakeMarketData', 'Risk'], static function (): void {
+    $t0 = FakeMarketData::SERVER_TIME_MS;
+
+    // ---- live mode without allow_live_engines places nothing at all
+    foreach (['grid', 'pmm'] as $engine) {
+        $db = freshDb('engine-guard-live-' . $engine);
+        $md = engineMd($t0);
+        $ex = new FakePaperExchange($md, 0.1, 200.0);
+        $ex->setMode('live');
+        $cfg = engineCfg(['engine' => $engine, 'mode' => 'live', 'api_key' => 'k', 'api_secret' => 's']);
+        $r   = (new Bot($cfg, $db, $ex, $t0))->tick();
+        T::eq('ok', $r['status'], $engine . ' live tick still completes', $r['summary']);
+        T::eq('engine_live_blocked', (string) $db->getState('no_trade_reason', ''), $engine . ' reports engine_live_blocked');
+        T::eq(0, $ex->limitCalls, $engine . ' sent zero orders to the exchange in live mode');
+        T::eq(0, countRows($db, 'SELECT COUNT(*) FROM engine_orders'), $engine . ' wrote no engine order in live mode');
+        T::eq(0, $ex->openOrderCount(), $engine . ' left nothing on the book in live mode');
+        // the same config with the flag on does quote
+        $db2 = freshDb('engine-guard-allow-' . $engine);
+        $md2 = engineMd($t0);
+        $ex2 = new FakePaperExchange($md2, 0.1, 200.0);
+        $ex2->setMode('live');
+        $ex2->setBalance('SOL', 1.0);
+        (new Bot(engineCfg(['engine' => $engine, 'mode' => 'live', 'api_key' => 'k', 'api_secret' => 's', 'allow_live_engines' => true]), $db2, $ex2, $t0))->tick();
+        T::ok($ex2->limitCalls > 0, $engine . ' quotes in live mode once allow_live_engines is on');
+    }
+
+    // ---- the equity floor cancels every resting order and halts
+    $db = freshDb('engine-guard-floor');
+    $md = engineMd($t0);
+    $ex = new FakePaperExchange($md, 0.1, 200.0);
+    for ($i = 0; $i < 2; $i++) {
+        (new Bot(engineCfg(), $db, $ex, $t0 + $i * 60000))->tick();
+    }
+    T::eq(2, $ex->openOrderCount('SOLUSDT'), 'two rungs rest before the kill switch');
+    $r = (new Bot(engineCfg(['equity_floor_usdt' => 500.0]), $db, $ex, $t0 + 2 * 60000))->tick();
+    T::eq('halted', $r['status'], 'the equity floor halts the tick', $r['summary']);
+    T::eq('1', (string) $db->getState('halted', '0'), 'the bot is halted');
+    T::eq('equity_floor', (string) $db->getState('halt_reason', ''), 'halt_reason is equity_floor');
+    T::eq(0, $ex->openOrderCount('SOLUSDT'), 'the kill switch cancelled every resting order');
+    T::eq(0, count($db->openEngineOrders('SOLUSDT')), 'no live engine rows are left after the halt');
+
+    // ---- a daily-cap pause takes the ladder off the book too
+    $db = freshDb('engine-guard-cap');
+    $md = engineMd($t0);
+    $ex = new FakePaperExchange($md, 0.1, 200.0);
+    for ($i = 0; $i < 2; $i++) {
+        (new Bot(engineCfg(), $db, $ex, $t0 + $i * 60000))->tick();
+    }
+    T::eq(2, $ex->openOrderCount('SOLUSDT'), 'two rungs rest before the cap');
+    // −5 USDT today is over the 2 % daily cap of a 200 USDT account and under the 5 % weekly one
+    closedPosition($db, -5.0, ['closed_at' => Util::nowIso(), 'opened_at' => Util::nowIso(time() - 600)]);
+    $r = (new Bot(engineCfg(), $db, $ex, $t0 + 2 * 60000))->tick();
+    T::eq('ok', $r['status'], 'the capped tick completes', $r['summary']);
+    T::eq('daily_cap', (string) $db->getState('no_trade_reason', ''), 'the tick reports daily_cap');
+    T::eq(0, $ex->openOrderCount('SOLUSDT'), 'the daily cap cancelled every resting order');
+    T::eq(0, count($db->openEngineOrders('SOLUSDT')), 'no live engine rows are left while the cap holds');
+});
+
+/* ------------------------------------------------------- engine-demo-only
+ * The demo-only guarantee, end to end (DESIGN-ENGINES.md §1). With mode=live,
+ * engine=grid and allow_live_engines=false the bot must not place a SINGLE order —
+ * not through the cron tick, and not through any of the panel actions of §10
+ * (cancel_order, cancel_all, reanchor_grid, flatten_inventory, run_tick).
+ *
+ * The state is deliberately built FIRST with the flag on, so a ladder really rests and
+ * a lot is really held when the flag is switched off. A guard tested over empty state
+ * proves nothing: every action would be a no-op anyway. Cancelling is not placing —
+ * an action is allowed to take orders OFF the book, and the last assertion is that the
+ * blocked run ends with an empty book, untouched inventory, and all three order
+ * counters (limit, market buy, market sell) still at zero.
+ */
+T::group('engine-demo-only', ['Bot', 'EngineGrid', 'EngineOrders', 'FakePaperExchange'], static function (): void {
+    $t0 = FakeMarketData::SERVER_TIME_MS;
+    $db = freshDb('engine-demo-only');
+    $md = engineMd($t0);
+    $ex = new FakePaperExchange($md, 0.1, 200.0);
+    $ex->setMode('live');
+    $info = FakeMarketData::infoRow('SOLUSDT');
+    $keys = ['engine' => 'grid', 'mode' => 'live', 'api_key' => 'k', 'api_secret' => 's'];
+
+    // ---- setup: three rungs rest and one of them fills into a lot, all with the flag ON
+    $allowed = engineCfg(array_merge($keys, ['allow_live_engines' => true]));
+    for ($i = 0; $i < 3; $i++) {
+        (new Bot($allowed, $db, $ex, $t0 + $i * 60000))->tick();
+    }
+    $md->setPrice('SOLUSDT', 129.15, 129.20);
+    (new Bot($allowed, $db, $ex, $t0 + 3 * 60000))->tick();
+    $lotsBefore = $db->openLots('SOLUSDT', 'live', 'grid');
+    $invBefore  = 0.0;
+    foreach ($lotsBefore as $l) {
+        $invBefore += (float) $l['remaining'];
+    }
+    T::ok($invBefore > 0.0, 'setup: the allowed engine really holds inventory', T::dump($invBefore));
+    T::ok($ex->openOrderCount('SOLUSDT') > 0, 'setup: the allowed engine really has orders resting');
+    T::ok($ex->limitCalls > 0, 'setup: the allowed engine really placed orders');
+    // free + locked: the resting grid_sell holds part of the base, and cancelling it (which a
+    // blocked action IS allowed to do) moves base between the two without selling anything
+    $baseBefore = $ex->free('SOL') + $ex->locked('SOL');
+
+    // ---- flip the flag off; from here NOTHING may be placed by any path
+    $blocked = engineCfg(array_merge($keys, ['allow_live_engines' => false]));
+    $ex->limitCalls      = 0;
+    $ex->marketBuyCalls  = 0;
+    $ex->marketSellCalls = 0;
+
+    // panel action "Re-anchor grid": moves the anchor, must not quote against it
+    (new Bot($blocked, $db, $ex, $t0 + 4 * 60000))->reanchorGrid();
+    T::eq(0, $ex->limitCalls, 'blocked: reanchor_grid placed no limit order');
+    T::eq(0, $ex->marketBuyCalls + $ex->marketSellCalls, 'blocked: reanchor_grid placed no market order');
+
+    // panel action "Cancel" on one resting order: allowed (it only takes risk off)
+    $live = $db->openEngineOrders('SOLUSDT', 'live');
+    T::ok(count($live) > 0, 'blocked: the ladder from the allowed run is still on the book');
+    if ($live !== []) {
+        $cid  = (string) $live[0]['client_id'];
+        $cfgO = array_merge($blocked, ['engine_symbol' => 'SOLUSDT']);
+        $ok   = (new EngineOrders($cfgO, $db, $ex, $info, $t0 + 4 * 60000))->cancel($cid);
+        T::ok($ok, 'blocked: cancel_order still takes an order off the book');
+        $after = $db->engineOrder($cid);
+        T::eq('CANCELED', $after === null ? '' : strtoupper((string) $after['status']), 'blocked: the cancelled row is CANCELED');
+    }
+    T::eq(0, $ex->limitCalls, 'blocked: cancel_order placed no limit order');
+
+    // panel action "Flatten inventory": the one action that ends in a real market SELL
+    $flat = (new Bot($blocked, $db, $ex, $t0 + 5 * 60000))->flattenInventory();
+    T::ok(empty($flat['ok']), 'blocked: flatten_inventory reports that it sold nothing');
+    T::strContains((string) $flat['message'], 'blocked in live mode', 'blocked: flatten_inventory says why');
+    T::eq(0, $ex->marketSellCalls, 'blocked: flatten_inventory sent no market SELL');
+    T::near($baseBefore, $ex->free('SOL') + $ex->locked('SOL'), 1e-12, 'blocked: the base balance is untouched');
+    $invAfter = 0.0;
+    foreach ($db->openLots('SOLUSDT', 'live', 'grid') as $l) {
+        $invAfter += (float) $l['remaining'];
+    }
+    T::near($invBefore, $invAfter, 1e-12, 'blocked: the inventory lots are untouched');
+
+    // panel action "Cancel all orders"
+    (new Bot($blocked, $db, $ex, $t0 + 6 * 60000))->cancelAllEngineOrders('panel_cancel_all');
+    T::eq(0, $ex->openOrderCount('SOLUSDT'), 'blocked: cancel_all cleared the exchange book');
+    T::eq(0, $ex->limitCalls, 'blocked: cancel_all placed no limit order');
+
+    // panel action "Run tick" / the cron tick itself
+    $r = (new Bot($blocked, $db, $ex, $t0 + 7 * 60000))->tick();
+    T::eq('ok', $r['status'], 'blocked: the tick still completes', $r['summary']);
+    T::eq('engine_live_blocked', (string) $db->getState('no_trade_reason', ''), 'blocked: the tick reports engine_live_blocked');
+
+    // ---- the whole blocked run, summed up
+    T::eq(0, $ex->limitCalls, 'blocked: zero limit orders across every path');
+    T::eq(0, $ex->marketBuyCalls, 'blocked: zero market BUYs across every path');
+    T::eq(0, $ex->marketSellCalls, 'blocked: zero market SELLs across every path');
+    T::eq(0, $ex->openOrderCount(), 'blocked: nothing is left resting on the exchange');
+    T::eq(0, count($db->openEngineOrders('SOLUSDT', 'live')), 'blocked: no live engine row is left');
+    $invEnd = 0.0;
+    foreach ($db->openLots('SOLUSDT', 'live', 'grid') as $l) {
+        $invEnd += (float) $l['remaining'];
+    }
+    T::near($invBefore, $invEnd, 1e-12, 'blocked: the inventory survived every action');
+
+    // ---- and the guard, not an empty state, is what stopped it: flip the flag back on
+    $flat2 = (new Bot($allowed, $db, $ex, $t0 + 8 * 60000))->flattenInventory();
+    T::ok(!empty($flat2['ok']), 'allowed: flatten_inventory sells the same inventory', (string) $flat2['message']);
+    T::eq(1, $ex->marketSellCalls, 'allowed: exactly one market SELL was sent');
+    // the sold quantity is the inventory floored to stepSize (0.001 on SOLUSDT), so it is the
+    // whole inventory bar at most one step of dust
+    $sold = (float) $flat2['qty'];
+    T::ok($sold > 0.0 && $sold <= $invBefore + 1e-12 && $invBefore - $sold < 0.001,
+        'allowed: the whole inventory was sold bar sub-step dust', T::dump(['inv' => $invBefore, 'sold' => $sold]));
+    $invLeft = 0.0;
+    foreach ($db->openLots('SOLUSDT', 'live', 'grid') as $l) {
+        $invLeft += (float) $l['remaining'];
+    }
+    T::ok($invLeft < 0.001, 'allowed: the flatten consumed the lots down to sub-step dust', T::dump($invLeft));
+
+    // ---- pmm is guarded by the very same rule
+    $db2 = freshDb('engine-demo-only-pmm');
+    $md2 = engineMd($t0);
+    $ex2 = new FakePaperExchange($md2, 0.1, 200.0);
+    $ex2->setMode('live');
+    $ex2->setBalance('SOL', 1.0);
+    $pmm = engineCfg(array_merge($keys, ['engine' => 'pmm', 'allow_live_engines' => false]));
+    (new Bot($pmm, $db2, $ex2, $t0))->tick();
+    (new Bot($pmm, $db2, $ex2, $t0 + 60000))->flattenInventory();
+    T::eq(0, $ex2->limitCalls, 'blocked: pmm placed no limit order');
+    T::eq(0, $ex2->marketSellCalls, 'blocked: pmm flatten sent no market SELL');
+    T::eq(0, countRows($db2, 'SELECT COUNT(*) FROM engine_orders'), 'blocked: pmm wrote no engine order at all');
+});
+
+/* ------------------------------------------------------------ paper-limit
+ * The shipped paper exchange, not the scriptable double. grid/pmm refuse to run in
+ * live mode unless allow_live_engines is set (DESIGN-ENGINES.md §1), so PaperExchange
+ * IS the engine's normal home and its limit surface (§11) has to hold up end to end:
+ * rest, lock funds, survive the gap between cron processes, fill when the book crosses,
+ * and book a lot -> cycle through the very same EngineOrders the live path uses.
+ */
+T::group('paper-limit', ['PaperExchange', 'EngineOrders', 'EngineGrid', 'FakeMarketData', 'Db'], static function (): void {
+    $db   = freshDb('paper-limit');
+    $md   = engineMd(FakeMarketData::SERVER_TIME_MS);
+    $path = $db->pdo();
+    $ex   = new PaperExchange($md, $db, 0.1, 200.0, 'USDT');
+    $info = FakeMarketData::infoRow('SOLUSDT');
+    $cfg  = engineCfg();
+    $t0   = FakeMarketData::SERVER_TIME_MS;
+
+    T::ok(method_exists('PaperExchange', 'limitOrder'), 'PaperExchange has the limit-order surface');
+    T::ok(method_exists('PaperExchange', 'cancelOrder'), 'PaperExchange can cancel one order');
+    T::ok(method_exists('PaperExchange', 'cancelAllOrders'), 'PaperExchange can cancel every order');
+    T::ok(method_exists('PaperExchange', 'openOrders'), 'PaperExchange reports its open orders');
+    T::ok(method_exists('LiveExchange', 'limitOrder'), 'LiveExchange has the limit-order surface too');
+
+    $o = new EngineOrders($cfg, $db, $ex, $info, $t0);
+
+    // ---- a rung rests, and locks exactly its notional
+    $row = $o->place('BUY', 129.22, 6.5, 'grid_buy', 1);
+    T::ok($row !== null, 'the engine places a resting buy on the paper exchange');
+    if ($row === null) {
+        return;
+    }
+    T::eq('NEW', (string) $row['status'], 'the paper rung is NEW');
+    T::eq(1, count($ex->openOrders('SOLUSDT')), 'the rung rests on the paper book');
+    T::near(6.461, $ex->lockedOf('USDT'), 1e-9, 'the resting buy locks its quote');
+    $acct = $ex->account();
+    T::near(6.461, (float) $acct['balances']['USDT']['locked'], 1e-9, 'account() reports the locked quote');
+    T::near(193.539, (float) $acct['balances']['USDT']['free'], 1e-9, 'the locked quote left the free balance');
+    T::near(200.0, (float) $acct['balances']['USDT']['free'] + (float) $acct['balances']['USDT']['locked'], 1e-9,
+        'free + locked still equals the starting balance');
+
+    // ---- a post-only rung that would cross is rejected the way Binance rejects it (§3)
+    $rejected = false;
+    try {
+        $o2 = new EngineOrders($cfg, $db, $ex, $info, $t0);
+        $o2->place('BUY', 131.00, 6.5, 'grid_buy', 9);   // above the ask: would take
+    } catch (Throwable $e) {
+        $rejected = true;
+    }
+    T::eq(1, count($ex->openOrders('SOLUSDT')), 'a crossing post-only rung never joins the book');
+    T::ok(!$rejected, 'a post-only reject is a skipped quote, not an exception');
+
+    // ---- the ladder survives the gap between two cron processes
+    $ex2 = new PaperExchange($md, $db, 0.1, 200.0, 'USDT');
+    T::eq(1, count($ex2->openOrders('SOLUSDT')), 'a fresh process still sees the resting rung');
+    T::near(6.461, $ex2->lockedOf('USDT'), 1e-9, 'and still accounts for the funds it locks');
+
+    // ---- the book crosses the rung: it fills, and the fill books a lot exactly once
+    $md->setPrice('SOLUSDT', 129.19, 129.21);
+    $o3 = new EngineOrders($cfg, $db, $ex2, $info, $t0);
+    $s  = $o3->sync('SOLUSDT');
+    T::eq(1, count($s['filled']), 'the crossed rung fills and is booked');
+    T::eq(0, count($ex2->openOrders('SOLUSDT')), 'the filled rung has left the book');
+    $lots = $db->openLots('SOLUSDT');
+    T::eq(1, count($lots), 'the buy fill produced one lot');
+    if (count($lots) > 0) {
+        T::eq(1, (int) $lots[0]['level'], 'the lot remembers its rung');
+        // the base-asset commission raises the cost basis above the rung price (DESIGN.md §6)
+        T::ok((float) $lots[0]['price'] > 129.22, 'the lot basis is fee-inclusive');
+        T::near(129.3493, (float) $lots[0]['price'], 1e-3, 'the fee-inclusive basis is one commission above the rung');
+    }
+    $again = $o3->sync('SOLUSDT');
+    T::eq(0, count($again['filled']), 'a second sync books nothing again');
+    T::eq(1, count($db->openLots('SOLUSDT')), 'and creates no second lot');
+
+    // ---- the grid answers the fill with a sell one rung up, which fills into a cycle
+    $g = new EngineGrid($cfg, $db, $ex2, $o3, $info);
+    $b = $md->bookTicker('SOLUSDT');
+    $g->tick((float) $b['bid'], (float) $b['ask']);
+    $sell = null;
+    foreach ($db->openEngineOrders('SOLUSDT') as $eo) {
+        if ((string) $eo['side'] === 'SELL') {
+            $sell = $eo;
+        }
+    }
+    T::ok($sell !== null, 'the grid answers the filled rung with a resting sell');
+    if ($sell !== null) {
+        T::ok((float) $sell['price'] > (float) $b['ask'], 'the sell rests above the ask');
+    }
+    $md->setPrice('SOLUSDT', 131.99, 132.01);
+    $o3->sync('SOLUSDT');
+    $cycles = $db->cycles(10);
+    T::eq(1, count($cycles), 'the round trip wrote one cycle');
+    if (count($cycles) > 0) {
+        $c   = $cycles[0];
+        $qty = (float) $c['qty'];
+        $net = $qty * (float) $c['sell_price'] * (1.0 - 0.001) - $qty * (float) $c['buy_price'];
+        T::near($net, (float) $c['pnl_usdt'], 1e-9, 'cycle pnl is proceeds net of fees minus the lot cost');
+        T::ok((float) $c['pnl_usdt'] > 0.0, 'a rung round trip at 0.60 % spacing clears the 0.2 % round trip');
+        // the sell is priced a full spacing above the FEE-INCLUSIVE basis and rounded up to the tick,
+        // so the gross step is a spacing plus at most one tick, and the margin left after the sell-side
+        // fee is the 'spacing - fees' DESIGN-ENGINES.md §11 asks for.
+        $rel = ((float) $c['sell_price'] / (float) $c['buy_price'] - 1.0) * 100.0;
+        $tickPct = 0.01 / (float) $c['buy_price'] * 100.0;
+        T::ok($rel >= 0.60 - 1e-9 && $rel <= 0.60 + $tickPct + 1e-9, 'the sell is one spacing (plus at most a tick) above the basis');
+        $netPct = (float) $c['pnl_usdt'] / ($qty * (float) $c['buy_price']) * 100.0;
+        T::ok($netPct >= 0.60 - 2 * 0.1 && $netPct <= 0.60, 'the realised margin sits between spacing - 2 x fee and spacing');
+    }
+    // the same tick that answered the fill also laddered a fresh buy rung (one new order per side
+    // per tick), so clear the book deliberately rather than assuming it emptied itself.
+    $o3->cancelAll('SOLUSDT', 'reset');
+    T::eq(0, count($ex2->openOrders('SOLUSDT')), 'cancelAll empties the paper book');
+    $wallet = $ex2->account();
+    T::near(0.0, (float) ($wallet['balances']['USDT']['locked'] ?? 0.0), 1e-9, 'nothing stays locked once the book is empty');
+    T::near(0.0, $ex2->lockedOf('USDT'), 1e-9, 'and the derived lock agrees');
+
+    // ---- cancel paths: one order, then the whole book
+    $o4  = new EngineOrders($cfg, $db, $ex2, $info, $t0);
+    $r1  = $o4->place('BUY', 129.22, 6.5, 'grid_buy', 1);
+    $r2  = $o4->place('BUY', 128.44, 6.5, 'grid_buy', 2);
+    T::eq(2, count($ex2->openOrders('SOLUSDT')), 'two rungs rest');
+    if ($r1 !== null) {
+        T::ok($o4->cancel((string) $r1['client_id']), 'a single rung cancels');
+        T::eq(1, count($ex2->openOrders('SOLUSDT')), 'and leaves the book');
+        T::near(6.422, $ex2->lockedOf('USDT'), 1e-3, 'its locked quote came back');
+    }
+    T::eq(1, $o4->cancelAll('SOLUSDT', 'test'), 'cancelAll clears the rest of the book');
+    T::eq(0, count($ex2->openOrders('SOLUSDT')), 'the paper book is empty');
+    T::near(0.0, $ex2->lockedOf('USDT'), 1e-9, 'and nothing is left locked');
+
+    // ---- cancelling a vanished order is the -2011 soft success, not a failure
+    $threw = false;
+    try {
+        $ex2->cancelOrder('SOLUSDT', 'no-such-order');
+    } catch (BinanceException $e) {
+        $threw = $e->binanceCode === -2011;
+    }
+    T::ok($threw, 'cancelling an unknown order answers -2011 like Binance');
+
+    T::ok(strpos((string) $db->getState('paper_orders', ''), 'SOLUSDT') !== false,
+        'the simulated book is persisted in state for the next cron process');
+});
+
+T::group('engine-fees', ['Risk'], static function (): void {
+    $db   = freshDb('engine-fees');
+    $base = engineCfg();
+
+    // spacing must clear the round trip: 2 × fee_pct + 0.1 = 0.30 % at VIP0
+    list($cfg, $errors) = Risk::validateConfig(['engine' => 'grid', 'grid_spacing_pct' => '0.25', 'fee_pct' => '0.1'], $base);
+    $hit = '';
+    foreach ($errors as $e) {
+        if (strpos((string) $e, 'grid_spacing_pct') !== false) {
+            $hit = (string) $e;
+        }
+    }
+    T::ok($hit !== '', 'a spacing below the fee floor is rejected', T::dump($errors));
+    T::strContains($hit, '0.3', 'the error names the 2 × fee + 0.1 floor');
+    T::ok((float) $cfg['grid_spacing_pct'] >= 0.3 - 1e-9, 'the rejected spacing is not stored');
+
+    // exactly on the floor is accepted, and so is the default
+    list($cfg2, $errors2) = Risk::validateConfig(['engine' => 'grid', 'grid_spacing_pct' => '0.30', 'fee_pct' => '0.1'], $base);
+    T::eq(0, count(array_filter($errors2, static function ($e) { return strpos((string) $e, 'grid_spacing_pct') !== false; })),
+        'a spacing exactly on the floor is accepted');
+    T::near(0.30, (float) $cfg2['grid_spacing_pct'], 1e-9, 'the accepted spacing is stored');
+    list($cfg3, $errors3) = Risk::validateConfig(['engine' => 'grid', 'grid_spacing_pct' => '0.60', 'fee_pct' => '0.1'], $base);
+    T::eq(0, count(array_filter($errors3, static function ($e) { return strpos((string) $e, 'grid_spacing_pct') !== false; })),
+        'the default 0.60 % spacing is accepted');
+
+    // a higher fee raises the floor with it
+    list($cfg4, $errors4) = Risk::validateConfig(['engine' => 'grid', 'grid_spacing_pct' => '0.60', 'fee_pct' => '0.5'], $base);
+    T::ok(count(array_filter($errors4, static function ($e) { return strpos((string) $e, 'grid_spacing_pct') !== false; })) === 1,
+        'at 0.5 % fees a 0.60 % spacing no longer clears the round trip');
+
+    // pmm must carry the expected-loss warning wherever it is selected (DESIGN-ENGINES.md §8.6)
+    $v = Risk::validateConfig(['engine' => 'pmm'], $base);
+    $warnings = isset($v[2]) && is_array($v[2]) ? $v[2] : [];
+    $lose = false;
+    foreach ($warnings as $w) {
+        if (stripos((string) $w, 'lose') !== false) {
+            $lose = true;
+        }
+    }
+    T::ok($lose, 'selecting pmm warns that it is expected to lose money at VIP0 fees', T::dump($warnings));
+
+    // grid/pmm in live mode without allow_live_engines saves, but warns
+    $v = Risk::validateConfig(['engine' => 'grid', 'mode' => 'live', 'api_key' => 'k', 'api_secret' => 's'],
+        array_merge($base, ['api_key' => 'k', 'api_secret' => 's']));
+    $warned = false;
+    foreach ((isset($v[2]) && is_array($v[2]) ? $v[2] : []) as $w) {
+        if (strpos((string) $w, 'allow_live_engines') !== false) {
+            $warned = true;
+        }
+    }
+    T::eq('grid', (string) $v[0]['engine'], 'grid in live mode is still saved');
+    T::ok($warned, 'grid in live mode without allow_live_engines is flagged', T::dump(isset($v[2]) ? $v[2] : []));
+    T::ok($db instanceof Db, 'engine-fees ran against its own database');
+});
+
+T::group('panel-engine', ['Panel', 'Db', 'Util'], static function (): void {
+    $db  = freshDb('panel-engine');
+    $cfg = engineCfg();
+
+    // state the tick would have written
+    $db->setState('symbol_info', ['SOLUSDT' => FakeMarketData::infoRow('SOLUSDT')]);
+    $db->setState('symbol_metrics', ['SOLUSDT' => ['price' => 130.0]]);
+    $db->setState('grid_anchor', 130.0);
+    $db->setState('grid_symbol', 'SOLUSDT');
+    $db->setState('grid_anchor_at', Util::nowIso(time() - 600));
+    $hostile = 'b-SOLUSDT-1"><script>alert(1)</script>';
+    $db->insertEngineOrder([
+        'client_id' => $hostile, 'order_id' => '1', 'mode' => 'paper', 'engine' => 'grid',
+        'symbol' => 'SOLUSDT', 'side' => 'BUY', 'status' => 'NEW', 'price' => 129.22, 'qty' => 0.05,
+        'quote' => 6.461, 'filled_qty' => 0.0, 'filled_quote' => 0.0, 'fee_usdt' => 0.0,
+        'level' => 1, 'purpose' => 'grid_buy', 'created_at' => Util::nowIso(time() - 120),
+    ]);
+    $db->insertLot(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'SOLUSDT', 'qty' => 0.04995,
+        'remaining' => 0.04995, 'price' => 129.349, 'fee_usdt' => 0.0065, 'level' => 1,
+        'client_id' => 'x', 'created_at' => Util::nowIso(time() - 300)]);
+    $db->insertCycle(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'SOLUSDT', 'level' => 1,
+        'qty' => 0.049, 'buy_price' => 129.349, 'sell_price' => 130.13, 'gross_usdt' => 6.376,
+        'fee_usdt' => 0.0127, 'pnl_usdt' => 0.0319, 'opened_at' => Util::nowIso(time() - 900),
+        'closed_at' => Util::nowIso(time() - 60)]);
+
+    $s = Panel::status($cfg, $db);
+    T::ok(!empty($s['show']['engine']), 'status reveals the engine block for grid');
+    T::ok(!empty($s['show']['grid_engine']), 'status marks the grid sub-block');
+    T::ok(empty($s['show']['pmm_engine']), 'the pmm sub-block stays hidden for grid');
+    T::ok(empty($s['show']['signal_engine']), 'the signal marker is off for grid');
+    T::eq('GRID', (string) $s['text']['eng_name'], 'engine name');
+    T::eq('SOLUSDT', (string) $s['text']['eng_symbol'], 'engine symbol');
+    T::eq('1 / 12', (string) $s['text']['eng_orders'], 'live orders / cap');
+    T::strContains((string) $s['text']['eng_anchor'], '130.000000', 'the anchor is shown');
+    T::strContains((string) $s['text']['eng_range_up'], '135.200000', 'the upper range edge is shown');
+    T::strContains((string) $s['text']['eng_range_down'], '122.200000', 'the lower range edge is shown');
+    T::strContains((string) $s['text']['eng_inventory'], '0.04995', 'the inventory quantity is shown');
+    T::strContains((string) $s['text']['eng_inv_cost'], '6.4610', 'the inventory cost is shown');
+    T::strContains((string) $s['text']['eng_unreal'], '+0.03', 'the unrealised at bid is shown');
+    T::eq('1', (string) $s['text']['eng_cycles_today'], 'cycles today');
+    T::strContains((string) $s['text']['eng_win_rate'], '1W/0L', 'cycle win rate');
+    T::near(0.0319, (float) $s['engine']['pnl'], 1e-9, 'the engine payload carries the realised pnl');
+    T::eq(1, (int) $s['engine']['open_orders'], 'the engine payload counts the resting orders');
+    T::near(0.04995, (float) $s['engine']['inventory_qty'], 1e-12, 'the engine payload carries the inventory');
+
+    // tables and the per-order Cancel button
+    T::eq(1, count($s['tables']['engine_orders']['rows']), 'one open-order row');
+    T::eq(8, (int) $s['tables']['engine_orders']['cols'], 'the open-order table has 8 columns');
+    $cell = $s['tables']['engine_orders']['rows'][0][7];
+    T::eq('cancel_order', (string) $cell['btn']['action'], 'the row carries a cancel_order button');
+    T::eq($hostile, (string) $cell['btn']['fields']['client_id'], 'the button carries the client id');
+    T::eq(1, count($s['tables']['cycles']['rows']), 'one cycle row');
+    T::eq(6, (int) $s['tables']['cycles']['cols'], 'the cycles table has 6 columns');
+
+    // every dynamic value is escaped on the way into HTML
+    $html = Panel::tableRows($s['tables']['engine_orders']);
+    T::ok(strpos($html, '<script>') === false, 'a hostile client id is escaped in the rendered row');
+    T::strContains($html, 'name="client_id"', 'the rendered row posts the client id');
+    T::strContains($html, 'name="action" value="cancel_order"', 'the rendered row posts cancel_order');
+
+    // signal keeps the engine block hidden and the signal cards on
+    $s2 = Panel::status(engineCfg(['engine' => 'signal']), $db);
+    T::ok(empty($s2['show']['engine']), 'the engine block is hidden for the signal engine');
+    T::ok(!empty($s2['show']['signal_engine']), 'the signal marker is on for the signal engine');
+    T::ok(isset($s2['tables']['symbols']) && isset($s2['tables']['closed']), 'the signal tables are still published');
+
+    // live mode without allow_live_engines is flagged in the payload
+    $s3 = Panel::status(engineCfg(['mode' => 'live']), $db);
+    T::ok(!empty($s3['show']['engine_live_blocked']), 'live mode without allow_live_engines is flagged');
+    T::strContains((string) $s3['text']['eng_state'], 'BLOCKED', 'the engine state says BLOCKED');
+    $s4 = Panel::status(engineCfg(['mode' => 'live', 'allow_live_engines' => true]), $db);
+    T::ok(empty($s4['show']['engine_live_blocked']), 'allow_live_engines clears the block flag');
 });
 
 /* ============================================================ summary */

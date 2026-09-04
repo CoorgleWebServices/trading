@@ -30,6 +30,22 @@ final class BinanceException extends RuntimeException
         $this->retryAfter  = $retryAfter;
     }
 
+    /**
+     * True for the LIMIT_MAKER rejection "Order would immediately match and take"
+     * (-2010). A post-only quote that would cross the book is refused by the
+     * exchange; that is a normal, expected outcome for a maker quote, not an error:
+     * the caller logs at debug and skips that quote for this tick.
+     */
+    public function isPostOnlyReject(): bool
+    {
+        if ($this->binanceCode !== -2010) {
+            return false;
+        }
+        $m = strtolower($this->getMessage());
+        return strpos($m, 'would immediately match') !== false
+            || strpos($m, 'immediately match') !== false;
+    }
+
     public function isNetworkError(): bool
     {
         return $this->httpStatus === 0;
@@ -261,6 +277,15 @@ final class Binance
             'tickSize'             => '0.00000001',
             'basePrecision'        => (int)($s['baseAssetPrecision'] ?? 8),
             'quotePrecision'       => (int)($s['quoteAssetPrecision'] ?? ($s['quotePrecision'] ?? 8)),
+            // PRICE_FILTER bounds (0 = no bound), PERCENT_PRICE_BY_SIDE and MAX_NUM_ORDERS (DESIGN-ENGINES.md §3)
+            'minPrice'             => '0.00000000',
+            'maxPrice'             => '0.00000000',
+            'bidMultiplierUp'      => 0.0,
+            'bidMultiplierDown'    => 0.0,
+            'askMultiplierUp'      => 0.0,
+            'askMultiplierDown'    => 0.0,
+            'avgPriceMins'         => 0,
+            'maxNumOrders'         => 200,
         ];
         $filters = isset($s['filters']) && is_array($s['filters']) ? $s['filters'] : [];
         $sawNotional = false;
@@ -280,6 +305,8 @@ final class Binance
                     break;
                 case 'PRICE_FILTER':
                     if (isset($f['tickSize'])) { $info['tickSize'] = (string)$f['tickSize']; }
+                    if (isset($f['minPrice'])) { $info['minPrice'] = (string)$f['minPrice']; }
+                    if (isset($f['maxPrice'])) { $info['maxPrice'] = (string)$f['maxPrice']; }
                     break;
                 case 'NOTIONAL':
                     // newer filter; takes precedence over MIN_NOTIONAL when both are present
@@ -292,11 +319,56 @@ final class Binance
                     if (isset($f['minNotional'])) { $info['minNotional'] = (float)$f['minNotional']; }
                     $info['applyMinToMarket'] = isset($f['applyToMarket']) ? (bool)$f['applyToMarket'] : true;
                     break;
+                case 'PERCENT_PRICE_BY_SIDE':
+                    if (isset($f['bidMultiplierUp']))   { $info['bidMultiplierUp']   = (float)$f['bidMultiplierUp']; }
+                    if (isset($f['bidMultiplierDown'])) { $info['bidMultiplierDown'] = (float)$f['bidMultiplierDown']; }
+                    if (isset($f['askMultiplierUp']))   { $info['askMultiplierUp']   = (float)$f['askMultiplierUp']; }
+                    if (isset($f['askMultiplierDown'])) { $info['askMultiplierDown'] = (float)$f['askMultiplierDown']; }
+                    if (isset($f['avgPriceMins']))      { $info['avgPriceMins']      = (int)$f['avgPriceMins']; }
+                    break;
+                case 'MAX_NUM_ORDERS':
+                    if (isset($f['maxNumOrders'])) { $info['maxNumOrders'] = (int)$f['maxNumOrders']; }
+                    break;
                 default:
                     break;
             }
         }
         return $info;
+    }
+
+    /**
+     * PERCENT_PRICE_BY_SIDE check (DESIGN-ENGINES.md §3): a BUY price must sit inside
+     * [reference × bidMultiplierDown, reference × bidMultiplierUp] and a SELL price inside
+     * [reference × askMultiplierDown, reference × askMultiplierUp].
+     *
+     * $reference is the exchange's average price over `avgPriceMins` minutes (avgPrice(), or the
+     * mid when that is what the caller has). Returns TRUE when the symbol has no such filter
+     * (both multipliers for that side are 0/absent) or when no usable reference is available —
+     * the filter can only reject, never invent a constraint. A non-positive price is rejected.
+     *
+     * @param array $info parsed symbol info from parseSymbolInfo()
+     */
+    public static function priceAllowed(float $price, string $side, float $reference, array $info): bool
+    {
+        $isSell = strtoupper(trim($side)) === 'SELL';
+        $up     = (float)($isSell ? ($info['askMultiplierUp']   ?? 0) : ($info['bidMultiplierUp']   ?? 0));
+        $down   = (float)($isSell ? ($info['askMultiplierDown'] ?? 0) : ($info['bidMultiplierDown'] ?? 0));
+        if ($up <= 0.0 && $down <= 0.0) {
+            return true;    // filter absent
+        }
+        if (!is_finite($price) || $price <= 0.0) {
+            return false;
+        }
+        if (!is_finite($reference) || $reference <= 0.0) {
+            return true;    // nothing to compare against
+        }
+        if ($up > 0.0 && $price > $reference * $up) {
+            return false;
+        }
+        if ($down > 0.0 && $price < $reference * $down) {
+            return false;
+        }
+        return true;
     }
 
     /** @return array rows [openTime(int), open, high, low, close, volume (floats), closeTime(int)] */
@@ -494,6 +566,125 @@ final class Binance
         return is_array($r) ? $r : [];
     }
 
+    // ------------------------------------------------------------------ limit orders (DESIGN-ENGINES.md §3)
+
+    /**
+     * Places a resting limit order. $qtyStr and $priceStr are pre-rounded exact decimal strings
+     * (Util::floorToStep / Util::roundToTick) — never a plain float cast.
+     *
+     * $postOnly sends LIMIT_MAKER (quantity + price, no timeInForce); the exchange rejects it with
+     * -2010 "Order would immediately match and take" when the quote would cross the book, which
+     * BinanceException::isPostOnlyReject() identifies as the normal outcome it is. Otherwise a
+     * plain LIMIT with timeInForce=GTC is sent.
+     *
+     * @return array raw FULL order response
+     */
+    public function limitOrder(string $symbol, string $side, string $qtyStr, string $priceStr, string $clientId, bool $postOnly): array
+    {
+        $params = [
+            'symbol' => $symbol,
+            'side'   => strtoupper(trim($side)) === 'SELL' ? 'SELL' : 'BUY',
+            'type'   => $postOnly ? 'LIMIT_MAKER' : 'LIMIT',
+        ];
+        if (!$postOnly) {
+            $params['timeInForce'] = 'GTC';
+        }
+        $params['quantity']         = $qtyStr;
+        $params['price']            = $priceStr;
+        $params['newClientOrderId'] = $clientId;
+        $params['newOrderRespType'] = 'FULL';
+        return $this->request('POST', '/api/v3/order', $params, true, false, true);
+    }
+
+    /**
+     * DELETE /api/v3/order by client id (weight 1).
+     *
+     * -2011 CANCEL_REJECTED means the order already left the book (filled, expired or cancelled
+     * elsewhere), which is a soft success: a synthetic response with status CANCEL_REJECTED and
+     * 'cancel_rejected' => true is returned instead of throwing, and the caller resolves the real
+     * state with getOrder(). Every other error still throws.
+     *
+     * @return array raw cancel response
+     */
+    public function cancelOrder(string $symbol, string $clientId): array
+    {
+        try {
+            return $this->request('DELETE', '/api/v3/order', [
+                'symbol'            => $symbol,
+                'origClientOrderId' => $clientId,
+            ], true, false, false);
+        } catch (BinanceException $e) {
+            if ($e->binanceCode !== -2011) {
+                throw $e;
+            }
+            return [
+                'symbol'            => $symbol,
+                'origClientOrderId' => $clientId,
+                'clientOrderId'     => $clientId,
+                'status'            => 'CANCEL_REJECTED',
+                'code'              => -2011,
+                'msg'               => $e->getMessage(),
+                'cancel_rejected'   => true,
+            ];
+        }
+    }
+
+    /**
+     * DELETE /api/v3/openOrders for one symbol (weight 1). -2011 (nothing open to cancel) is a
+     * soft success and yields an empty list.
+     *
+     * @return array raw list of cancel reports
+     */
+    public function cancelAllOrders(string $symbol): array
+    {
+        try {
+            $r = $this->request('DELETE', '/api/v3/openOrders', ['symbol' => $symbol], true, false, false);
+        } catch (BinanceException $e) {
+            if ($e->binanceCode !== -2011) {
+                throw $e;
+            }
+            return [];
+        }
+        return is_array($r) ? $r : [];
+    }
+
+    /**
+     * GET /api/v3/openOrders for ONE symbol (weight 6). The symbol is REQUIRED: without it the
+     * endpoint costs weight 80, which this client never spends.
+     *
+     * @return array [clientOrderId => ['order_id','symbol','side','price','orig_qty','executed_qty','status','time']]
+     */
+    public function openOrders(string $symbol): array
+    {
+        $symbol = trim($symbol);
+        if ($symbol === '') {
+            throw new InvalidArgumentException('Binance::openOrders() requires a symbol (an unfiltered call costs weight 80)');
+        }
+        $r = $this->request('GET', '/api/v3/openOrders', ['symbol' => $symbol], true, false, false);
+        $out = [];
+        foreach ($r as $o) {
+            if (!is_array($o)) {
+                continue;
+            }
+            $cid = isset($o['clientOrderId']) ? (string)$o['clientOrderId'] : '';
+            if ($cid === '') {
+                $cid = 'orderId:' . (isset($o['orderId']) ? (string)$o['orderId'] : '');
+            }
+            $time = isset($o['time']) ? (int)$o['time'] : (isset($o['updateTime']) ? (int)$o['updateTime'] : (isset($o['transactTime']) ? (int)$o['transactTime'] : 0));
+            $out[$cid] = [
+                'order_id'     => isset($o['orderId']) ? (string)$o['orderId'] : '',
+                'symbol'       => isset($o['symbol']) ? (string)$o['symbol'] : $symbol,
+                'side'         => strtoupper((string)($o['side'] ?? '')),
+                'price'        => (float)($o['price'] ?? 0),
+                'orig_qty'     => (float)($o['origQty'] ?? 0),
+                'executed_qty' => (float)($o['executedQty'] ?? 0),
+                'status'       => (string)($o['status'] ?? ''),
+                'time'         => $time,
+            ];
+        }
+        return $out;
+    }
+
     /** POST /api/v3/order/test. Returns true on success, throws BinanceException on rejection. */
     public function testOrder(array $params): bool
     {
@@ -516,7 +707,10 @@ final class Binance
      * @param array      $raw      order response
      * @param array      $info     parsed symbol info (needs 'base', 'quote', 'stepSize')
      * @param float|null $bnbPrice BNBUSDT price, only needed when a BNB commission is present
-     * @return array{qty:float, dust_qty:float, price:float, quote:float, fee_usdt:float, fee_asset:string, order_id:string, status:string, raw:array}
+     * @return array{qty:float, dust_qty:float, price:float, quote:float, fee_usdt:float, fee_asset:string, fee_base_usdt:float, order_id:string, status:string, raw:array}
+     *         fee_asset names the FIRST commission asset of the order; fee_base_usdt is the
+     *         base-asset part of fee_usdt (already netted off qty), so a mixed-asset order
+     *         (BNB balance running out mid-order) can still be booked exactly.
      */
     public static function normalizeOrder(array $raw, array $info, ?float $bnbPrice): array
     {
@@ -598,6 +792,7 @@ final class Binance
             'quote'     => $quote,
             'fee_usdt'  => $feeUsdt,
             'fee_asset' => $feeAsset,
+            'fee_base_usdt' => isset($commissions[$base]) ? (float)$commissions[$base] * $price : 0.0,
             'order_id'  => isset($raw['orderId']) ? (string)$raw['orderId'] : '',
             'status'    => (string)($raw['status'] ?? ''),
             'raw'       => $raw,

@@ -338,6 +338,13 @@ function handle_action(string $action, array $cfg, Db $db): void
             Panel::redirect('?page=dashboard');
             return;
 
+        case 'cancel_order':
+        case 'cancel_all':
+        case 'reanchor_grid':
+        case 'flatten_inventory':
+            handle_engine_action($action, $cfg, $db);
+            return;
+
         case 'save_settings':
         case 'test_api':
             handle_settings($action, $cfg, $db);
@@ -350,6 +357,106 @@ function handle_action(string $action, array $cfg, Db $db): void
     }
 }
 
+/* ------------------------------------------------------------ engine actions */
+
+/**
+ * The four engine actions of DESIGN-ENGINES.md §10, all POST + CSRF (checked globally before
+ * routing) and all inside Bot::runLocked so they can never race a cron tick:
+ *   cancel_order (one client_id) | cancel_all | reanchor_grid | flatten_inventory (confirm box)
+ * Each one redirects back to the dashboard with a flash.
+ */
+function handle_engine_action(string $action, array $cfg, Db $db): void
+{
+    if (!class_exists('Bot')) {
+        Panel::flash('danger', 'lib/Bot.php is missing - the engine actions are unavailable.');
+        Panel::redirect('?page=dashboard');
+    }
+    if ($action === 'flatten_inventory' && (!isset($_POST['confirm']) || $_POST['confirm'] !== '1')) {
+        Panel::flash('warn', 'Flatten inventory not executed: tick the confirmation box first.');
+        Panel::redirect('?page=dashboard');
+    }
+    $clientId = '';
+    if ($action === 'cancel_order') {
+        $clientId = isset($_POST['client_id']) && is_string($_POST['client_id']) ? trim($_POST['client_id']) : '';
+        if ($clientId === '' || strlen($clientId) > 64) {
+            Panel::flash('warn', 'Cancel order: no order was named.');
+            Panel::redirect('?page=dashboard');
+        }
+    }
+    set_time_limit(55);
+    try {
+        $fresh = trader_config(true);
+        $res = Bot::runLocked(static function () use ($fresh, $db, $action, $clientId): array {
+            $ex  = Exchange::factory($fresh, $db);
+            $bot = new Bot($fresh, $db, $ex);
+            if ($action === 'cancel_all') {
+                $n = $bot->cancelAllEngineOrders('panel_cancel_all');
+                return ['status' => 'ok', 'summary' => $n . ' resting order(s) cancelled.', 'ms' => 0];
+            }
+            if ($action === 'reanchor_grid') {
+                $bot->reanchorGrid();
+                $anchor = (string) $db->getState('grid_anchor', '');
+                return [
+                    'status'  => $anchor !== '' ? 'ok' : 'error',
+                    'summary' => $anchor !== ''
+                        ? 'Grid re-anchored at ' . Util::money((float) $anchor, 6) . '; the pause was cleared.'
+                        : 'Could not re-anchor: no book price for the engine symbol.',
+                    'ms'      => 0,
+                ];
+            }
+            if ($action === 'flatten_inventory') {
+                $r = $bot->flattenInventory();
+                return [
+                    'status'  => !empty($r['ok']) ? 'ok' : 'error',
+                    'summary' => (string) ($r['message'] ?? '')
+                        . (isset($r['cancelled']) && (int) $r['cancelled'] > 0 ? ' ' . (int) $r['cancelled'] . ' resting order(s) cancelled.' : ''),
+                    'ms'      => 0,
+                ];
+            }
+            // cancel_order: one resting order, resolved through EngineOrders so a fill that
+            // beat the cancel is still booked (lots / cycles) instead of being lost
+            $row = $db->engineOrder($clientId);
+            if ($row === null) {
+                return ['status' => 'error', 'summary' => 'Unknown order ' . $clientId . '.', 'ms' => 0];
+            }
+            $symbol = strtoupper((string) $row['symbol']);
+            $ok     = panel_engine_orders($fresh, $db, $ex, $symbol)->cancel($clientId);
+            $after  = $db->engineOrder($clientId);
+            $status = $after !== null ? strtoupper((string) $after['status']) : 'UNKNOWN';
+            return [
+                'status'  => $ok ? 'ok' : 'error',
+                'summary' => $ok
+                    ? 'Order ' . $clientId . ' left the book (' . $status . ').'
+                    : 'Order ' . $clientId . ' could not be cancelled (' . $status . ').',
+                'ms'      => 0,
+            ];
+        });
+        $status = (string) ($res['status'] ?? 'ok');
+        if ($status === 'skipped') {
+            Panel::flash('warn', 'Skipped: a tick is running right now. Try again in a few seconds.');
+        } else {
+            Panel::flash($status === 'ok' ? 'ok' : 'warn', (string) ($res['summary'] ?? ''));
+        }
+    } catch (Throwable $e) {
+        Log::error('panel: engine action ' . $action . ' failed - ' . $e->getMessage());
+        Panel::flash('danger', 'Engine action failed: ' . $e->getMessage());
+    }
+    Panel::redirect('?page=dashboard');
+}
+
+/** EngineOrders bound to $symbol, using the cached symbol info so the panel spends no extra weight. */
+function panel_engine_orders(array $cfg, Db $db, ExchangeInterface $ex, string $symbol): EngineOrders
+{
+    $cached = $db->getStateJson('symbol_info', []);
+    $info   = (is_array($cached) && isset($cached[$symbol]) && is_array($cached[$symbol])) ? $cached[$symbol] : [];
+    if ($info === []) {
+        $fetched = $ex->symbolInfo([$symbol]);
+        $info    = isset($fetched[$symbol]) && is_array($fetched[$symbol]) ? $fetched[$symbol] : [];
+    }
+    $cfg['engine_symbol'] = $symbol;
+    return new EngineOrders($cfg, $db, $ex, $info);
+}
+
 /** Keys shown on the settings form (every §3 key except the hashes, cron_key and force_https). */
 function settings_keys(): array
 {
@@ -358,14 +465,25 @@ function settings_keys(): array
         'cooldown_after_loss_min', 'cooldown_after_2_losses_min', 'take_profit_pct', 'take_profit_max_pct', 'stop_loss_pct',
         'trailing_activate_pct', 'trailing_distance_pct', 'trailing_floor_pct', 'max_hold_minutes', 'entry_threshold', 'adaptive',
         'candle_interval', 'trend_interval', 'atr_min_pct', 'atr_max_pct', 'atr1h_min_pct', 'atr1h_max_pct', 'max_spread_pct',
-        'fee_pct', 'paper_start_usdt', 'recv_window', 'timezone'];
+        'fee_pct', 'paper_start_usdt', 'recv_window', 'timezone',
+        // engines (DESIGN-ENGINES.md §2)
+        'engine', 'allow_live_engines', 'engine_symbol', 'engine_max_orders', 'post_only',
+        'grid_levels', 'grid_spacing_pct', 'grid_order_usdt', 'grid_range_up_pct', 'grid_range_down_pct', 'grid_exit_liquidates',
+        'pmm_spread_pct', 'pmm_order_usdt', 'pmm_refresh_sec', 'pmm_target_base_pct', 'pmm_max_base_pct'];
+}
+
+/** Settings keys rendered as checkboxes: absent from the POST means "off", never "unchanged". */
+function settings_checkbox_keys(): array
+{
+    return ['enabled', 'adaptive', 'allow_live_engines', 'grid_exit_liquidates', 'post_only'];
 }
 
 function handle_settings(string $action, array $cfg, Db $db): void
 {
-    $in = [];
+    $in    = [];
+    $boxes = settings_checkbox_keys();
     foreach (settings_keys() as $key) {
-        if ($key === 'enabled' || $key === 'adaptive') {
+        if (in_array($key, $boxes, true)) {
             $in[$key] = isset($_POST[$key]) ? '1' : '0';
             continue;
         }
@@ -374,15 +492,18 @@ function handle_settings(string $action, array $cfg, Db $db): void
         }
     }
     // the secret is write-only: blank keeps the stored one (validateConfig skips blanks)
-    list($newCfg, $errors) = Risk::validateConfig($in, $cfg);
-    $newMode = (string) ($newCfg['mode'] ?? 'paper');
+    $validated = Risk::validateConfig($in, $cfg);
+    $newCfg    = $validated[0];
+    $errors    = isset($validated[1]) && is_array($validated[1]) ? $validated[1] : [];
+    $warnings  = isset($validated[2]) && is_array($validated[2]) ? $validated[2] : [];
+    $newMode   = (string) ($newCfg['mode'] ?? 'paper');
 
     if ($action === 'test_api') {
         $result = panel_test_api($newCfg);
         // show the form again with the posted values (never the secret)
         $shown = $newCfg;
         $shown['api_secret'] = (string) ($cfg['api_secret'] ?? '');
-        echo panel_layout('Settings', page_settings($cfg, $db, $shown, $errors, $result), ['page' => 'settings']);
+        echo panel_layout('Settings', page_settings($cfg, $db, $shown, $errors, $result, $warnings), ['page' => 'settings']);
         exit;
     }
 
@@ -393,7 +514,7 @@ function handle_settings(string $action, array $cfg, Db $db): void
         $errors[] = 'Mode "' . $newMode . '" needs both an API key and a secret.';
     }
     if ($errors !== []) {
-        echo panel_layout('Settings', page_settings($cfg, $db, $newCfg, $errors, ''), ['page' => 'settings']);
+        echo panel_layout('Settings', page_settings($cfg, $db, $newCfg, $errors, '', $warnings), ['page' => 'settings']);
         exit;
     }
     // never let the form touch these
@@ -429,7 +550,41 @@ function handle_settings(string $action, array $cfg, Db $db): void
                 $db->setState($k, null);
             }
         }
+
+        // The engine (or its symbol) just changed: no tick will ever sync the ladder the
+        // previous engine left behind (Bot::tick() only runs an engine tick while engine
+        // !== 'signal'), and the dashboard block that could cancel it is hidden as soon as
+        // the engine card goes away. So take it off the book here. Inventory is kept: it is
+        // real base, and the operator flattens or sells it deliberately.
+        $engOld = strtolower(trim((string) ($cfg['engine'] ?? 'signal')));
+        $engNew = strtolower(trim((string) ($newCfg['engine'] ?? 'signal')));
+        $symOld = strtoupper(trim((string) ($cfg['engine_symbol'] ?? '')));
+        $symNew = strtoupper(trim((string) ($newCfg['engine_symbol'] ?? '')));
+        if (($engOld !== $engNew || $symOld !== $symNew) && class_exists('Bot')) {
+            try {
+                $res = Bot::runLocked(static function () use ($newCfg, $db): array {
+                    $ex  = Exchange::factory($newCfg, $db);
+                    $bot = new Bot($newCfg, $db, $ex);
+                    return ['status' => 'ok', 'summary' => (string) $bot->cancelAllEngineOrders('engine_changed'), 'ms' => 0];
+                });
+                if ((string) ($res['status'] ?? '') === 'skipped') {
+                    Panel::flash('warn', 'A tick was running, so the previous engine\'s resting orders were left on the book: press "Cancel all orders" on the dashboard.');
+                } else {
+                    $n = (int) ($res['summary'] ?? 0);
+                    if ($n > 0) {
+                        Panel::flash('warn', $n . ' resting order(s) of the previous engine were cancelled. Inventory it still holds stays in the wallet - switch back and use "Flatten inventory" to sell it.');
+                    }
+                }
+            } catch (Throwable $e) {
+                Log::error('panel: cancelling the previous engine orders failed - ' . $e->getMessage());
+                Panel::flash('warn', 'The previous engine\'s resting orders could not be cancelled: ' . $e->getMessage());
+            }
+        }
+
         Panel::flash('ok', 'Settings saved' . ($changed !== [] ? ' (' . implode(', ', $changed) . ')' : ' (no changes)') . '.');
+        foreach ($warnings as $w) {
+            Panel::flash('warn', (string) $w);
+        }
     } catch (Throwable $e) {
         Panel::flash('danger', 'Could not save: ' . $e->getMessage());
     }
@@ -592,6 +747,19 @@ function page_errors(array $errors): string
     return $h . '</ul></div>';
 }
 
+/** Non-blocking notices from Risk::validateConfig (the config was still saved). */
+function page_warnings(array $warnings): string
+{
+    if ($warnings === []) {
+        return '';
+    }
+    $h = '<div class="flash flash-warn"><strong>Please note:</strong><ul>';
+    foreach ($warnings as $w) {
+        $h .= '<li>' . Panel::e((string) $w) . '</li>';
+    }
+    return $h . '</ul></div>';
+}
+
 function page_cron(array $cfg): string
 {
     $e = 'Panel::e';
@@ -652,6 +820,11 @@ function page_dashboard(array $cfg, array $s): string
     $h .= Panel::kpi($s, 'effective_threshold', 'Entry threshold');
     $h .= Panel::kpi($s, 'equity_hwm', 'High-water mark');
     $h .= '</section>';
+
+    // ---- engine block (DESIGN-ENGINES.md §10): rendered only when grid or pmm is selected.
+    // The signal-engine cards below stay exactly as they are when engine === 'signal'.
+    $engineOn = !empty($s['show']['engine']);
+    $h .= panel_engine_dashboard($s, $quote, $engineOn);
 
     // ---- three cards: API health, position, sparkline
     $h .= '<section class="grid3">';
@@ -722,6 +895,94 @@ function page_dashboard(array $cfg, array $s): string
     return $h;
 }
 
+/**
+ * Engine card, actions, open orders, cycles and cycle KPIs (DESIGN-ENGINES.md §10).
+ * Every section carries data-show="engine" so assets/panel.js reveals or hides the whole
+ * block when the engine changes, without a page reload and without an inline style.
+ */
+function panel_engine_dashboard(array $s, string $quote, bool $on): string
+{
+    $e   = 'Panel::e';
+    $hid = $on ? '' : ' hidden';
+
+    $h  = '<section class="card engine-card" data-show="engine"' . $hid . '>';
+    $h .= '<h2>Engine ' . Panel::pill((string) ($s['text']['eng_name'] ?? '–'), (string) ($s['levels']['eng_name'] ?? 'muted'), 'eng_name')
+        . ' ' . Panel::pill((string) ($s['text']['eng_state'] ?? '–'), (string) ($s['levels']['eng_state'] ?? 'muted'), 'eng_state') . '</h2>';
+    $h .= '<p class="flash flash-danger" data-show="engine_live_blocked" hidden>This engine is in <strong>live</strong> mode with '
+        . '<code>allow_live_engines</code> off: it places no order at all and every tick reports <code>engine_live_blocked</code>. '
+        . 'Enable the setting in Settings → Engine, or switch the mode back to paper, demo or testnet.</p>';
+
+    // actions
+    $h .= '<div class="actions-row">';
+    $h .= panel_action_form('cancel_all', 'Cancel all orders', 'btn btn-warn', false);
+    $h .= '<span class="inline-group" data-show="grid_engine"' . (!empty($s['show']['grid_engine']) ? '' : ' hidden') . '>'
+        . '<form method="post" action="index.php" class="inline" data-confirm="Re-anchor the grid on the current mid price? This also clears a range-exit pause.">'
+        . Panel::csrfField() . '<input type="hidden" name="action" value="reanchor_grid">'
+        . '<button type="submit" class="btn">Re-anchor grid</button></form></span>';
+    $h .= '<form method="post" action="index.php" class="inline panic" data-confirm="FLATTEN INVENTORY: cancel every resting order and market-sell the whole engine inventory. Continue?">'
+        . Panel::csrfField() . '<input type="hidden" name="action" value="flatten_inventory">'
+        . '<label class="check small"><input type="checkbox" name="confirm" value="1" required> confirm</label>'
+        . '<button type="submit" class="btn btn-danger">Flatten inventory</button></form>';
+    $h .= '</div>';
+
+    // card body
+    $h .= '<div class="grid3 engine-kv">';
+    $h .= '<dl class="kv">';
+    $h .= panel_kv($s, 'Engine', 'eng_name');
+    $h .= panel_kv($s, 'Symbol', 'eng_symbol');
+    $h .= panel_kv($s, 'Last price', 'eng_price');
+    $h .= panel_kv($s, 'Live orders', 'eng_orders');
+    $h .= '</dl>';
+    $h .= '<dl class="kv">';
+    $h .= panel_kv($s, 'Inventory', 'eng_inventory');
+    $h .= panel_kv($s, 'Inventory cost', 'eng_inv_cost');
+    $h .= panel_kv($s, 'Inventory at bid', 'eng_inv_value');
+    $h .= panel_kv($s, 'Unrealised', 'eng_unreal', true);
+    $h .= '</dl>';
+    $h .= '<div data-show="grid_engine"' . (!empty($s['show']['grid_engine']) ? '' : ' hidden') . '><dl class="kv">';
+    $h .= panel_kv($s, 'Anchor', 'eng_anchor');
+    $h .= panel_kv($s, 'Anchored at', 'eng_anchor_at');
+    $h .= panel_kv($s, 'Range up', 'eng_range_up', true);
+    $h .= panel_kv($s, 'Range down', 'eng_range_down', true);
+    $h .= panel_kv($s, 'Rung spacing', 'eng_spacing');
+    $h .= '</dl></div>';
+    $h .= '<div data-show="pmm_engine"' . (!empty($s['show']['pmm_engine']) ? '' : ' hidden') . '><dl class="kv">';
+    $h .= panel_kv($s, 'Half-spread', 'eng_spread');
+    $h .= panel_kv($s, 'Re-quote age', 'eng_refresh');
+    $h .= '</dl>';
+    $h .= '<p class="muted small">pmm is expected to lose money at VIP0 fees: a round trip costs about 0.2 % while typical '
+        . 'spreads on the majors are 0.01–0.05 %. Watch the realised cycle PnL below, not the fill count.</p></div>';
+    $h .= '</div></section>';
+
+    // cycle KPIs
+    $h .= '<section class="kpis" data-show="engine"' . $hid . '>';
+    $h .= Panel::kpi($s, 'eng_cycles_today', 'Cycles today');
+    $h .= Panel::kpi($s, 'eng_cycles', 'Cycles total');
+    $h .= Panel::kpi($s, 'eng_pnl_today', 'Cycle PnL today', true);
+    $h .= Panel::kpi($s, 'eng_pnl', 'Cycle PnL realised', true);
+    $h .= Panel::kpi($s, 'eng_fees', 'Cycle fees');
+    $h .= Panel::kpi($s, 'eng_win_rate', 'Cycle win rate');
+    $h .= '</section>';
+
+    // open orders
+    $h .= '<section class="card" data-show="engine"' . $hid . '><h2>Open orders</h2><div class="table-wrap">'
+        . '<table class="tbl"><thead><tr><th>Side</th><th>Level</th><th>Price</th><th>Qty</th><th>Quote ' . $e($quote) . '</th>'
+        . '<th>Age</th><th>Status</th><th></th></tr></thead>'
+        . '<tbody data-table="engine_orders" data-cols="8">' . Panel::tableRows($s['tables']['engine_orders']) . '</tbody>'
+        . '</table></div><p class="muted small">The engine owns the order book of its symbol: anything resting there that it does not '
+        . 'track is cancelled on the next tick. Cancelling here resolves the order against the exchange first, so a fill that beat the '
+        . 'cancel is still booked into the lots and cycles.</p></section>';
+
+    // cycles
+    $h .= '<section class="card" data-show="engine"' . $hid . '><h2>Cycles (last 30)</h2><div class="table-wrap">'
+        . '<table class="tbl"><thead><tr><th>Level</th><th>Buy</th><th>Sell</th><th>Qty</th><th>PnL ' . $e($quote) . '</th><th>Closed</th></tr></thead>'
+        . '<tbody data-table="cycles" data-cols="6">' . Panel::tableRows($s['tables']['cycles']) . '</tbody>'
+        . '</table></div><p class="muted small">One row per realised buy → sell round trip, FIFO. PnL is net: the sell fee is deducted '
+        . 'and the buy fee is already inside the buy price.</p></section>';
+
+    return $h;
+}
+
 function panel_action_form(string $action, string $label, string $class, bool $disabled): string
 {
     return '<form method="post" action="index.php" class="inline">' . Panel::csrfField()
@@ -742,11 +1003,17 @@ function panel_kv(array $s, string $label, string $key, bool $pill = false): str
 
 /* -------------------------------------------------------------- settings */
 
-function page_settings(array $cfg, Db $db, array $v, array $errors, string $testResult): string
+function page_settings(array $cfg, Db $db, array $v, array $errors, string $testResult, array $warnings = []): string
 {
     $e = 'Panel::e';
+    foreach (panel_engine_defaults() as $k => $d) {
+        if (!isset($v[$k])) {
+            $v[$k] = $d;   // the form still renders on an install whose config predates the engines
+        }
+    }
     $h  = '<section class="card"><h1>Settings</h1>';
     $h .= page_errors($errors);
+    $h .= page_warnings($warnings);
     if ($testResult !== '') {
         $lvl = strpos($testResult, 'OK:') === 0 ? 'ok' : (strpos($testResult, 'PARTIAL') === 0 ? 'warn' : 'danger');
         $h .= '<div class="flash flash-' . $lvl . '">' . $e($testResult) . '</div>';
@@ -778,6 +1045,65 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     $h .= '<label>Symbols (comma separated, must end with the quote asset)<textarea name="symbols" rows="2">' . $e($symbols) . '</textarea></label>';
     $h .= panel_input('quote_asset', $v, 'Quote asset', 'text');
     $h .= '</div></fieldset>';
+
+    // -- engine (DESIGN-ENGINES.md §2, §10)
+    $engine = strtolower(trim((string) ($v['engine'] ?? 'signal')));
+    if (!in_array($engine, ['signal', 'grid', 'pmm'], true)) {
+        $engine = 'signal';
+    }
+    $h .= '<fieldset><legend>Engine</legend>';
+    $h .= '<div class="grid3">';
+    $h .= '<label>Engine<span class="muted help">signal trades one position at a time on the watchlist; grid and pmm quote one symbol continuously</span>'
+        . '<select name="engine" data-engine-select>';
+    foreach ([
+        'signal' => 'signal - mean-reversion, market orders, one position',
+        'grid'   => 'grid - ladder of resting limit orders',
+        'pmm'    => 'pmm - pure market making (expected to lose at VIP0 fees)',
+    ] as $k => $label) {
+        $h .= '<option value="' . $e($k) . '"' . ($engine === $k ? ' selected' : '') . '>' . $e($label) . '</option>';
+    }
+    $h .= '</select></label>';
+    $h .= panel_input('engine_symbol', $v, 'Engine symbol', 'text', 'the single pair grid / pmm trade - they do not use the watchlist');
+    $h .= panel_input('engine_max_orders', $v, 'Max simultaneous orders', 'number', '1-20; also held under the symbol MAX_NUM_ORDERS - 2', '1');
+    $h .= '</div>';
+    $h .= panel_check('post_only', $v, 'Post-only quotes (LIMIT_MAKER).',
+        '<span class="muted">A quote that would match immediately is rejected and simply skipped for that tick - that rejection is normal. Unticked uses LIMIT + GTC, which can take.</span>');
+    $h .= panel_check('allow_live_engines', $v, 'Allow grid / pmm to run in LIVE mode.',
+        '<span class="danger">Warning: grid and pmm refuse to place a single order in live mode while this is off '
+        . '(the tick reports <code>engine_live_blocked</code>). Only turn it on once you have run the engine in paper, demo or testnet '
+        . 'and understand that it trades real money continuously.</span>');
+
+    // signal
+    $h .= panel_engine_group('signal', $engine,
+        '<p class="muted">The signal engine is configured by the sections below (watchlist, sizing, exits, strategy). '
+        . 'The grid and pmm fields do not apply to it.</p>');
+
+    // grid
+    $grid  = '<div class="grid3">';
+    $grid .= panel_input('grid_levels', $v, 'Buy rungs below the anchor', 'number', '1-20, and under engine_max_orders', '1');
+    $grid .= panel_input('grid_spacing_pct', $v, 'Rung spacing %', 'number', 'must be at least 2 x fee % + 0.1, otherwise a round trip cannot pay for itself');
+    $grid .= panel_input('grid_order_usdt', $v, 'Quote per rung', 'number', 'must clear the symbol required size (minNotional + step)');
+    $grid .= panel_input('grid_range_up_pct', $v, 'Range up %', 'number', 'mid above anchor x (1 + x) ends the grid');
+    $grid .= panel_input('grid_range_down_pct', $v, 'Range down %', 'number', 'mid below anchor x (1 - x) ends the grid');
+    $grid .= '</div>';
+    $grid .= panel_check('grid_exit_liquidates', $v, 'On a range exit, also market-sell the inventory.',
+        '<span class="muted">Off keeps the base in the wallet; a range exit always cancels every resting order and pauses the grid until you press "Re-anchor grid".</span>');
+    $h .= panel_engine_group('grid', $engine, $grid);
+
+    // pmm
+    $pmm  = '<div class="flash flash-warn"><strong>pmm is expected to LOSE money at VIP0 fees.</strong> Binance charges 0.1 % maker, '
+          . 'identical to taker, so a round trip costs about 0.2 % while observed spreads on the majors are 0.01-0.05 %. '
+          . 'It is here because it was asked for, and it becomes viable at a better fee tier, on wide-spread pairs, or with maker rebates. '
+          . 'Run it in paper or demo mode and watch the cycle KPIs before you consider anything else.</div>';
+    $pmm .= '<div class="grid3">';
+    $pmm .= panel_input('pmm_spread_pct', $v, 'Half-spread % each side', 'number', 'bid = mid x (1 - x), ask = mid x (1 + x)');
+    $pmm .= panel_input('pmm_order_usdt', $v, 'Quote per quote-order', 'number', 'the inventory skew scales it, never above 1.5 x');
+    $pmm .= panel_input('pmm_refresh_sec', $v, 'Re-quote age (s)', 'number', 'quotes older than this are cancelled and replaced', '1');
+    $pmm .= panel_input('pmm_target_base_pct', $v, 'Target base %', 'number', 'share of engine equity held as base');
+    $pmm .= panel_input('pmm_max_base_pct', $v, 'Max base %', 'number', 'above this stop bidding; below 100 - this stop asking');
+    $pmm .= '</div>';
+    $h .= panel_engine_group('pmm', $engine, $pmm);
+    $h .= '</fieldset>';
 
     // -- sizing & kill switches
     $h .= '<fieldset><legend>Sizing &amp; kill switches</legend><div class="grid3">';
@@ -854,6 +1180,41 @@ function panel_input(string $key, array $v, string $label, string $type = 'numbe
         $attrs .= ' type="text" spellcheck="false"';
     }
     return '<label>' . Panel::e($label) . ($help !== '' ? ' <span class="muted help">' . Panel::e($help) . '</span>' : '') . '<input' . $attrs . '></label>';
+}
+
+/**
+ * Checkbox row. $extraHtml is trusted static markup written in this file (never user data);
+ * the label itself and every value still go through Panel::e().
+ */
+function panel_check(string $key, array $v, string $label, string $extraHtml = ''): string
+{
+    return '<label class="check"><input type="checkbox" name="' . Panel::e($key) . '" value="1"'
+        . (!empty($v[$key]) ? ' checked' : '') . '> ' . Panel::e($label)
+        . ($extraHtml !== '' ? ' ' . $extraHtml : '') . '</label>';
+}
+
+/**
+ * One engine's field group. Only the selected engine's group is visible; assets/panel.js
+ * toggles the `is-hidden` CLASS on the select's change event (the CSP forbids inline JS and
+ * inline style attributes, so visibility is a class in assets/panel.css and nothing else).
+ */
+function panel_engine_group(string $name, string $current, string $body): string
+{
+    return '<div class="engine-group' . ($name === $current ? '' : ' is-hidden') . '"'
+        . ' data-engine-group="' . Panel::e($name) . '">' . $body . '</div>';
+}
+
+/** DESIGN-ENGINES.md §2 defaults, used only to render the form when config.php has no value yet. */
+function panel_engine_defaults(): array
+{
+    return [
+        'engine' => 'signal', 'allow_live_engines' => false, 'engine_symbol' => 'DOGEUSDT',
+        'engine_max_orders' => 12, 'post_only' => true,
+        'grid_levels' => 6, 'grid_spacing_pct' => 0.60, 'grid_order_usdt' => 1.30,
+        'grid_range_up_pct' => 4.0, 'grid_range_down_pct' => 6.0, 'grid_exit_liquidates' => false,
+        'pmm_spread_pct' => 0.25, 'pmm_order_usdt' => 1.30, 'pmm_refresh_sec' => 60,
+        'pmm_target_base_pct' => 50, 'pmm_max_base_pct' => 80,
+    ];
 }
 
 function panel_select(string $key, array $v, string $label, array $options): string

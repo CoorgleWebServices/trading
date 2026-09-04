@@ -550,10 +550,35 @@ final class Panel
             $td .= '<span class="bar-text">' . self::e($text) . '</span>';
         } elseif (isset($cell['pill'])) {
             $td .= self::pill($text, (string) $cell['pill']);
+        } elseif (isset($cell['btn']) && is_array($cell['btn'])) {
+            $td .= self::actionButton($cell['btn'], $text);
         } else {
             $td .= self::e($text);
         }
         return $td . '</td>';
+    }
+
+    /**
+     * Inline POST form for a per-row action button: `['t' => 'Cancel', 'btn' => ['action' => …,
+     * 'fields' => ['client_id' => …], 'class' => …]]`. The CSRF token is included, the classes
+     * live in assets/panel.css and nothing is inlined — assets/panel.js rebuilds the identical
+     * markup when it refreshes the table.
+     */
+    public static function actionButton(array $btn, string $label): string
+    {
+        $action = isset($btn['action']) ? (string) $btn['action'] : '';
+        if ($action === '') {
+            return '';
+        }
+        $class  = isset($btn['class']) && (string) $btn['class'] !== '' ? (string) $btn['class'] : 'btn btn-mini';
+        $fields = isset($btn['fields']) && is_array($btn['fields']) ? $btn['fields'] : [];
+        $h = '<form method="post" action="index.php" class="inline">' . self::csrfField()
+           . '<input type="hidden" name="action" value="' . self::e($action) . '">';
+        foreach ($fields as $k => $v) {
+            $h .= '<input type="hidden" name="' . self::e((string) $k) . '" value="' . self::e($v) . '">';
+        }
+        return $h . '<button type="submit" class="' . self::e($class) . '">'
+            . self::e($label !== '' ? $label : 'Go') . '</button></form>';
     }
 
     /**
@@ -991,6 +1016,14 @@ final class Panel
         }
         $tables['logs'] = ['rows' => $rows, 'cols' => 3, 'empty' => 'No log entries yet'];
 
+        // ---- engine card, open orders, cycles (DESIGN-ENGINES.md §10)
+        $eng    = self::engineBlock($cfg, $db, $st, $now, $tz);
+        $text   = array_merge($text, $eng['text']);
+        $levels = array_merge($levels, $eng['levels']);
+        $raw    = array_merge($raw, $eng['raw']);
+        $tables = array_merge($tables, $eng['tables']);
+        $show   = array_merge($show, $eng['show']);
+
         $text['now']         = self::fmtTime($nowIso, $tz) . ' ' . $tz;
         $text['api_key_fp']  = self::keyFingerprint((string) ($cfg['api_key'] ?? ''));
 
@@ -1004,8 +1037,299 @@ final class Panel
             'tables'    => $tables,
             'sparkline' => $spark,
             'position'  => $posPayload,
+            'engine'    => $eng['payload'],
             'raw'       => $raw,
             'refresh_s' => 20,
+        ];
+    }
+
+
+    /**
+     * Engine card, open-order table, cycle table and cycle KPIs (DESIGN-ENGINES.md §10).
+     *
+     * Always returns the whole shape, even for the signal engine, so `?api=status` keeps one
+     * stable contract and panel.js never has to test for missing keys; `show.engine` is what
+     * decides whether the dashboard renders the block at all.
+     *
+     * @return array{text: array, levels: array, raw: array, tables: array, show: array, payload: array}
+     */
+    private static function engineBlock(array $cfg, Db $db, callable $st, int $now, string $tz): array
+    {
+        $engine = strtolower(trim((string) ($cfg['engine'] ?? 'signal')));
+        if (!in_array($engine, ['signal', 'grid', 'pmm'], true)) {
+            $engine = 'signal';
+        }
+        $active = $engine !== 'signal';
+        $symbol = strtoupper(trim((string) ($cfg['engine_symbol'] ?? '')));
+        $quote  = (string) ($cfg['quote_asset'] ?? 'USDT');
+        $mode   = (string) ($cfg['mode'] ?? 'paper');
+        $base   = '';
+
+        $text   = [];
+        $levels = [];
+        $raw    = [];
+
+        // ---- symbol info + last seen price (the engine symbol need not be on the watchlist,
+        //      so symbol_metrics may not carry it; the last engine trade is then the best price)
+        $info = null;
+        try {
+            $all = $db->getStateJson('symbol_info', []);
+            if (is_array($all) && $symbol !== '' && isset($all[$symbol]) && is_array($all[$symbol])) {
+                $info = $all[$symbol];
+                $base = (string) ($info['base'] ?? '');
+            }
+        } catch (Throwable $e) {
+            $info = null;
+        }
+        if ($base === '' && $symbol !== '' && strlen($symbol) > strlen($quote) && substr($symbol, -strlen($quote)) === $quote) {
+            $base = substr($symbol, 0, -strlen($quote));
+        }
+        $price = 0.0;
+        try {
+            $metrics = $db->getStateJson('symbol_metrics', []);
+            if (is_array($metrics) && $symbol !== '' && isset($metrics[$symbol]['price'])) {
+                $price = self::f($metrics[$symbol]['price']);
+            }
+        } catch (Throwable $e) {
+            $price = 0.0;
+        }
+        if ($price <= 0.0 && $symbol !== '') {
+            try {
+                $q = $db->pdo()->prepare('SELECT price FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1');
+                $q->execute([$symbol]);
+                $v = $q->fetchColumn();
+                $price = ($v === false || $v === null) ? 0.0 : self::f($v);
+            } catch (Throwable $e) {
+                $price = 0.0;
+            }
+        }
+
+        // ---- KPIs, inventory and cycles
+        $stats  = ['cycles' => 0, 'pnl' => 0.0, 'fees' => 0.0, 'wins' => 0, 'losses' => 0,
+                   'win_rate' => 0.0, 'inventory_qty' => 0.0, 'inventory_cost' => 0.0];
+        $cycles = [];
+        $pnlToday = 0.0;
+        try {
+            $stats = array_merge($stats, $db->engineStats($mode, $active ? $engine : null));
+        } catch (Throwable $e) {
+            // table missing (older install): the card just shows zeros
+        }
+        try {
+            $cycles = $db->cycles(30, $mode, $active ? $engine : null);
+        } catch (Throwable $e) {
+            $cycles = [];
+        }
+        $todayStart = Util::todayUtc() . 'T00:00:00Z';
+        try {
+            $pnlToday = $db->cyclePnl($todayStart, $mode, $active ? $engine : null);
+        } catch (Throwable $e) {
+            $pnlToday = 0.0;
+        }
+        $cyclesToday = 0;
+        foreach ($cycles as $c) {
+            if (strcmp((string) ($c['closed_at'] ?? ''), $todayStart) >= 0) {
+                $cyclesToday++;
+            }
+        }
+
+        $invQty  = self::f($stats['inventory_qty']);
+        $invCost = self::f($stats['inventory_cost']);
+        $invVal  = $price > 0.0 ? $invQty * $price : 0.0;
+        $unreal  = ($price > 0.0 && $invQty > 0.0) ? $invVal - $invCost : 0.0;
+
+        // ---- open orders
+        $open = [];
+        try {
+            // the table carries per-order Cancel buttons that act through the CURRENT mode's
+            // exchange, so it must only ever show the current mode's rows (strtolower/trim
+            // matches how EngineOrders normalises the mode it writes)
+            $open = $symbol !== ''
+                ? $db->openEngineOrders($symbol, strtolower(trim($mode)))
+                : $db->engineOrders(Db::ENGINE_LIVE_STATUSES, strtolower(trim($mode)));
+        } catch (Throwable $e) {
+            $open = [];
+        }
+        $cap = (int) self::f($cfg['engine_max_orders'] ?? 12, 12.0);
+        if ($cap < 1) {
+            $cap = 1;
+        }
+
+        // ---- anchor and range edges (grid only)
+        $anchor   = 0.0;
+        $anchorAt = '';
+        if ((string) $st('grid_symbol', '') === $symbol && $symbol !== '') {
+            $anchor   = self::f($st('grid_anchor', '0'));
+            $anchorAt = $st('grid_anchor_at', '');
+        }
+        $upPct   = self::f($cfg['grid_range_up_pct'] ?? 4.0, 4.0);
+        $downPct = self::f($cfg['grid_range_down_pct'] ?? 6.0, 6.0);
+        $upEdge   = $anchor > 0.0 ? $anchor * (1.0 + $upPct / 100.0) : 0.0;
+        $downEdge = $anchor > 0.0 ? $anchor * (1.0 - $downPct / 100.0) : 0.0;
+
+        // ---- state pill
+        $liveBlocked = $active && $mode === 'live' && empty($cfg['allow_live_engines']);
+        $gridPause   = (string) $st('grid_paused_reason', '');
+        if (!$active) {
+            $stateText  = 'signal engine';
+            $stateLevel = 'muted';
+        } elseif ($liveBlocked) {
+            $stateText  = 'BLOCKED in live mode (allow_live_engines is off)';
+            $stateLevel = 'danger';
+        } elseif ($gridPause !== '') {
+            $stateText  = 'PAUSED (' . $gridPause . ') - re-anchor to resume';
+            $stateLevel = 'warn';
+        } elseif (empty($cfg['enabled'])) {
+            $stateText  = 'PAUSED (entries disabled)';
+            $stateLevel = 'warn';
+        } elseif ($open !== []) {
+            $stateText  = 'quoting';
+            $stateLevel = 'ok';
+        } else {
+            $stateText  = 'idle (no resting order)';
+            $stateLevel = 'muted';
+        }
+
+        $text['eng_name']      = strtoupper($engine);
+        $levels['eng_name']    = $active ? ($engine === 'pmm' ? 'warn' : 'info') : 'muted';
+        $text['eng_state']     = $stateText;
+        $levels['eng_state']   = $stateLevel;
+        $text['eng_symbol']    = $symbol !== '' ? $symbol : '-';
+        $text['eng_price']     = $price > 0.0 ? Util::money($price, 6) : '-';
+        $text['eng_anchor']    = $anchor > 0.0
+            ? Util::money($anchor, 6) . ($anchorAt !== '' ? ' (' . self::ago($anchorAt, $now) . ')' : '')
+            : ($engine === 'grid' ? 'not anchored yet' : '-');
+        $text['eng_anchor_at'] = $anchorAt !== '' ? self::fmtTime($anchorAt, $tz) : '-';
+        $text['eng_range_up']   = $upEdge > 0.0
+            ? Util::money($upEdge, 6) . ' (+' . Util::money($upPct, 2) . ' %'
+              . ($price > 0.0 ? ', ' . self::pct(($upEdge - $price) / $price * 100.0, 2, true) . ' away' : '') . ')'
+            : '-';
+        $text['eng_range_down'] = $downEdge > 0.0
+            ? Util::money($downEdge, 6) . ' (-' . Util::money($downPct, 2) . ' %'
+              . ($price > 0.0 ? ', ' . self::pct(($downEdge - $price) / $price * 100.0, 2, true) . ' away' : '') . ')'
+            : '-';
+        $levels['eng_range_up']   = ($upEdge > 0.0 && $price > 0.0 && $price >= $upEdge * 0.99) ? 'warn' : 'muted';
+        $levels['eng_range_down'] = ($downEdge > 0.0 && $price > 0.0 && $price <= $downEdge * 1.01) ? 'warn' : 'muted';
+        $text['eng_orders']    = count($open) . ' / ' . $cap;
+        $levels['eng_orders']  = count($open) >= $cap ? 'warn' : 'muted';
+        $text['eng_inventory'] = Util::toDecimalString($invQty, 8) . ($base !== '' ? ' ' . $base : '');
+        $text['eng_inv_cost']  = Util::money($invCost, 4) . ' ' . $quote
+            . ($invQty > 0.0 ? ' (avg ' . Util::money($invCost / $invQty, 6) . ')' : '');
+        $text['eng_inv_value'] = $price > 0.0 ? Util::money($invVal, 4) . ' ' . $quote : '-';
+        $text['eng_unreal']    = ($price > 0.0 && $invQty > 0.0)
+            ? self::signed($unreal, 4) . ' (' . self::pct($invCost > 0.0 ? $unreal / $invCost * 100.0 : 0.0, 2, true) . ')'
+            : '-';
+        $levels['eng_unreal']  = ($price > 0.0 && $invQty > 0.0) ? self::pnlLevel($unreal) : 'muted';
+
+        $text['eng_cycles_today'] = (string) $cyclesToday;
+        $text['eng_cycles']       = (string) (int) $stats['cycles'];
+        $text['eng_pnl']          = self::signed(self::f($stats['pnl']), 4);
+        $levels['eng_pnl']        = self::pnlLevel(self::f($stats['pnl']));
+        $text['eng_pnl_today']    = self::signed($pnlToday, 4);
+        $levels['eng_pnl_today']  = self::pnlLevel($pnlToday);
+        $text['eng_fees']         = Util::money(self::f($stats['fees']), 4) . ' ' . $quote;
+        $decided = (int) $stats['wins'] + (int) $stats['losses'];
+        $text['eng_win_rate']     = $decided > 0
+            ? Util::money(self::f($stats['win_rate']), 1) . ' % (' . (int) $stats['wins'] . 'W/' . (int) $stats['losses'] . 'L)'
+            : '- (no cycles)';
+        $text['eng_spread']       = Util::money(self::f($cfg['pmm_spread_pct'] ?? 0.25, 0.25), 3) . ' % each side';
+        $text['eng_refresh']      = (string) (int) self::f($cfg['pmm_refresh_sec'] ?? 60, 60.0) . ' s';
+        $text['eng_spacing']      = Util::money(self::f($cfg['grid_spacing_pct'] ?? 0.60, 0.60), 3) . ' %';
+
+        // ---- open-orders table (side, level, price, qty, quote, age, status, cancel)
+        $rows = [];
+        foreach ($open as $o) {
+            $side   = strtoupper((string) ($o['side'] ?? ''));
+            $status = strtoupper((string) ($o['status'] ?? ''));
+            $ts     = Util::isoToTs((string) ($o['created_at'] ?? ''));
+            $rows[] = [
+                ['t' => $side, 'pill' => $side === 'SELL' ? 'warn' : 'info'],
+                ['t' => ($o['level'] === null || $o['level'] === '') ? '-' : (string) (int) $o['level'], 'c' => 'num'],
+                ['t' => Util::money(self::f($o['price'] ?? 0), 6), 'c' => 'num'],
+                ['t' => Util::toDecimalString(self::f($o['qty'] ?? 0), 8), 'c' => 'num'],
+                ['t' => Util::money(self::f($o['quote'] ?? 0), 4), 'c' => 'num'],
+                ['t' => $ts === null ? '-' : self::duration(max(0, $now - $ts)), 'c' => 'nowrap'],
+                ['t' => $status, 'pill' => $status === 'PARTIALLY_FILLED' ? 'warn' : 'muted'],
+                ['t' => 'Cancel', 'btn' => [
+                    'action' => 'cancel_order',
+                    'fields' => ['client_id' => (string) ($o['client_id'] ?? '')],
+                    'class'  => 'btn btn-mini btn-warn',
+                ]],
+            ];
+        }
+        $tables = [];
+        $tables['engine_orders'] = ['rows' => $rows, 'cols' => 8, 'empty' => 'No resting engine orders'];
+
+        // ---- cycles table (last 30)
+        $rows = [];
+        foreach ($cycles as $c) {
+            $pnl = self::f($c['pnl_usdt'] ?? 0);
+            $rows[] = [
+                ['t' => ($c['level'] === null || $c['level'] === '') ? '-' : (string) (int) $c['level'], 'c' => 'num'],
+                ['t' => Util::money(self::f($c['buy_price'] ?? 0), 6), 'c' => 'num'],
+                ['t' => Util::money(self::f($c['sell_price'] ?? 0), 6), 'c' => 'num'],
+                ['t' => Util::toDecimalString(self::f($c['qty'] ?? 0), 8), 'c' => 'num'],
+                ['t' => self::signed($pnl, 6), 'c' => 'num lvl-' . self::pnlLevel($pnl)],
+                ['t' => self::fmtTime((string) ($c['closed_at'] ?? ''), $tz, 'm-d H:i:s'), 'c' => 'mono nowrap'],
+            ];
+        }
+        $tables['cycles'] = ['rows' => $rows, 'cols' => 6, 'empty' => 'No completed cycles yet'];
+
+        $raw['engine']          = $engine;
+        $raw['engine_symbol']   = $symbol;
+        $raw['engine_anchor']   = $anchor;
+        $raw['engine_orders']   = count($open);
+        $raw['engine_cap']      = $cap;
+        $raw['inventory_qty']   = $invQty;
+        $raw['inventory_cost']  = $invCost;
+        $raw['inventory_value'] = $invVal;
+        $raw['inventory_unreal'] = $unreal;
+        $raw['cycles']          = (int) $stats['cycles'];
+        $raw['cycles_today']    = $cyclesToday;
+        $raw['cycle_pnl']       = self::f($stats['pnl']);
+        $raw['cycle_pnl_today'] = $pnlToday;
+        $raw['cycle_fees']      = self::f($stats['fees']);
+        $raw['cycle_win_rate']  = self::f($stats['win_rate']);
+        $raw['engine_live_blocked'] = $liveBlocked;
+
+        return [
+            'text'    => $text,
+            'levels'  => $levels,
+            'raw'     => $raw,
+            'tables'  => $tables,
+            'show'    => [
+                'engine'              => $active,
+                'signal_engine'       => !$active,
+                'grid_engine'         => $engine === 'grid',
+                'pmm_engine'          => $engine === 'pmm',
+                'engine_live_blocked' => $liveBlocked,
+            ],
+            'payload' => [
+                'engine'         => $engine,
+                'active'         => $active,
+                'symbol'         => $symbol,
+                'base'           => $base,
+                'price'          => $price,
+                'anchor'         => $anchor,
+                'anchor_at'      => $anchorAt,
+                'range_up'       => $upEdge,
+                'range_down'     => $downEdge,
+                'open_orders'    => count($open),
+                'max_orders'     => $cap,
+                'inventory_qty'  => $invQty,
+                'inventory_cost' => $invCost,
+                'inventory_value' => $invVal,
+                'unrealised'     => $unreal,
+                'cycles'         => (int) $stats['cycles'],
+                'cycles_today'   => $cyclesToday,
+                'pnl'            => self::f($stats['pnl']),
+                'pnl_today'      => $pnlToday,
+                'fees'           => self::f($stats['fees']),
+                'wins'           => (int) $stats['wins'],
+                'losses'         => (int) $stats['losses'],
+                'win_rate'       => self::f($stats['win_rate']),
+                'live_blocked'   => $liveBlocked,
+                'paused_reason'  => $gridPause,
+            ],
         ];
     }
 

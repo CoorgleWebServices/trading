@@ -59,6 +59,43 @@
     }
   }
 
+  /* The CSRF token of this page: every rendered page carries at least the logout form. */
+  function csrfToken() {
+    var el = document.querySelector('input[name="csrf"]');
+    return el && el.value ? el.value : '';
+  }
+
+  function hiddenInput(name, value) {
+    var i = document.createElement('input');
+    i.type = 'hidden';
+    i.name = name;
+    i.value = value === null || value === undefined ? '' : String(value);
+    return i;
+  }
+
+  /* Per-row action button: the same markup Panel::actionButton() renders server-side. */
+  function buildActionForm(btn, label) {
+    var form = document.createElement('form');
+    var fields = btn.fields && typeof btn.fields === 'object' ? btn.fields : {};
+    var button, k;
+    form.setAttribute('method', 'post');
+    form.setAttribute('action', 'index.php');
+    form.className = 'inline';
+    form.appendChild(hiddenInput('csrf', csrfToken()));
+    form.appendChild(hiddenInput('action', btn.action));
+    for (k in fields) {
+      if (Object.prototype.hasOwnProperty.call(fields, k)) {
+        form.appendChild(hiddenInput(k, fields[k]));
+      }
+    }
+    button = document.createElement('button');
+    button.type = 'submit';
+    button.className = btn['class'] ? String(btn['class']) : 'btn btn-mini';
+    button.textContent = label || 'Go';
+    form.appendChild(button);
+    return form;
+  }
+
   function buildCell(cell) {
     var td = document.createElement('td');
     var text, cls, svg, rect, wrap, span, pill;
@@ -100,6 +137,8 @@
       setLevelClass(pill, String(cell.pill), 'pill-');
       pill.textContent = text;
       td.appendChild(pill);
+    } else if (cell.btn && typeof cell.btn === 'object') {
+      td.appendChild(buildActionForm(cell.btn, text));
     } else {
       td.textContent = text;
     }
@@ -266,8 +305,32 @@
     }
   }
 
+  /* Settings → Engine: reveal only the selected engine's field group. The CSP forbids inline
+   * scripts and inline style attributes, so visibility is the `is-hidden` CLASS from panel.css
+   * and this is the only place that touches it. */
+  function installEngineGroups() {
+    var select = document.querySelector('[data-engine-select]');
+    if (!select) {
+      return;
+    }
+    function apply() {
+      var groups = document.querySelectorAll('[data-engine-group]');
+      var i;
+      for (i = 0; i < groups.length; i++) {
+        if (groups[i].getAttribute('data-engine-group') === String(select.value)) {
+          groups[i].classList.remove('is-hidden');
+        } else {
+          groups[i].classList.add('is-hidden');
+        }
+      }
+    }
+    select.addEventListener('change', apply);
+    apply();
+  }
+
   function init() {
     installConfirms();
+    installEngineGroups();
     startAutoRefresh();
   }
 

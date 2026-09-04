@@ -24,7 +24,7 @@ function trader_config_path(): string
     return trader_data_dir() . '/config.json';
 }
 
-/** Defaults table from DESIGN.md §3 (cron_key is filled with a random value on first use). */
+/** Defaults table from DESIGN.md §3 plus DESIGN-ENGINES.md §2 (cron_key is filled with a random value on first use). */
 function trader_config_defaults(): array
 {
     return [
@@ -67,6 +67,26 @@ function trader_config_defaults(): array
         'paper_start_usdt'            => 10.0,
         'recv_window'                 => 10000,
         'timezone'                    => 'UTC',
+
+        // --- engines (docs/DESIGN-ENGINES.md §2). They live here, not only in the panel's
+        //     form fallback, so a config.json written before the engines existed still comes
+        //     back from trader_config() with every key present and correctly typed.
+        'engine'                      => 'signal',
+        'allow_live_engines'          => false,
+        'engine_symbol'               => 'DOGEUSDT',
+        'engine_max_orders'           => 12,
+        'post_only'                   => true,
+        'grid_levels'                 => 6,
+        'grid_spacing_pct'            => 0.60,
+        'grid_order_usdt'             => 1.30,
+        'grid_range_up_pct'           => 4.0,
+        'grid_range_down_pct'         => 6.0,
+        'grid_exit_liquidates'        => false,
+        'pmm_spread_pct'              => 0.25,
+        'pmm_order_usdt'              => 1.30,
+        'pmm_refresh_sec'             => 60,
+        'pmm_target_base_pct'         => 50.0,
+        'pmm_max_base_pct'            => 80.0,
     ];
 }
 

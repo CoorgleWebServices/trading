@@ -9,6 +9,15 @@ require_once __DIR__ . '/Exchange.php';
 require_once __DIR__ . '/Indicators.php';
 require_once __DIR__ . '/Strategy.php';
 require_once __DIR__ . '/Risk.php';
+require_once __DIR__ . '/EngineOrders.php';
+// the two engine implementations are optional at load time: a signal-engine install
+// (or a partial deployment) must still be able to run a tick.
+if (is_file(__DIR__ . '/EngineGrid.php')) {
+    require_once __DIR__ . '/EngineGrid.php';
+}
+if (is_file(__DIR__ . '/EnginePmm.php')) {
+    require_once __DIR__ . '/EnginePmm.php';
+}
 
 /**
  * Internal control-flow exception used by Bot::tick(): ends the current tick
@@ -41,6 +50,8 @@ final class Bot
     const KLINES_15M          = 320;
     const KLINES_1H           = 260;
     const RECONCILE_MISSING_RATIO = 0.9;
+    /** Block reasons that must take an engine's whole ladder off the book (DESIGN-ENGINES.md §9). */
+    const ENGINE_CAPITAL_BLOCKS = ['halted', 'disabled', 'api_paused', 'daily_cap', 'weekly_cap'];
 
     /** @var array */
     private $cfg;
@@ -56,6 +67,12 @@ final class Bot
     private $info = [];
     /** @var float per-side fee in percent used for sizing */
     private $feePct;
+    /** @var string signal | grid | pmm */
+    private $engine;
+    /** @var string the single symbol grid/pmm trade; '' for the signal engine */
+    private $engineSymbol = '';
+    /** @var EngineOrders[] one per symbol, built on demand */
+    private $engineOrdersCache = [];
 
     // ---- per-tick scratch
     /** @var int */
@@ -74,6 +91,10 @@ final class Bot
     private $posSummary = '';
     /** @var string[] */
     private $notes = [];
+    /** @var float bid of the engine symbol this tick (0.0 when unknown) */
+    private $engineBid = 0.0;
+    /** @var float ask of the engine symbol this tick (0.0 when unknown) */
+    private $engineAsk = 0.0;
 
     public function __construct(array $cfg, Db $db, ExchangeInterface $ex, ?int $nowMs = null)
     {
@@ -83,6 +104,10 @@ final class Bot
         $this->fixedNowMs = $nowMs;
         $this->mode       = $ex->mode();
         $this->feePct     = max(0.0, (float) $this->cfg['fee_pct']);
+        $this->engine     = Risk::engineName($this->cfg);
+        if (Risk::isContinuousEngine($this->engine)) {
+            $this->engineSymbol = strtoupper(trim((string) $this->cfg['engine_symbol']));
+        }
     }
 
     /** Minimal defaults so a partial config (tests) still works; the real defaults live in config.php. */
@@ -100,6 +125,10 @@ final class Bot
             'candle_interval'     => '15m',
             'trend_interval'      => '1h',
             'fee_pct'             => 0.1,
+            'engine'              => 'signal',
+            'allow_live_engines'  => false,
+            'engine_symbol'       => 'DOGEUSDT',
+            'engine_max_orders'   => 12,
         ];
     }
 
@@ -120,6 +149,8 @@ final class Bot
         $this->quoteFree        = null;
         $this->posSummary       = '';
         $this->notes            = [];
+        $this->engineBid        = 0.0;
+        $this->engineAsk        = 0.0;
 
         try {
             $this->db->setState('last_tick_at', $this->nowIso());
@@ -346,6 +377,8 @@ final class Bot
         }
         $this->mergeSymbolMetrics($pxPatch);
         $this->applyFeeFromAccount($acct);
+        // the engine's equity counts its base at the bid, so the book is read before the snapshot
+        $this->loadEngineBook();
         $bal = $this->analyseBalances($acct, $prices);
         $this->reconcileBalances($acct, $bal);
         $bal = $this->analyseBalances($acct, $prices);   // positions may have changed
@@ -368,16 +401,26 @@ final class Bot
         // ---- 4. survival layer
         // read the halted flag BEFORE the check: survivalCheck() writes halted=1 itself on a fresh breach
         $already = ((string) $this->db->getState('halted', '0')) === '1';
-        $sv = Risk::survivalCheck($this->cfg, $this->db, $bal['equity'], $open !== null || $stuck !== null, $bal['exchange_has_base']);
+        $hasInventory = $this->engineActive() && $this->engineInventoryQty() > 0.0;
+        $sv = Risk::survivalCheck($this->cfg, $this->db, $bal['equity'], $open !== null || $stuck !== null || $hasInventory, $bal['exchange_has_base']);
         $action = (string) ($sv['action'] ?? 'none');
         $svReason = (string) ($sv['reason'] ?? '');
         if ($action === 'halt') {
             $reason  = $svReason !== '' ? $svReason : 'equity_floor';
+            // the kill switch takes every resting engine order off the book BEFORE it liquidates
+            $cancelled = $this->cancelAllEngineOrders($reason);
+            if ($cancelled > 0) {
+                $this->notes[] = $cancelled . ' engine order(s) cancelled';
+            }
             if ($open !== null) {
                 $closed = $this->closePosition($reason);
                 $this->notes[] = $closed !== null ? 'position closed' : 'position NOT closed (see log)';
             } elseif ($stuck !== null) {
                 $this->retryStuck($stuck, $acct);
+            }
+            if ($hasInventory) {
+                $flat = $this->flattenInventory();
+                $this->notes[] = !empty($flat['ok']) ? 'inventory flattened' : 'inventory NOT flattened (see log)';
             }
             if (!$already) {
                 $this->notes[] = 'KILL SWITCH ' . $reason;
@@ -388,6 +431,12 @@ final class Bot
         }
         if ($action === 'no_entry' && $svReason !== '') {
             $this->notes[] = 'survival: ' . $svReason;
+        }
+
+        // ---- 5-7. grid / pmm run their own path (DESIGN-ENGINES.md §9)
+        if ($this->engine !== 'signal') {
+            $this->runEngineTick($bal);
+            return ((string) $this->db->getState('halted', '0')) === '1' ? 'halted' : 'ok';
         }
 
         // ---- 5. position management
@@ -517,6 +566,12 @@ final class Bot
                 $symbols[] = $sym;   // a position off the watchlist must still count towards equity
             }
         }
+        // grid/pmm trade one symbol that need not be on the watchlist; its base — free AND locked
+        // in resting orders — is inventory, not a loss, so it is valued at the bid and counted.
+        $engineSym = $this->engineSymbol;
+        if ($engineSym !== '' && !in_array($engineSym, $symbols, true)) {
+            $symbols[] = $engineSym;
+        }
         foreach ($symbols as $sym) {
             if (!isset($this->info[$sym])) {
                 continue;
@@ -527,10 +582,14 @@ final class Bot
                 continue;
             }
             $seen[$base] = true;
+            $isEngine = $engineSym !== '' && $sym === $engineSym;
             $free   = isset($balances[$base]) ? (float) ($balances[$base]['free'] ?? 0.0) : 0.0;
             $locked = isset($balances[$base]) ? (float) ($balances[$base]['locked'] ?? 0.0) : 0.0;
             $total  = $free + $locked;
             $price  = isset($prices[$sym]) ? (float) $prices[$sym] : 0.0;
+            if ($isEngine && $this->engineBid > 0.0) {
+                $price = $this->engineBid;
+            }
             $value  = $price > 0.0 ? $total * $price : 0.0;
             $minNotional = (float) ($info['minNotional'] ?? 0.0);
             $row = ['symbol' => $sym, 'base' => $base, 'free' => $free, 'total' => $total, 'price' => $price, 'value' => $value, 'tracked' => isset($tracked[$sym]), 'untracked_big' => false];
@@ -539,13 +598,17 @@ final class Bot
                     $pq = (float) $tracked[$sym]['qty'];
                     $posValue  += min($pq, $total) * $price;
                     $dustValue += max(0.0, $total - $pq) * $price;
+                } elseif ($isEngine) {
+                    // engine inventory: held on purpose, so it is neither dust nor an untracked
+                    // position — counting it as one would halt the bot the moment a rung fills
+                    $posValue += $value;
                 } else {
                     $dustValue += $value;
                     if ($minNotional > 0.0 && $value >= $minNotional) {
                         $row['untracked_big'] = true;
                     }
                 }
-                if ($minNotional > 0.0 && $value >= $minNotional) {
+                if (!$isEngine && $minNotional > 0.0 && $value >= $minNotional) {
                     $hasBase = true;
                 }
             }
@@ -951,6 +1014,557 @@ final class Bot
             'qty' => $r['qty'], 'dust_qty' => $r['dust_qty'], 'price' => $r['price'], 'quote' => $r['quote'],
             'entry_eff' => $entryEff, 'fee_usdt' => $r['fee_usdt'],
         ]);
+    }
+
+    /* ================================================================ engines (DESIGN-ENGINES.md §9) */
+
+    /**
+     * Cancels every resting engine order, whatever engine placed it. Safe to call when no
+     * engine is active: without a live row in `engine_orders` it touches neither the
+     * exchange nor the config, so the signal engine pays one indexed SELECT and nothing else.
+     *
+     * @return int number of orders that left the book
+     */
+    public function cancelAllEngineOrders(string $reason): int
+    {
+        $symbols = $this->liveEngineSymbols();
+        if ($symbols === []) {
+            return 0;
+        }
+        $n = 0;
+        foreach ($symbols as $sym) {
+            try {
+                $orders = $this->engineOrdersFor($sym);
+                if ($orders === null) {
+                    continue;
+                }
+                $n += (int) $orders->cancelAll($sym, $reason);
+            } catch (BinanceException $e) {
+                $this->handleApiError($e, 'engine_cancel_all:' . $sym);
+            } catch (Throwable $e) {
+                Log::error('engine cancelAll ' . $sym . ' failed: ' . $e->getMessage(), ['reason' => $reason]);
+            }
+        }
+        return $n;
+    }
+
+    /**
+     * Panel action "Re-anchor grid": re-centres the ladder on the current mid and clears the
+     * pause a range exit left behind. Safe to call with any engine selected.
+     */
+    public function reanchorGrid(): void
+    {
+        $sym = $this->actionSymbol();
+        if ($sym === '') {
+            Log::warn('reanchor: no engine symbol configured');
+            return;
+        }
+        try {
+            $mid = $this->engineMid($sym);
+            if ($mid <= 0.0) {
+                Log::warn('reanchor: no book price for ' . $sym);
+                return;
+            }
+            $grid = $this->makeGrid($sym);
+            if ($grid !== null) {
+                $grid->reanchor($mid);
+            } else {
+                $this->db->setState('grid_anchor', $mid);
+                $this->db->setState('grid_anchor_at', $this->nowIso());
+                $this->db->setState('grid_symbol', $sym);
+            }
+            $wasGridPause = (string) $this->db->getState('grid_paused_reason', '') === 'grid_range_exit';
+            $this->db->setState('grid_paused_reason', '');
+            if ($wasGridPause || (string) $this->db->getState('pause_reason', '') === 'grid_range_exit') {
+                $this->db->setState('paused_until', '');
+                $this->db->setState('pause_reason', '');
+            }
+            Log::info('reanchor: grid re-anchored on ' . $sym . ' at ' . Util::money($mid, 8));
+        } catch (BinanceException $e) {
+            $this->handleApiError($e, 'reanchor:' . $sym);
+        } catch (Throwable $e) {
+            Log::error('reanchor failed: ' . $e->getMessage(), ['symbol' => $sym]);
+        }
+    }
+
+    /**
+     * Panel action "Flatten inventory": cancels the resting orders and market-sells the whole
+     * engine inventory of the engine symbol. Safe to call when no engine is active (it then
+     * reports that there is nothing to sell). The sell is booked through EngineOrders, so the
+     * lots are consumed FIFO and the cycles are written exactly like an engine sell.
+     *
+     * @return array{ok:bool, message:string, symbol:string, qty:float, quote:float, cancelled:int}
+     */
+    public function flattenInventory(): array
+    {
+        $sym = $this->actionSymbol();
+        $out = ['ok' => false, 'message' => '', 'symbol' => $sym, 'qty' => 0.0, 'quote' => 0.0, 'cancelled' => 0];
+        if ($sym === '') {
+            $out['message'] = 'No engine symbol configured.';
+            return $out;
+        }
+        // The demo-only rule (DESIGN-ENGINES.md §1) is about ORDERS, not about ticks: while
+        // grid/pmm are blocked in live mode the bot must not place a single one, and this
+        // action ends in a real market SELL. Cancelling is still allowed below - it only ever
+        // takes risk off. Selling leftover inventory stays reachable: switch the engine back
+        // to `signal` (or turn allow_live_engines on) and flatten from there.
+        if ($this->engine !== 'signal' && $this->engineLiveBlocked()) {
+            $out['cancelled'] = $this->cancelAllEngineOrders('engine_live_blocked');
+            $out['message']   = 'The ' . $this->engine . ' engine is blocked in live mode (allow_live_engines is off),'
+                              . ' so nothing was sold. Switch the engine back to "signal" to flatten the inventory.';
+            return $out;
+        }
+        $out['cancelled'] = $this->cancelAllEngineOrders('flatten_inventory');
+        try {
+            $info = $this->infoFor($sym);
+            $bid  = $this->engineBid > 0.0 ? $this->engineBid : (float) ($this->ex->bookTicker($sym)['bid'] ?? 0.0);
+            if ($bid <= 0.0) {
+                $out['message'] = 'No bid price for ' . $sym . '.';
+                return $out;
+            }
+            $acct     = $this->ex->account();
+            $balances = isset($acct['balances']) && is_array($acct['balances']) ? $acct['balances'] : [];
+            $base     = (string) ($info['base'] ?? '');
+            $baseFree = ($base !== '' && isset($balances[$base])) ? (float) ($balances[$base]['free'] ?? 0.0) : 0.0;
+            $step     = (string) ($info['stepSize'] ?? '0.00000001');
+            $inv      = $this->engineInventoryQty($sym);
+            $qtyStr   = Util::floorToStep(min($inv, $baseFree), $step);
+            $qty      = (float) $qtyStr;
+            if ($qty <= 0.0) {
+                $out['message'] = 'No engine inventory to sell.';
+                return $out;
+            }
+            $minNotional = (float) ($info['minNotional'] ?? 0.0);
+            if ($minNotional > 0.0 && $qty * $bid < $minNotional) {
+                $out['qty']     = $qty;
+                $out['message'] = 'Inventory is below the minimum notional (dust); nothing sold.';
+                Log::warn('flatten: inventory below minNotional, left in the wallet', [
+                    'symbol' => $sym, 'qty' => $qty, 'bid' => $bid, 'min_notional' => $minNotional,
+                ]);
+                return $out;
+            }
+            $cid = $this->newEngineClientId('SELL', $sym);
+            if ($cid === null) {
+                $out['message'] = 'Could not allocate a client id for the sell.';
+                return $out;
+            }
+            // the inventory may have been bought by another engine (the user switched engines);
+            // book the sell against the engine that owns the lots, or nothing is consumed
+            $lotEngine = $this->inventoryEngine($sym);
+            $this->db->insertEngineOrder([
+                'client_id'  => $cid,
+                'mode'       => $this->mode,
+                'engine'     => $lotEngine,
+                'symbol'     => $sym,
+                'side'       => 'SELL',
+                'status'     => 'SENDING',
+                'price'      => $bid,
+                'qty'        => $qty,
+                'quote'      => $qty * $bid,
+                'purpose'    => 'flatten',
+                'created_at' => $this->nowIso(),
+            ]);
+            $r = $this->ex->marketSell($sym, $qtyStr, $info, $cid);
+            $filled = (float) ($r['qty'] ?? 0.0);
+            $orders = $this->engineOrdersBookingAs($sym, $lotEngine);
+            if ($orders !== null) {
+                $orders->bookFill(['client_id' => $cid], $r, $filled > 0.0 ? 'FILLED' : 'EXPIRED');
+            } else {
+                $this->db->updateEngineOrder($cid, ['status' => $filled > 0.0 ? 'FILLED' : 'EXPIRED', 'updated_at' => $this->nowIso()]);
+            }
+            if ($filled <= 0.0) {
+                $out['message'] = 'The sell executed nothing; the inventory is untouched.';
+                Log::warn('flatten: sell executed nothing', ['symbol' => $sym, 'requested_qty' => $qtyStr]);
+                return $out;
+            }
+            $out['ok']      = true;
+            $out['qty']     = $filled;
+            $out['quote']   = (float) ($r['quote'] ?? 0.0);
+            $out['message'] = 'Sold ' . Util::money($filled, 8) . ' ' . ($base !== '' ? $base : $sym)
+                            . ' for ' . Util::money($out['quote']) . ' ' . $this->cfg['quote_asset'] . '.';
+            Log::warn('flatten: engine inventory sold', [
+                'symbol' => $sym, 'qty' => $filled, 'quote' => $out['quote'], 'client_id' => $cid,
+            ]);
+            return $out;
+        } catch (BinanceException $e) {
+            $this->handleApiError($e, 'flatten:' . $sym);
+            $out['message'] = 'Sell failed: ' . $e->getMessage();
+            return $out;
+        } catch (Throwable $e) {
+            Log::error('flatten failed: ' . $e->getMessage(), ['symbol' => $sym]);
+            $out['message'] = 'Sell failed: ' . $e->getMessage();
+            return $out;
+        }
+    }
+
+    /**
+     * The grid / pmm branch of the tick, run instead of steps 5-7 (DESIGN-ENGINES.md §9):
+     * live-mode guard, order synchronisation, capital pause, engine tick.
+     */
+    private function runEngineTick(array $bal): void
+    {
+        // ---- 1. demo-only rule: grid/pmm never place a single order in live mode
+        if ($this->engineLiveBlocked()) {
+            $this->noTradeReason = 'engine_live_blocked';
+            $this->notes[]       = 'engine ' . $this->engine . ' blocked in live mode';
+            // cancelling is not placing: a ladder left resting by an earlier allow_live_engines
+            // run has to come off the book here, because nothing else takes it off and no sync
+            // runs to book its fills. Without a live row this is one indexed SELECT and no call.
+            $n = $this->cancelAllEngineOrders('engine_live_blocked');
+            if ($n > 0) {
+                $this->notes[] = $n . ' engine order(s) cancelled (live blocked)';
+            }
+            return;
+        }
+        $sym = $this->engineSymbol;
+        if ($sym === '') {
+            $this->noTradeReason = 'engine_no_symbol';
+            return;
+        }
+        $orders = $this->engineOrdersFor($sym);
+        if ($orders === null) {
+            $this->noTradeReason = 'engine_no_symbol_info';
+            return;
+        }
+
+        // ---- 2. reconcile the resting orders and book every new fill
+        $sum = $this->step('engine_sync:' . $sym, function () use ($orders, $sym): array {
+            return $orders->sync($sym);
+        }, false);
+        if (is_array($sum)) {
+            $nFilled = isset($sum['filled']) && is_array($sum['filled']) ? count($sum['filled']) : 0;
+            if ($nFilled > 0) {
+                $this->notes[] = $nFilled . ' engine fill(s) booked';
+            }
+        }
+
+        // ---- 3. a capital pause stops the quoting and takes the ladder off the book
+        $block = (string) Risk::entryBlockReason($this->cfg, $this->db, $bal['quote_free'], $bal['equity'], $this->engine);
+        if ($block !== '' && self::isCapitalBlock($block)) {
+            $this->noTradeReason = $block;
+            $n = $this->cancelAllEngineOrders($block);
+            if ($n > 0) {
+                $this->notes[] = 'engine paused (' . $block . '): ' . $n . ' order(s) cancelled';
+            }
+            return;
+        }
+        if ($block !== '') {
+            // not a capital reason (a short quote balance): the engine keeps running, because it
+            // still has to manage the inventory it already holds - sells and re-quotes go on.
+            $this->notes[] = 'engine: ' . $block;
+        }
+
+        // ---- 4. the engine itself
+        $bid = $this->engineBid;
+        $ask = $this->engineAsk;
+        if ($bid <= 0.0 || $ask <= 0.0) {
+            $this->noTradeReason = 'engine_no_book';
+            Log::warn('engine: no book price, tick skipped', ['symbol' => $sym]);
+            return;
+        }
+        $baseFree = isset($bal['bases'][$sym]['free']) ? (float) $bal['bases'][$sym]['free'] : 0.0;
+        $engine   = $this->engine;
+        $r = $this->step('engine_tick:' . $sym, function () use ($engine, $sym, $orders, $bid, $ask, $baseFree, $bal) {
+            if ($engine === 'grid') {
+                $g = $this->makeGrid($sym, $orders);
+                return $g === null ? null : $g->tick($bid, $ask, (float) $bal['quote_free']);
+            }
+            $p = $this->makePmm($sym, $orders);
+            return $p === null ? null : $p->tick($bid, $ask, $baseFree, (float) $bal['quote_free']);
+        }, false);
+        if (!is_array($r)) {
+            if ($this->noTradeReason === '') {
+                $this->noTradeReason = 'engine_unavailable';
+            }
+            return;
+        }
+        $action = (string) ($r['action'] ?? '');
+        $detail = (string) ($r['detail'] ?? '');
+        $this->noTradeReason = $engine . ':' . ($action !== '' ? $action : 'idle');
+        if ($detail !== '') {
+            $this->notes[] = $engine . ' ' . ($action !== '' ? $action : 'idle') . ' ' . $detail;
+        }
+        $this->posSummary = $engine . ' ' . $sym
+            . ' orders=' . count($this->db->openEngineOrders($sym, $this->mode))
+            . ' inv=' . Util::money($this->engineInventoryQty($sym), 8)
+            . ' bid=' . Util::money($bid, 8);
+    }
+
+    /** true when the engine may not trade because it is live and allow_live_engines is false. */
+    private function engineLiveBlocked(): bool
+    {
+        // either source of truth saying "live" blocks: the exchange the bot is really talking to
+        // and the configured mode, so a mis-paired config can never slip an order through
+        $live    = $this->mode === 'live' || strtolower(trim((string) $this->cfg['mode'])) === 'live';
+        $blocked = $live && !self::truthy($this->cfg, 'allow_live_engines');
+        $logged  = (string) $this->db->getState('engine_live_blocked_at', '');
+        if (!$blocked) {
+            if ($logged !== '') {
+                $this->db->setState('engine_live_blocked_at', '');
+            }
+            return false;
+        }
+        if ($logged === '') {
+            $this->db->setState('engine_live_blocked_at', $this->nowIso());
+            Log::warn('engine: ' . $this->engine . ' refuses to run in live mode (allow_live_engines is false); no order is placed', [
+                'engine' => $this->engine, 'symbol' => $this->engineSymbol,
+            ]);
+        }
+        return true;
+    }
+
+    /** A block reason that must take the whole ladder off the book (DESIGN-ENGINES.md §9.3). */
+    private static function isCapitalBlock(string $reason): bool
+    {
+        if (in_array($reason, self::ENGINE_CAPITAL_BLOCKS, true)) {
+            return true;
+        }
+        return strncmp($reason, 'paused:', 7) === 0;
+    }
+
+    /** grid | pmm with a configured symbol. */
+    private function engineActive(): bool
+    {
+        return $this->engine !== 'signal' && $this->engineSymbol !== '';
+    }
+
+    /** Symbol the panel actions work on: the engine symbol, else whatever inventory is left. */
+    private function actionSymbol(): string
+    {
+        if ($this->engineSymbol !== '') {
+            return $this->engineSymbol;
+        }
+        $sym = strtoupper(trim((string) ($this->cfg['engine_symbol'] ?? '')));
+        if ($sym !== '') {
+            return $sym;
+        }
+        try {
+            $st = $this->db->pdo()->prepare('SELECT symbol FROM lots WHERE mode = ? AND remaining > 0 ORDER BY id DESC LIMIT 1');
+            $st->execute([$this->mode]);
+            $v = $st->fetchColumn();
+            return $v === false || $v === null ? '' : strtoupper((string) $v);
+        } catch (Throwable $e) {
+            return '';
+        }
+    }
+
+    /** Distinct symbols with at least one resting engine order; [] (and no query cost) is the norm. */
+    private function liveEngineSymbols(): array
+    {
+        try {
+            $rows = $this->db->engineOrders(Db::ENGINE_LIVE_STATUSES, $this->mode);
+        } catch (Throwable $e) {
+            return [];
+        }
+        $out = [];
+        foreach ($rows as $row) {
+            // never touch another mode's book: a leftover paper/testnet row must not make a
+            // live cancelAll fire against the real account (and vice versa)
+            if (strtolower(trim((string) ($row['mode'] ?? ''))) !== strtolower(trim($this->mode))) {
+                continue;
+            }
+            $s = strtoupper((string) ($row['symbol'] ?? ''));
+            if ($s !== '') {
+                $out[$s] = true;
+            }
+        }
+        return array_keys($out);
+    }
+
+    /** Base quantity the engine still owns (open lots), 0.0 when the table or the symbol is empty. */
+    private function engineInventoryQty(string $symbol = ''): float
+    {
+        $sym = $symbol !== '' ? $symbol : $this->engineSymbol;
+        if ($sym === '') {
+            return 0.0;
+        }
+        try {
+            $lots = $this->db->openLots($sym, $this->mode, null);
+        } catch (Throwable $e) {
+            return 0.0;
+        }
+        $q = 0.0;
+        foreach ($lots as $lot) {
+            $q += max(0.0, (float) ($lot['remaining'] ?? 0.0));
+        }
+        return $q;
+    }
+
+    /**
+     * Reads the engine symbol's book once per tick. The engine equity values the base at the
+     * bid, and the equity snapshot runs before the engine branch, so this happens early.
+     * Best effort: a missing book leaves the price at 0.0 and the engine tick reports it.
+     */
+    private function loadEngineBook(): void
+    {
+        if (!$this->engineActive()) {
+            return;
+        }
+        $sym  = $this->engineSymbol;
+        $book = $this->step('book:' . $sym, function () use ($sym): array {
+            return $this->ex->bookTicker($sym);
+        }, false);
+        if (!is_array($book)) {
+            return;
+        }
+        $bid = (float) ($book['bid'] ?? 0.0);
+        $ask = (float) ($book['ask'] ?? 0.0);
+        $this->engineBid = $bid > 0.0 ? $bid : 0.0;
+        $this->engineAsk = $ask > 0.0 ? $ask : 0.0;
+    }
+
+    /** Mid price of $symbol from the book (cached when the tick already fetched it). */
+    private function engineMid(string $symbol): float
+    {
+        if ($symbol === $this->engineSymbol && $this->engineBid > 0.0 && $this->engineAsk > 0.0) {
+            return ($this->engineBid + $this->engineAsk) / 2.0;
+        }
+        $book = $this->ex->bookTicker($symbol);
+        $bid  = (float) ($book['bid'] ?? 0.0);
+        $ask  = (float) ($book['ask'] ?? 0.0);
+        if ($bid > 0.0 && $ask > 0.0) {
+            return ($bid + $ask) / 2.0;
+        }
+        return max($bid, $ask);
+    }
+
+    /**
+     * Engine that owns the open lots of $symbol (oldest first), the configured engine when
+     * there are none. engineInventoryQty() counts every engine's lots, so a flatten after an
+     * engine switch must consume them under THEIR engine or bookSell() matches nothing.
+     */
+    private function inventoryEngine(string $symbol): string
+    {
+        try {
+            $lots = $this->db->openLots($symbol, $this->mode, null);
+        } catch (Throwable $e) {
+            return $this->engine;
+        }
+        foreach ($lots as $lot) {
+            $e = strtolower(trim((string) ($lot['engine'] ?? '')));
+            if ($e !== '') {
+                return $e;
+            }
+        }
+        return $this->engine;
+    }
+
+    /** EngineOrders for $symbol whose lot/cycle bookkeeping runs under $engine (never cached). */
+    private function engineOrdersBookingAs(string $symbol, string $engine): ?EngineOrders
+    {
+        if ($engine === '' || $engine === $this->engine) {
+            return $this->engineOrdersFor($symbol);
+        }
+        $symbol = strtoupper(trim($symbol));
+        if ($symbol === '') {
+            return null;
+        }
+        try {
+            $info = $this->infoFor($symbol);
+        } catch (Throwable $e) {
+            Log::warn('engine: no symbol info for ' . $symbol . ' - ' . $e->getMessage());
+            return null;
+        }
+        $cfg           = $this->engineCfg($symbol);
+        $cfg['engine'] = $engine;
+        return new EngineOrders($cfg, $this->db, $this->ex, $info, $this->fixedNowMs);
+    }
+
+    /** EngineOrders bound to $symbol, or null when the symbol info cannot be loaded. */
+    private function engineOrdersFor(string $symbol): ?EngineOrders
+    {
+        $symbol = strtoupper(trim($symbol));
+        if ($symbol === '') {
+            return null;
+        }
+        if (isset($this->engineOrdersCache[$symbol])) {
+            return $this->engineOrdersCache[$symbol];
+        }
+        try {
+            $info = $this->infoFor($symbol);
+        } catch (Throwable $e) {
+            Log::warn('engine: no symbol info for ' . $symbol . ' - ' . $e->getMessage());
+            return null;
+        }
+        $cfg = $this->engineCfg($symbol);
+        $this->engineOrdersCache[$symbol] = new EngineOrders($cfg, $this->db, $this->ex, $info, $this->fixedNowMs);
+        return $this->engineOrdersCache[$symbol];
+    }
+
+    private function makeGrid(string $symbol, ?EngineOrders $orders = null): ?EngineGrid
+    {
+        if (!class_exists('EngineGrid')) {
+            Log::error('engine: EngineGrid is not installed');
+            return null;
+        }
+        if ($orders === null) {
+            $orders = $this->engineOrdersFor($symbol);
+        }
+        if ($orders === null) {
+            return null;
+        }
+        return new EngineGrid($this->engineCfg($symbol), $this->db, $this->ex, $orders, $this->infoFor($symbol));
+    }
+
+    private function makePmm(string $symbol, ?EngineOrders $orders = null): ?EnginePmm
+    {
+        if (!class_exists('EnginePmm')) {
+            Log::error('engine: EnginePmm is not installed');
+            return null;
+        }
+        if ($orders === null) {
+            $orders = $this->engineOrdersFor($symbol);
+        }
+        if ($orders === null) {
+            return null;
+        }
+        return new EnginePmm($this->engineCfg($symbol), $this->db, $this->ex, $orders, $this->infoFor($symbol));
+    }
+
+    /** Config for the engine classes: the exchange's mode and the acting symbol win. */
+    private function engineCfg(string $symbol): array
+    {
+        $cfg = $this->cfg;
+        $cfg['mode']          = $this->mode;
+        $cfg['engine']        = $this->engine;
+        $cfg['engine_symbol'] = $symbol;
+        $cfg['fee_pct']       = $this->feePct;
+        return $cfg;
+    }
+
+    /** Free client id for an engine order sent by the bot itself (flatten). */
+    private function newEngineClientId(string $side, string $symbol): ?string
+    {
+        $minute = intdiv($this->nowMs(), 60000) * 60;
+        $base   = Util::clientOrderId($side, $symbol, $minute);
+        $cid    = $base;
+        for ($n = 2; $n < 100; $n++) {
+            if ($this->db->engineOrder($cid) === null && $this->orderStatus($cid) === null) {
+                return $cid;
+            }
+            $cid = substr($base . '-' . $n, 0, 36);
+        }
+        return null;
+    }
+
+    /** Config flag that may arrive as bool, int or string. */
+    private static function truthy(array $cfg, string $key): bool
+    {
+        if (!array_key_exists($key, $cfg)) {
+            return false;
+        }
+        $v = $cfg[$key];
+        if (is_bool($v)) {
+            return $v;
+        }
+        if (is_numeric($v)) {
+            return (float) $v != 0.0;
+        }
+        if (is_string($v)) {
+            $v = strtolower(trim($v));
+            return $v === '1' || $v === 'true' || $v === 'yes' || $v === 'on';
+        }
+        return false;
     }
 
     /* ================================================================ orders */
@@ -1561,6 +2175,9 @@ final class Bot
                     $out[$sym] = true;
                 }
             }
+        }
+        if ($this->engineSymbol !== '') {
+            $out[$this->engineSymbol] = true;   // grid/pmm do not use the watchlist
         }
         return array_keys($out);
     }

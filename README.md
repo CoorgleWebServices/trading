@@ -170,7 +170,120 @@ You do not need keys for paper mode. For demo, testnet and live:
 
 ---
 
+## Engines: signal, grid, pmm
+
+The bot runs exactly one **engine** at a time, chosen with the `engine` setting. The signal engine
+is the default and is what the rest of this file describes; the other two trade continuously and
+are **demo-only by default**.
+
+| engine | what it does | orders | earns from | loses when |
+|---|---|---|---|---|
+| `signal` (default) | one position at a time, entries only on a closed 15m candle | market | mean reversion inside an uptrend | the setup keeps failing (the survival layer bounds it) |
+| `grid` | a ladder of resting buy rungs below an anchor, each with a sell one rung up | limit (post-only) | oscillation inside a range | price **trends out of the range** |
+| `pmm` | pure market making: one bid and one ask around mid, re-quoted every refresh | limit (post-only) | the spread | always, at VIP0 fees - see below |
+
+**pmm is expected to LOSE money at VIP0 fees.** Binance charges 0.1 % maker, identical to taker, so
+a round trip costs about 0.2 %, while observed spreads on the majors are 0.01 - 0.05 %. It is
+included because it was asked for and because it becomes viable at better fee tiers, on wide-spread
+pairs, or with maker rebates. Do not run it live expecting profit. The panel repeats this warning
+wherever pmm is selected.
+
+**Grid earns while the market ranges and bleeds while it trends.** Every completed rung round trip
+banks `grid_spacing_pct` minus the ~0.2 % round trip, so a choppy market pays and a one-way market
+does not: the ladder just keeps buying into the fall and ends up holding inventory bought above the
+market. It is viable only when the rung spacing exceeds the round-trip cost, which the settings
+validator enforces (`grid_spacing_pct` must be at least `2 x fee_pct + 0.1`). Its real risk is not
+the fee but the trend: a grid holds inventory bought on the way down, so a market that leaves the
+range leaves you long. `grid_range_up_pct` / `grid_range_down_pct` bound that - on a range exit the
+bot cancels every order, optionally market-sells the inventory (`grid_exit_liquidates`, off by
+default), and pauses until you press **Re-anchor grid** in the panel.
+
+### The demo-only rule
+
+`grid` and `pmm` **place no order at all in `live` mode** unless `allow_live_engines` is explicitly
+turned on. The default is off. In that state every tick returns immediately with
+`no_trade_reason = engine_live_blocked`, the event is logged once, and the dashboard shows a red
+banner. This is deliberate, not a bug: prove an engine in paper, demo or testnet first.
+
+The rule covers the **panel actions** as well as the cron tick, because it is about orders, not
+about ticks:
+
+| action | while live-blocked |
+|---|---|
+| **Run tick** / cron | returns `engine_live_blocked`, places nothing |
+| **Cancel all orders** | still works - cancelling only ever takes risk off the book |
+| **Cancel** (one order) | still works, same reason |
+| **Re-anchor grid** | moves the anchor and clears the pause; quotes nothing against it |
+| **Flatten inventory** | **refused.** It ends in a real market SELL, so it cancels the resting orders, sells nothing, and tells you to switch the engine back to `signal` first |
+
+So the one way out of a live-blocked engine that is holding inventory is to set `engine` back to
+`signal` (or turn `allow_live_engines` on, deliberately) and flatten from there. `tests/run.php`
+proves the whole guarantee in the `engine-demo-only` group: it builds a real ladder and a real lot
+with the flag on, turns the flag off, drives every action listed above, and asserts that the limit,
+market-buy and market-sell counters of the exchange double are all still zero.
+
+### Engine settings
+
+All sixteen keys below are ordinary config keys with defaults in `config.php`, so an installation
+that predates the engines picks them up on the next load - you never have to hand-edit
+`data/config.json`. The Settings page shows only the fields of the engine you have selected, and
+`Risk::validateConfig()` checks their bounds on save (see the notes column).
+
+| key | default | notes |
+|---|---|---|
+| `engine` | `signal` | `signal` / `grid` / `pmm` |
+| `allow_live_engines` | `false` | must be on before grid/pmm may trade in live mode |
+| `engine_symbol` | `DOGEUSDT` | the single symbol grid/pmm trade; they ignore the watchlist |
+| `engine_max_orders` | `12` | hard cap on simultaneously open orders (1 - 20) |
+| `post_only` | `true` | `LIMIT_MAKER`; a post-only rejection is normal and simply skips that quote |
+| `grid_levels` | `6` | buy rungs below the anchor, 1 - 20 |
+| `grid_spacing_pct` | `0.60` | distance between rungs; must clear the round-trip fee |
+| `grid_order_usdt` | `1.30` | quote per rung; must clear the symbol's required size |
+| `grid_range_up_pct` | `4.0` | mid above `anchor x (1 + x)` ends the grid |
+| `grid_range_down_pct` | `6.0` | mid below `anchor x (1 - x)` ends the grid |
+| `grid_exit_liquidates` | `false` | on a range exit, also market-sell the inventory |
+| `pmm_spread_pct` | `0.25` | half-spread each side of mid |
+| `pmm_order_usdt` | `1.30` | quote per quote-order |
+| `pmm_refresh_sec` | `60` | quotes older than this are cancelled and replaced |
+| `pmm_target_base_pct` | `50` | inventory target, percent of engine equity held as base |
+| `pmm_max_base_pct` | `80` | above this stop bidding; below `100 - this` stop asking |
+
+**Funding the ladder.** A grid needs `grid_levels x grid_order_usdt` of free quote before the lower
+rungs can fill, and each rung must also clear the symbol's required size - about **1.35 USDT for
+DOGEUSDT** (see the minimum-notional section above), so the 1.30 default should be raised slightly
+for that pair. The defaults therefore want roughly `6 x 1.30 = 7.80 USDT` free, or `8.10` at a rung
+of 1.35. That is nothing on a demo account, but on a 10 USDT live account it is very nearly the
+whole balance: the settings validator warns when the full ladder costs more than 90 % of the free
+quote. On a small real account drop `grid_levels` to 1 - 2.
+
+### Switching back to the signal engine
+
+The resting orders and the inventory belong to the engine, not to the signal engine, and once the
+selector says `signal` no tick will ever sync that ladder again. So do this in order:
+
+1. **Flatten inventory** while the engine is still selected (it market-sells what the engine holds
+   and needs its confirmation tick box). Skip this only if you want to keep the base.
+2. Wait one tick, so the fills book into `cycles` and the KPIs are right.
+3. Set `engine` back to `signal` in **Settings** and save.
+
+Saving a change to `engine` **or** to `engine_symbol` cancels the previous engine's resting orders
+automatically - it is the last moment anything can, since the dashboard's engine card disappears
+with the same save - and tells you how many went. That safety net is not a substitute for step 1:
+it cancels orders, it never sells. **Inventory is deliberately kept**, because it is real base and
+selling it is your decision, not the panel's. If you find leftover base later, select the engine
+again and use **Flatten inventory**, or sell it by hand on Binance.
+
+The signal-engine cards reappear as soon as `signal` is selected. Realised engine PnL keeps
+counting against the daily and weekly loss caps either way, so a bad grid still pauses the account.
+
+---
+
 ## Recommended rollout
+
+0. **Pick the engine first.** The steps below describe the signal engine. `grid` and `pmm` are
+   demo-only until you deliberately set `allow_live_engines`, so step 3 is off the table for them
+   by default - and it should stay off the table for `pmm`, which is expected to lose money at
+   VIP0 fees. See "Engines: signal, grid, pmm" above.
 
 1. **Paper for 2 - 4 weeks.** Fills are simulated at the live bid/ask with the configured fee, so
    the numbers are realistic. Watch: win rate, expectancy per trade, total fees versus total PnL,
@@ -339,7 +452,7 @@ always sell it by hand on Binance; the next reconciliation will notice.
   age - red "cron not running" after 3 minutes), equity and PnL tiles, API health (clock offset,
   used request weight, last error), the open position with its live stop/target/trailing state, an
   equity sparkline, the watchlist table (filters, required size, ATR, spread, last score and gates),
-  closed positions, a histogram of why no trade was taken in the last 24 hours, and the log tail.
+  closed positions, a histogram of why no trade was taken in the last 24 hours, and the log tail. When an engine is active the dashboard also shows an **Engine** card (engine, symbol, anchor, distance to each range edge, live order count, inventory and unrealised at bid), an **Open orders** table with a per-order Cancel and **Cancel all orders**, a **Cycles** table with its KPIs, and the **Re-anchor grid** and **Flatten inventory** actions.
 * **Actions**: Start, Pause, Reset halt, Panic sell (sells at market and disables trading; needs a
   confirmation tick box), Run tick now, Reset paper account, Logout.
 * **Settings**: every parameter with validation (the take-profit must be at least three times the
@@ -446,6 +559,14 @@ indicators, the strategy on oversold / overbought / downtrend series, the surviv
 fills, and a complete tick sequence (entry, no double entry on one candle, take-profit, stop-loss,
 kill switch, order reconciliation after a crash or a timeout).
 
+The engines are covered by the same run: `util-tick`, `engine-orders` (place / sync / cancel, a
+fill becomes a lot, a sell consumes lots FIFO into cycles, a repeated sync books nothing twice),
+`engine-grid` (the ladder, a rung round trip earning spacing minus fees, the order cap, range exit
+and re-anchor), `engine-pmm` (both quotes around mid, refresh, inventory skew), `engine-fees`
+(spacing under the fee floor is rejected on save), `engine-guard` (the equity floor and the daily
+cap take the ladder off the book) and `engine-demo-only` (the demo-only rule, proved over a real
+ladder and a real lot, across the tick and every panel action).
+
 ---
 
 ## Files and data
@@ -454,7 +575,7 @@ kill switch, order reconciliation after a crash or a timeout).
 trader/
   index.php      panel        cron.php   tick        config.php  configuration helpers
   lib/           the code     assets/    css + js    tests/      offline tests
-  docs/DESIGN.md the design contract every file follows
+  docs/DESIGN.md the design contract every file follows;  docs/DESIGN-ENGINES.md the same for grid + pmm
   data/          runtime (auto-created): config.json (secrets, 0600), trader.sqlite (positions,
                  orders, trades, signals, equity, logs - 30 days retention), bot.log (rotates at
                  2 MB), tick.lock

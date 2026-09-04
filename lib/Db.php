@@ -55,6 +55,26 @@ final class Db
         ],
         'logs' => ['id' => 'i', 'ts' => 's', 'level' => 's', 'message' => 's', 'context' => 's'],
         'login_attempts' => ['ip' => 's', 'attempts' => 'i', 'last_at' => 's', 'locked_until' => 's'],
+        'engine_orders' => [
+            'client_id' => 's', 'order_id' => 's', 'mode' => 's', 'engine' => 's',
+            'symbol' => 's', 'side' => 's', 'status' => 's',
+            'price' => 'f', 'qty' => 'f', 'quote' => 'f',
+            'filled_qty' => 'f', 'filled_quote' => 'f',
+            'fee_usdt' => 'f', 'fee_asset' => 's',
+            'level' => 'i', 'purpose' => 's',
+            'created_at' => 's', 'updated_at' => 's', 'raw' => 's',
+        ],
+        'lots' => [
+            'id' => 'i', 'mode' => 's', 'engine' => 's', 'symbol' => 's',
+            'qty' => 'f', 'remaining' => 'f', 'price' => 'f', 'fee_usdt' => 'f',
+            'level' => 'i', 'client_id' => 's', 'created_at' => 's',
+        ],
+        'cycles' => [
+            'id' => 'i', 'mode' => 's', 'engine' => 's', 'symbol' => 's',
+            'level' => 'i', 'qty' => 'f', 'buy_price' => 'f', 'sell_price' => 'f',
+            'gross_usdt' => 'f', 'fee_usdt' => 'f', 'pnl_usdt' => 'f',
+            'opened_at' => 's', 'closed_at' => 's',
+        ],
     ];
 
     /* ------------------------------------------------------------ lifecycle */
@@ -166,6 +186,32 @@ CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol, id);
 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);
 CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
+CREATE TABLE IF NOT EXISTS engine_orders (
+  client_id TEXT PRIMARY KEY, order_id TEXT, mode TEXT NOT NULL, engine TEXT NOT NULL,
+  symbol TEXT NOT NULL, side TEXT NOT NULL,
+  status TEXT NOT NULL,
+  price REAL NOT NULL, qty REAL NOT NULL, quote REAL NOT NULL,
+  filled_qty REAL NOT NULL DEFAULT 0, filled_quote REAL NOT NULL DEFAULT 0,
+  fee_usdt REAL NOT NULL DEFAULT 0, fee_asset TEXT,
+  level INTEGER,
+  purpose TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT, raw TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_engine_orders_live ON engine_orders(status, symbol);
+CREATE INDEX IF NOT EXISTS idx_engine_orders_created ON engine_orders(created_at);
+CREATE TABLE IF NOT EXISTS lots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, engine TEXT NOT NULL, symbol TEXT NOT NULL,
+  qty REAL NOT NULL, remaining REAL NOT NULL, price REAL NOT NULL, fee_usdt REAL NOT NULL DEFAULT 0,
+  level INTEGER, client_id TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lots_open ON lots(symbol, remaining);
+CREATE TABLE IF NOT EXISTS cycles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, engine TEXT NOT NULL, symbol TEXT NOT NULL,
+  level INTEGER, qty REAL NOT NULL, buy_price REAL NOT NULL, sell_price REAL NOT NULL,
+  gross_usdt REAL NOT NULL, fee_usdt REAL NOT NULL, pnl_usdt REAL NOT NULL,
+  opened_at TEXT, closed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cycles_closed ON cycles(closed_at);
 SQL;
         $this->pdo->exec($sql);
     }
@@ -571,7 +617,22 @@ SQL;
         return ' AND mode = ?';
     }
 
-    /** Sum of pnl_usdt of positions closed at or after $sinceIso; null $mode = every mode. */
+    /** Same idea as modeClause() for the engine column (engine_orders / lots / cycles). */
+    private static function engineClause(?string $engine, array &$params): string
+    {
+        if ($engine === null || $engine === '') {
+            return '';
+        }
+        $params[] = $engine;
+        return ' AND engine = ?';
+    }
+
+    /**
+     * Realised PnL at or after $sinceIso: sum of positions.pnl_usdt of positions closed
+     * then (DESIGN.md §4); null $mode = every mode. The engines' round trips live in
+     * cycles.pnl_usdt — Risk adds cyclePnl() on top for the daily / weekly caps
+     * (DESIGN-ENGINES §5) so the caps govern all three engines.
+     */
     public function realisedPnl(string $sinceIso, ?string $mode = null): float
     {
         $params = [$sinceIso];
@@ -651,6 +712,267 @@ SQL;
         $this->pdo->prepare('DELETE FROM equity WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM logs WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM login_attempts WHERE last_at IS NOT NULL AND last_at < ?')->execute([$cutoff]);
+    }
+
+    /* --------------------------------------------------------------- engines */
+    /*
+     * Grid / pure-market-making bookkeeping (docs/DESIGN-ENGINES.md §5).
+     *
+     *   engine_orders  every limit order the engines put on the book
+     *   lots           FIFO inventory produced by engine BUY fills
+     *   cycles         realised buy -> sell round trips
+     *
+     * `SENDING` is the transient status an engine order carries between the row
+     * being written and the exchange answering (same idempotency discipline as
+     * the `orders` table); `UNKNOWN` is a send whose outcome was never seen.
+     * Both count as live: they may be resting on the exchange.
+     */
+
+    /** Engine-order statuses that may still be resting on the exchange. */
+    const ENGINE_LIVE_STATUSES = ['SENDING', 'NEW', 'PARTIALLY_FILLED', 'UNKNOWN'];
+
+    /** Quantities below this are treated as zero when consuming inventory. */
+    const LOT_EPSILON = 1.0e-12;
+
+    /** Engine orders with any of $statuses (empty = every status), newest first; null/'' $mode = every mode. */
+    public function engineOrders(array $statuses = [], ?string $mode = null): array
+    {
+        $sql    = 'SELECT * FROM engine_orders WHERE 1 = 1';
+        $params = [];
+        $clean  = [];
+        foreach ($statuses as $s) {
+            $s = strtoupper(trim((string) $s));
+            if ($s !== '') {
+                $clean[] = $s;
+            }
+        }
+        if ($clean !== []) {
+            $sql .= ' AND status IN (' . implode(', ', array_fill(0, count($clean), '?')) . ')';
+            $params = $clean;
+        }
+        $sql .= self::modeClause($mode, $params) . ' ORDER BY created_at DESC, client_id DESC';
+        return $this->fetchAll('engine_orders', $sql, $params);
+    }
+
+    public function engineOrder(string $clientId): ?array
+    {
+        return $this->fetchOne('engine_orders', 'SELECT * FROM engine_orders WHERE client_id = ?', [$clientId]);
+    }
+
+    /** Insert one engine order (`client_id` is the primary key; defaults: status SENDING, created_at now). */
+    public function insertEngineOrder(array $row): void
+    {
+        if (!isset($row['created_at'])) {
+            $row['created_at'] = Util::nowIso();
+        }
+        if (!isset($row['status'])) {
+            $row['status'] = 'SENDING';
+        }
+        $this->insertRow('engine_orders', $row);
+    }
+
+    public function updateEngineOrder(string $clientId, array $fields): void
+    {
+        if (!isset($fields['updated_at'])) {
+            $fields['updated_at'] = Util::nowIso();
+        }
+        $this->updateRow('engine_orders', 'client_id', $clientId, $fields);
+    }
+
+    /**
+     * Live engine orders for one symbol (statuses in ENGINE_LIVE_STATUSES), oldest first.
+     * null/'' $mode = every mode (panel view); the engines always pass their configured
+     * mode so a paper tick can never reconcile - and abandon - a live order (DESIGN.md §4).
+     */
+    public function openEngineOrders(string $symbol, ?string $mode = null): array
+    {
+        $in     = implode(', ', array_fill(0, count(self::ENGINE_LIVE_STATUSES), '?'));
+        $params = array_merge([$symbol], self::ENGINE_LIVE_STATUSES);
+        $sql    = 'SELECT * FROM engine_orders WHERE symbol = ? AND status IN (' . $in . ')'
+                . self::modeClause($mode, $params)
+                . ' ORDER BY created_at ASC, client_id ASC';
+        return $this->fetchAll('engine_orders', $sql, $params);
+    }
+
+    /* ------------------------------------------------------------------ lots */
+
+    /** Insert a FIFO inventory lot; `remaining` defaults to `qty`, `created_at` to now. */
+    public function insertLot(array $row): int
+    {
+        if (!isset($row['created_at'])) {
+            $row['created_at'] = Util::nowIso();
+        }
+        if (!isset($row['remaining']) && isset($row['qty'])) {
+            $row['remaining'] = $row['qty'];
+        }
+        return $this->insertRow('lots', $row);
+    }
+
+    /** Lots with inventory left for $symbol, FIFO order (oldest first). */
+    public function openLots(string $symbol, ?string $mode = null, ?string $engine = null): array
+    {
+        $params = [$symbol, self::LOT_EPSILON];
+        $sql    = 'SELECT * FROM lots WHERE symbol = ? AND remaining > ?'
+                . self::modeClause($mode, $params)
+                . self::engineClause($engine, $params)
+                . ' ORDER BY created_at ASC, id ASC';
+        return $this->fetchAll('lots', $sql, $params);
+    }
+
+    /**
+     * Consume $qty of base inventory for $symbol, strict FIFO (oldest lot first),
+     * decrementing `remaining` as it goes.
+     *
+     * Never consumes more than is available: when the inventory is short the
+     * method returns the slices it could fill and the caller is expected to
+     * notice (sum the slice quantities) rather than being handed a fabricated lot.
+     *
+     * @return array [['lot' => row (with `remaining` already decremented),
+     *                 'qty' => float consumed from that lot,
+     *                 'cost' => float qty x lot.price], ...]
+     */
+    public function consumeLots(string $symbol, float $qty, ?string $mode = null, ?string $engine = null): array
+    {
+        return $this->consumeFrom($this->openLots($symbol, $mode, $engine), $qty);
+    }
+
+    /**
+     * Same as consumeLots(), restricted to the lots of one grid rung (oldest first).
+     *
+     * A grid sell is placed against one specific lot (DESIGN-ENGINES §7.4: "for each
+     * lot with no live sell"), so its fill must consume THAT lot: plain FIFO would
+     * burn an older, dearer lot whose own sell is still resting, leaving the engine
+     * quoting more base than it holds and pricing the cycle against the wrong basis.
+     *
+     * @return array same slice shape as consumeLots()
+     */
+    public function consumeLotsAtLevel(string $symbol, float $qty, ?string $mode, ?string $engine, int $level): array
+    {
+        $params = [$symbol, self::LOT_EPSILON];
+        $sql    = 'SELECT * FROM lots WHERE symbol = ? AND remaining > ?'
+                . self::modeClause($mode, $params)
+                . self::engineClause($engine, $params)
+                . ' AND level = ?'
+                . ' ORDER BY created_at ASC, id ASC';
+        $params[] = $level;
+        return $this->consumeFrom($this->fetchAll('lots', $sql, $params), $qty);
+    }
+
+    /** Take $qty out of $lots in the order given, decrementing `remaining`. */
+    private function consumeFrom(array $lots, float $qty): array
+    {
+        $out = [];
+        if (!is_finite($qty) || $qty <= self::LOT_EPSILON) {
+            return $out;
+        }
+        $left = $qty;
+        $st   = $this->pdo->prepare('UPDATE lots SET remaining = ? WHERE id = ?');
+        foreach ($lots as $lot) {
+            if ($left <= self::LOT_EPSILON) {
+                break;
+            }
+            $rem = (float) $lot['remaining'];
+            if ($rem <= self::LOT_EPSILON) {
+                continue;
+            }
+            $take = $rem <= $left ? $rem : $left;
+            $newRemaining = $rem - $take;
+            if ($newRemaining < self::LOT_EPSILON) {
+                $newRemaining = 0.0;
+            }
+            $st->execute([$newRemaining, (int) $lot['id']]);
+            $lot['remaining'] = $newRemaining;
+            $out[] = [
+                'lot'  => $lot,
+                'qty'  => $take,
+                'cost' => $take * (float) $lot['price'],
+            ];
+            $left -= $take;
+        }
+        return $out;
+    }
+
+    /* ---------------------------------------------------------------- cycles */
+
+    /** Insert a realised round trip; `closed_at` defaults to now. */
+    public function insertCycle(array $row): int
+    {
+        if (!isset($row['closed_at'])) {
+            $row['closed_at'] = Util::nowIso();
+        }
+        return $this->insertRow('cycles', $row);
+    }
+
+    /** Newest first. */
+    public function cycles(int $limit = 30, ?string $mode = null, ?string $engine = null): array
+    {
+        $params = [];
+        $sql    = 'SELECT * FROM cycles WHERE 1 = 1'
+                . self::modeClause($mode, $params)
+                . self::engineClause($engine, $params)
+                . ' ORDER BY closed_at DESC, id DESC LIMIT ?';
+        $params[] = max(1, $limit);
+        return $this->fetchAll('cycles', $sql, $params);
+    }
+
+    /**
+     * Sum of cycles.pnl_usdt closed at or after $since (null/'' = all history);
+     * null/'' $mode = every mode, exactly like the other analytics methods.
+     */
+    public function cyclePnl(?string $since = null, ?string $mode = null, ?string $engine = null): float
+    {
+        $params = [];
+        $sql    = 'SELECT COALESCE(SUM(pnl_usdt), 0) FROM cycles WHERE 1 = 1';
+        if ($since !== null && $since !== '') {
+            $sql     .= ' AND closed_at >= ?';
+            $params[] = $since;
+        }
+        $sql .= self::modeClause($mode, $params) . self::engineClause($engine, $params);
+        return (float) $this->scalar($sql, $params);
+    }
+
+    /**
+     * Engine KPIs: cycles, pnl, fees, wins, losses, win_rate (percent of decided
+     * cycles), inventory_qty and inventory_cost (open lots at their cost basis).
+     * null/'' scopes mean "every mode" / "every engine".
+     */
+    public function engineStats(?string $mode = null, ?string $engine = null): array
+    {
+        $params = [];
+        $sql    = 'SELECT COUNT(*) AS cycles, COALESCE(SUM(pnl_usdt), 0) AS pnl,
+                    COALESCE(SUM(fee_usdt), 0) AS fees,
+                    COALESCE(SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN pnl_usdt < 0 THEN 1 ELSE 0 END), 0) AS losses
+             FROM cycles WHERE 1 = 1'
+                . self::modeClause($mode, $params)
+                . self::engineClause($engine, $params);
+        $st = $this->pdo->prepare($sql);
+        $st->execute($params);
+        $r = $st->fetch();
+
+        $invParams = [self::LOT_EPSILON];
+        $invSql    = 'SELECT COALESCE(SUM(remaining), 0) AS qty, COALESCE(SUM(remaining * price), 0) AS cost
+             FROM lots WHERE remaining > ?'
+                . self::modeClause($mode, $invParams)
+                . self::engineClause($engine, $invParams);
+        $ist = $this->pdo->prepare($invSql);
+        $ist->execute($invParams);
+        $inv = $ist->fetch();
+
+        $wins    = (int) ($r['wins'] ?? 0);
+        $losses  = (int) ($r['losses'] ?? 0);
+        $decided = $wins + $losses;
+
+        return [
+            'cycles'         => (int) ($r['cycles'] ?? 0),
+            'pnl'            => (float) ($r['pnl'] ?? 0),
+            'fees'           => (float) ($r['fees'] ?? 0),
+            'wins'           => $wins,
+            'losses'         => $losses,
+            'win_rate'       => $decided > 0 ? $wins / $decided * 100.0 : 0.0,
+            'inventory_qty'  => (float) ($inv['qty'] ?? 0),
+            'inventory_cost' => (float) ($inv['cost'] ?? 0),
+        ];
     }
 
     /* ---------------------------------------------------------------- login */
