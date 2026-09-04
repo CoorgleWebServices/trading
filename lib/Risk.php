@@ -44,6 +44,18 @@ final class Risk
     const GRID_SPACING_MARGIN = 0.1;
     /** Default quote per engine order when the key is absent. */
     const ENGINE_ORDER_USDT_DEFAULT = 1.30;
+    /** Portfolio sleeves (DESIGN-PORTFOLIO.md §2): one sleeve per method, keyed by engine name. */
+    const SLEEVE_ENGINES = ['signal', 'grid', 'pmm'];
+    /** Sleeves whose engine trades exactly one symbol. */
+    const SLEEVE_SINGLE_SYMBOL_ENGINES = ['grid', 'pmm'];
+    /** Percent of a sleeve's budget it may lose before it stops opening new exposure. */
+    const SLEEVE_MAX_DRAWDOWN_DEFAULT = 25.0;
+    /** Percent of the total quote balance that is never allocated to a sleeve. */
+    const SLEEVE_RESERVE_DEFAULT = 5.0;
+    /** A sleeve budget must cover this many minimum-size orders of its symbols. */
+    const SLEEVE_BUDGET_REQUIRED_MULTIPLE = 20.0;
+    /** Largest budget a single sleeve may be given (a sanity bound, not a limit of the account). */
+    const SLEEVE_BUDGET_MAX = 1000000000.0;
 
     /* ------------------------------------------------------------ survival */
 
@@ -512,7 +524,8 @@ final class Risk
     /* ---------------------------------------------------------- validation */
 
     /**
-     * Sanitise every DESIGN.md §3 and DESIGN-ENGINES.md §2 key found in $in on top
+     * Sanitise every DESIGN.md §3, DESIGN-ENGINES.md §2 and DESIGN-PORTFOLIO.md §2 key
+     * found in $in on top
      * of $current. Invalid values are reported in errors[] and the current value is
      * kept; configurations that are legal but dangerous are reported in warnings[]
      * and ARE applied (the panel shows them next to the saved settings).
@@ -567,6 +580,15 @@ final class Risk
             'pmm_target_base_pct'         => ['f', 0.0, 100.0],
             'pmm_max_base_pct'            => ['f', 1.0, 100.0],
             'engine_max_orders'           => ['i', 1, self::ENGINE_MAX_ORDERS_CAP],
+            // portfolio + scanner (DESIGN-PORTFOLIO.md §2)
+            'sleeve_reserve_pct'          => ['f', 0.0, 50.0],
+            'sleeve_max_drawdown_pct'     => ['f', 1.0, 90.0],
+            'scanner_refresh_min'         => ['i', 1, 1440],
+            'scanner_min_quote_vol'       => ['f', 0.0, 1000000000000.0],
+            'scanner_max_spread_pct'      => ['f', 0.001, 5.0],
+            'scanner_min_atr_pct'         => ['f', 0.0, 50.0],
+            'scanner_max_atr_pct'         => ['f', 0.01, 100.0],
+            'scanner_top_n'               => ['i', 1, 100],
         ];
         foreach ($numeric as $key => $spec) {
             if (!array_key_exists($key, $in)) {
@@ -604,7 +626,8 @@ final class Risk
             }
         }
 
-        foreach (['enabled', 'adaptive', 'force_https', 'allow_live_engines', 'grid_exit_liquidates', 'post_only'] as $key) {
+        foreach (['enabled', 'adaptive', 'force_https', 'allow_live_engines', 'grid_exit_liquidates', 'post_only',
+                  'portfolio_enabled', 'scanner_enabled'] as $key) {
             if (array_key_exists($key, $in)) {
                 $cfg[$key] = self::toBool($in[$key]);
             }
@@ -870,7 +893,342 @@ final class Risk
             }
         }
 
+        /* ---- portfolio sleeves and scanner (DESIGN-PORTFOLIO.md §2) ---- */
+
+        if (array_key_exists('scanner_exclude', $in)) {
+            $list = $in['scanner_exclude'];
+            if (is_string($list)) {
+                $parts = preg_split('/[\s,;]+/', $list);
+                $list  = $parts === false ? [] : $parts;
+            }
+            if (!is_array($list)) {
+                $errors[] = 'scanner_exclude must be a list of symbols';
+            } else {
+                $clean = [];
+                $bad   = [];
+                foreach ($list as $s) {
+                    if (!is_scalar($s)) {
+                        continue;
+                    }
+                    $s = strtoupper(trim((string) $s));
+                    if ($s === '') {
+                        continue;
+                    }
+                    if (preg_match('/^[A-Z0-9]{3,20}$/', $s) === 1) {
+                        $clean[$s] = true;
+                    } else {
+                        $bad[] = $s;
+                    }
+                }
+                if ($bad !== []) {
+                    $errors[] = 'scanner_exclude: invalid symbols: ' . implode(', ', array_slice($bad, 0, 10));
+                } elseif (count($clean) > 100) {
+                    $errors[] = 'scanner_exclude: at most 100 symbols';
+                } else {
+                    $cfg['scanner_exclude'] = array_keys($clean);
+                }
+            }
+        }
+
+        $atrLo = self::f($cfg, 'scanner_min_atr_pct', 0.5);
+        $atrHi = self::f($cfg, 'scanner_max_atr_pct', 4.0);
+        if ($atrLo >= $atrHi) {
+            $errors[] = 'scanner_min_atr_pct must be lower than scanner_max_atr_pct';
+            $cfg['scanner_min_atr_pct'] = self::f($current, 'scanner_min_atr_pct', 0.5);
+            $cfg['scanner_max_atr_pct'] = self::f($current, 'scanner_max_atr_pct', 4.0);
+        }
+
+        if (array_key_exists('sleeves', $in)) {
+            $parsed = self::parseSleeves($in['sleeves'], $quote, $errors);
+            if ($parsed !== null) {
+                $cfg['sleeves'] = $parsed;
+            }
+            // on any sleeve error the current map is kept, exactly like every other key
+        }
+
+        if (isset($cfg['sleeves']) && is_array($cfg['sleeves']) && $cfg['sleeves'] !== []) {
+            self::checkSleeveBudgets($cfg, $quote, $errors, $warnings);
+        }
+
         return [$cfg, $errors, $warnings];
+    }
+
+    /* --------------------------------------------------- portfolio sleeves */
+
+    /** Percent of a sleeve's budget it may lose before it stops opening new exposure. */
+    public static function sleeveMaxDrawdownPct(array $cfg): float
+    {
+        $v = self::f($cfg, 'sleeve_max_drawdown_pct', self::SLEEVE_MAX_DRAWDOWN_DEFAULT);
+        if (!is_finite($v)) {
+            $v = self::SLEEVE_MAX_DRAWDOWN_DEFAULT;
+        }
+        return Util::clamp($v, 0.0, 100.0);
+    }
+
+    /** Percent of the total quote balance that is never allocated to a sleeve. */
+    public static function sleeveReservePct(array $cfg): float
+    {
+        $v = self::f($cfg, 'sleeve_reserve_pct', self::SLEEVE_RESERVE_DEFAULT);
+        if (!is_finite($v)) {
+            $v = self::SLEEVE_RESERVE_DEFAULT;
+        }
+        return Util::clamp($v, 0.0, 100.0);
+    }
+
+    /**
+     * Validate and normalise the `sleeves` map (DESIGN-PORTFOLIO.md §2). Every rule here
+     * is an ERROR: an overlapping symbol would make one sleeve sell inventory another one
+     * bought, and a multi-symbol grid/pmm sleeve cannot be run by its single-symbol engine.
+     *
+     * @param mixed  $raw    the posted value: a map keyed by engine name (or its JSON)
+     * @param string $quote  the configured quote asset
+     * @return array|null the normalised map, or null when it must not be applied
+     */
+    private static function parseSleeves($raw, string $quote, array &$errors): ?array
+    {
+        if (is_string($raw)) {
+            $decoded = json_decode($raw, true);
+            $raw     = is_array($decoded) ? $decoded : null;
+            if ($raw === null) {
+                $errors[] = 'sleeves must be a map keyed by engine name (' . implode(', ', self::SLEEVE_ENGINES) . ')';
+                return null;
+            }
+        }
+        if (!is_array($raw)) {
+            $errors[] = 'sleeves must be a map keyed by engine name (' . implode(', ', self::SLEEVE_ENGINES) . ')';
+            return null;
+        }
+
+        $out   = [];
+        $owner = [];
+        $ok    = true;
+        foreach ($raw as $key => $entry) {
+            $engine = strtolower(trim((string) $key));
+            if ($engine === '') {
+                continue;
+            }
+            if (!in_array($engine, self::SLEEVE_ENGINES, true)) {
+                $errors[] = 'sleeves: unknown sleeve "' . $engine . '" (expected ' . implode(', ', self::SLEEVE_ENGINES) . ')';
+                $ok = false;
+                continue;
+            }
+            if (!is_array($entry)) {
+                $errors[] = 'sleeve ' . $engine . ' must have enabled, budget_usdt and symbols';
+                $ok = false;
+                continue;
+            }
+
+            $enabled = self::toBool(array_key_exists('enabled', $entry) ? $entry['enabled'] : false);
+
+            $budget    = 0.0;
+            $budgetRaw = array_key_exists('budget_usdt', $entry) ? $entry['budget_usdt'] : 0;
+            if (is_string($budgetRaw)) {
+                $budgetRaw = trim($budgetRaw);
+            }
+            if (is_bool($budgetRaw) || !is_numeric($budgetRaw)) {
+                $errors[] = 'sleeve ' . $engine . ': budget_usdt must be a number';
+                $ok = false;
+            } else {
+                $budget = (float) $budgetRaw;
+                if (!is_finite($budget) || $budget < 0.0 || $budget > self::SLEEVE_BUDGET_MAX) {
+                    $errors[] = 'sleeve ' . $engine . ': budget_usdt must be between 0 and '
+                        . self::fmtBound(self::SLEEVE_BUDGET_MAX);
+                    $ok = false;
+                    $budget = 0.0;
+                }
+            }
+
+            $list = array_key_exists('symbols', $entry) ? $entry['symbols'] : [];
+            if (is_string($list)) {
+                $parts = preg_split('/[\s,;]+/', $list);
+                $list  = $parts === false ? [] : $parts;
+            }
+            $symbols = [];
+            if (!is_array($list)) {
+                $errors[] = 'sleeve ' . $engine . ': symbols must be a list';
+                $ok = false;
+            } else {
+                $bad = [];
+                foreach ($list as $s) {
+                    if (!is_scalar($s)) {
+                        continue;
+                    }
+                    $s = strtoupper(trim((string) $s));
+                    if ($s === '') {
+                        continue;
+                    }
+                    $okChars = preg_match('/^[A-Z0-9]{3,20}$/', $s) === 1;
+                    $okQuote = strlen($s) > strlen($quote) && substr($s, -strlen($quote)) === $quote;
+                    if ($okChars && $okQuote) {
+                        if (!in_array($s, $symbols, true)) {
+                            $symbols[] = $s;
+                        }
+                    } else {
+                        $bad[] = $s;
+                    }
+                }
+                if ($bad !== []) {
+                    $errors[] = 'sleeve ' . $engine . ': invalid symbols (must be uppercase and end with '
+                        . $quote . '): ' . implode(', ', array_slice($bad, 0, 10));
+                    $ok = false;
+                }
+            }
+
+            // grid and pmm are single-symbol engines; an empty disabled sleeve is left alone
+            if (in_array($engine, self::SLEEVE_SINGLE_SYMBOL_ENGINES, true)
+                && !($symbols === [] && !$enabled)
+                && count($symbols) !== 1) {
+                $errors[] = 'sleeve ' . $engine . ' trades exactly one symbol (got ' . count($symbols) . ')';
+                $ok = false;
+            }
+
+            // a symbol may appear in at most one sleeve: report it and BOTH sleeves
+            foreach ($symbols as $s) {
+                if (isset($owner[$s])) {
+                    $errors[] = $s . ' is in the ' . $owner[$s] . ' sleeve and in the ' . $engine
+                        . ' sleeve; a symbol may belong to only one sleeve';
+                    $ok = false;
+                } else {
+                    $owner[$s] = $engine;
+                }
+            }
+
+            $out[$engine] = ['enabled' => $enabled, 'budget_usdt' => $budget, 'symbols' => $symbols];
+        }
+
+        return $ok ? $out : null;
+    }
+
+    /**
+     * Budget rules of DESIGN-PORTFOLIO.md §2 on the sleeves that are about to be saved:
+     * the enabled budgets must fit inside the total quote balance minus the reserve, and each
+     * budget must cover 20 minimum-size orders of its symbols. Both degrade to a warning when
+     * the balance / the symbol filters are not known yet, and both stay a warning while
+     * portfolio mode is off (the sleeve budgets are inert then, so a stale sleeve
+     * configuration must not block an unrelated settings save).
+     */
+    private static function checkSleeveBudgets(array $cfg, string $quote, array &$errors, array &$warnings): void
+    {
+        $portfolio = self::b($cfg, 'portfolio_enabled', false);
+        $fee       = self::f($cfg, 'fee_pct', 0.1);
+        $reserve   = self::sleeveReservePct($cfg);
+        $sum       = 0.0;
+        $enabled   = [];
+        foreach ($cfg['sleeves'] as $key => $entry) {
+            $engine = strtolower(trim((string) $key));
+            if ($engine === '' || !is_array($entry) || !self::toBool($entry['enabled'] ?? false)) {
+                continue;
+            }
+            $budget = isset($entry['budget_usdt']) && is_numeric($entry['budget_usdt']) ? (float) $entry['budget_usdt'] : 0.0;
+            if (!is_finite($budget) || $budget < 0.0) {
+                $budget = 0.0;
+            }
+            $symbols = [];
+            $raw     = isset($entry['symbols']) && is_array($entry['symbols']) ? $entry['symbols'] : [];
+            foreach ($raw as $s) {
+                if (is_scalar($s) && trim((string) $s) !== '') {
+                    $symbols[] = strtoupper(trim((string) $s));
+                }
+            }
+            $enabled[$engine] = ['budget' => $budget, 'symbols' => $symbols];
+            $sum += $budget;
+        }
+        if ($enabled === []) {
+            return;
+        }
+
+        $total = self::lastTotalQuote();
+        if ($total > 0.0) {
+            $allowed = $total * (1.0 - $reserve / 100.0);
+            if ($sum > $allowed + 1e-9) {
+                $msg = 'the enabled sleeve budgets add up to ' . self::fmtBound($sum) . ' ' . $quote
+                     . ', more than the ' . self::fmtBound($allowed) . ' ' . $quote . ' available after the '
+                     . self::fmtBound($reserve) . '% reserve (balance ' . self::fmtBound($total) . ')';
+                if ($portfolio) {
+                    $errors[] = $msg;
+                } else {
+                    $warnings[] = $msg;
+                }
+            }
+        } else {
+            $warnings[] = 'the enabled sleeve budgets add up to ' . self::fmtBound($sum) . ' ' . $quote
+                . '; the account balance is not known yet (no equity sample), so the split could not be checked';
+        }
+
+        foreach ($enabled as $engine => $s) {
+            $need    = 0.0;
+            $needSym = '';
+            $unknown = [];
+            foreach ($s['symbols'] as $symbol) {
+                $ref = self::symbolReference($symbol);
+                if ($ref['info'] === null || $ref['price'] <= 0.0) {
+                    $unknown[] = $symbol;
+                    continue;
+                }
+                $min = self::SLEEVE_BUDGET_REQUIRED_MULTIPLE * self::requiredSize($ref['info'], $ref['price'], $fee);
+                if ($min > $need) {
+                    $need    = $min;
+                    $needSym = $symbol;
+                }
+            }
+            if ($need > 0.0 && $s['budget'] < $need - 1e-9) {
+                $msg = 'sleeve ' . $engine . ': budget_usdt must be at least '
+                     . self::fmtBound(self::SLEEVE_BUDGET_REQUIRED_MULTIPLE) . 'x the required size for '
+                     . $needSym . ' (' . self::fmtBound($need) . ' ' . $quote . ')';
+                if ($portfolio) {
+                    $errors[] = $msg;
+                } else {
+                    $warnings[] = $msg;   // inert while portfolio mode is off: never block an unrelated save
+                }
+            } elseif ($unknown !== []) {
+                $warnings[] = 'sleeve ' . $engine . ': the budget could not be checked against '
+                    . implode(', ', array_slice($unknown, 0, 5)) . ' (no symbol info yet); '
+                    . self::fmtBound(self::SLEEVE_BUDGET_REQUIRED_MULTIPLE) . 'x the required size is the minimum that works';
+            }
+        }
+
+        if (!$portfolio) {
+            return;
+        }
+        $live = self::mode($cfg) === 'live' && !self::b($cfg, 'allow_live_engines', false);
+        foreach (self::SLEEVE_SINGLE_SYMBOL_ENGINES as $engine) {
+            if (!isset($enabled[$engine])) {
+                continue;
+            }
+            if ($live) {
+                $warnings[] = 'the ' . $engine . ' sleeve is saved but will place no order in live mode'
+                    . ' until allow_live_engines is enabled';
+            }
+            if ($engine === 'pmm') {
+                $warnings[] = 'the pmm sleeve is expected to LOSE money at VIP0 fees: a round trip costs '
+                    . self::fmtBound(2.0 * $fee) . '% while typical spreads on the majors are 0.01-0.05%';
+            }
+        }
+    }
+
+    /**
+     * Total quote capital of the account (the newest equity sample), or 0.0 when unknown.
+     * Best-effort: the validator must work without a database.
+     */
+    private static function lastTotalQuote(): float
+    {
+        if (!defined('TRADER_ROOT')) {
+            return 0.0;
+        }
+        try {
+            $row = Db::get()->lastEquity();
+            if (is_array($row)) {
+                if (isset($row['equity_usdt']) && is_numeric($row['equity_usdt']) && (float) $row['equity_usdt'] > 0.0) {
+                    return (float) $row['equity_usdt'];
+                }
+                if (isset($row['quote_free']) && is_numeric($row['quote_free'])) {
+                    return (float) $row['quote_free'];
+                }
+            }
+        } catch (Throwable $e) {
+            return 0.0;
+        }
+        return 0.0;
     }
 
     /**
@@ -882,7 +1240,16 @@ final class Risk
      */
     private static function engineSymbolReference(array $cfg): array
     {
-        $out = ['symbol' => strtoupper(trim((string) ($cfg['engine_symbol'] ?? ''))), 'info' => null, 'price' => 0.0];
+        return self::symbolReference((string) ($cfg['engine_symbol'] ?? ''));
+    }
+
+    /**
+     * Same, for any symbol: cached `symbol_info` row and last known price from
+     * `symbol_metrics`. ['symbol'=>string, 'info'=>?array, 'price'=>float].
+     */
+    private static function symbolReference(string $symbol): array
+    {
+        $out = ['symbol' => strtoupper(trim($symbol)), 'info' => null, 'price' => 0.0];
         if ($out['symbol'] === '' || !defined('TRADER_ROOT')) {
             return $out;
         }

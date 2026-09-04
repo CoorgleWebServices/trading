@@ -76,6 +76,12 @@ final class EngineOrders
     private $nowMs;
     /** @var bool logged once when the exchange cannot list open orders */
     private $warnedNoOpenOrders = false;
+    /**
+     * Quote this engine's sleeve may still commit to BUY orders (DESIGN-PORTFOLIO.md §3),
+     * or null for the single-engine mode of DESIGN-ENGINES.md, which has no sleeve budget.
+     * @var float|null
+     */
+    private $availableQuote = null;
 
     /**
      * @param array $info parsed info for the engine symbol; either the flat row
@@ -251,6 +257,23 @@ final class EngineOrders
      *
      * @throws BinanceException on any error that is not a post-only rejection
      */
+    /**
+     * The sleeve budget rule of DESIGN-PORTFOLIO.md §3: place() refuses a BUY whose quote
+     * exceeds what the sleeve still has available. Additive and off by default - null (the
+     * single-engine mode of DESIGN-ENGINES.md) places exactly as it does today. SELLs are
+     * never budget-blocked: reducing inventory returns capital to the sleeve.
+     */
+    public function setAvailableQuote(?float $available): void
+    {
+        $this->availableQuote = ($available === null || !is_finite($available)) ? null : max(0.0, $available);
+    }
+
+    /** @return float|null the cap set by setAvailableQuote(), or null when uncapped */
+    public function availableQuote(): ?float
+    {
+        return $this->availableQuote;
+    }
+
     public function place(string $side, float $price, float $quote, string $purpose, ?int $level): ?array
     {
         $side   = strtoupper(trim($side)) === 'SELL' ? 'SELL' : 'BUY';
@@ -300,6 +323,15 @@ final class EngineOrders
         if ($minNotional > 0.0 && $notional + self::eps($notional) < $minNotional) {
             Log::debug('engine place: below minNotional, skipping ' . $purpose, [
                 'symbol' => $symbol, 'notional' => $notional, 'min_notional' => $minNotional,
+            ]);
+            return null;
+        }
+        // sleeve budget cap (DESIGN-PORTFOLIO.md §3): a BUY may never commit more than the
+        // sleeve still has available. Uncapped in single-engine mode; SELLs are never blocked.
+        if ($side === 'BUY' && $this->availableQuote !== null
+            && $notional > $this->availableQuote + self::eps($notional)) {
+            Log::debug('engine place: over the sleeve budget, skipping ' . $purpose, [
+                'symbol' => $symbol, 'notional' => $notional, 'available' => $this->availableQuote,
             ]);
             return null;
         }

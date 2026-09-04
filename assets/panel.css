@@ -279,3 +279,51 @@ svg.bar rect { fill: var(--accent); }
 .inline-group { display: inline-flex; align-items: center; gap: 8px; }
 .btn-mini { padding: 2px 8px; font-size: .78rem; line-height: 1.5; }
 table.tbl td form.inline { margin: 0; }
+
+/* ---- portfolio & scanner (docs/DESIGN-PORTFOLIO.md §7)
+   Row colours, sleeve legend swatches and the per-sleeve sparkline colours all live here:
+   the CSP forbids inline style attributes, so nothing in the panel ever emits one. */
+.portfolio-card .pf-best { margin: 10px 0 2px; }
+.pill-wide { white-space: normal; max-width: 100%; overflow: visible; text-overflow: clip; line-height: 1.4; padding: 4px 10px; }
+.pf-kv { margin-top: 10px; }
+table.tbl tr.row-ok > td { background: rgba(46, 204, 113, .07); }
+table.tbl tr.row-danger > td { background: rgba(255, 92, 92, .07); }
+table.tbl tr.row-muted > td { color: var(--muted); }
+table.tbl tr.row-ok:hover > td, table.tbl tr.row-danger:hover > td, table.tbl tr.row-muted:hover > td { background: var(--card2); }
+.sleeve-actions { margin: 4px 0 2px; gap: 8px 16px; }
+.sleeve-actions .inline-group { gap: 6px; }
+.sleeve-name { color: var(--muted); text-transform: uppercase; font-size: .78rem; }
+
+/* settings: the sleeve fields follow the portfolio_enabled checkbox (class toggle in panel.js) */
+.portfolio-sleeves { margin: 4px 0 0; }
+.sleeve-group { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px 2px; margin: 0 0 10px; background: var(--card2); }
+.sleeve-group h3 { margin: 2px 0 6px; text-transform: uppercase; font-size: .82rem; letter-spacing: .05em; color: var(--accent); }
+.inline-errors { margin: 0 0 8px; }
+.inline-errors ul { margin: 0 0 0 18px; }
+
+/* per-row "Assign to…" control */
+form.inline.assign { gap: 4px; }
+form.inline.assign .assign-select {
+  display: inline-block;
+  width: auto;
+  margin: 0;
+  padding: 2px 6px;
+  background: #0b1015;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-size: .78rem;
+}
+
+/* overlaid sleeve sparkline: one class per sleeve, plus a neutral fallback */
+.spark-multi .spark-series { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke: var(--muted); }
+.spark-multi .spark-signal { stroke: var(--accent); }
+.spark-multi .spark-grid { stroke: var(--ok); }
+.spark-multi .spark-pmm { stroke: var(--warn); }
+.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.legend-swatch { display: inline-block; width: 14px; height: 3px; border-radius: 2px; background: var(--muted); }
+.legend-swatch.swatch-signal { background: var(--accent); }
+.legend-swatch.swatch-grid { background: var(--ok); }
+.legend-swatch.swatch-pmm { background: var(--warn); }
+.legend-value { font-variant-numeric: tabular-nums; }

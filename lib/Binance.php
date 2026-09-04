@@ -482,6 +482,112 @@ final class Binance
         return (float)($r['price'] ?? 0);
     }
 
+    /**
+     * GET /api/v3/ticker/24hr — 24 hour rolling window statistics.
+     *
+     * **WEIGHT 80 WITH NO SYMBOLS.** Called with an empty $symbols this asks the exchange for
+     * EVERY listed symbol (thousands of rows, ~1 MB of JSON) and costs **80** of the 1200
+     * request weight the account gets per minute. NEVER call it on a per-tick path and never
+     * in a loop: the whole point of the hourly `Scanner::refresh()` (guarded by
+     * `Scanner::due()` / `scanner_refresh_min`) is that this call happens once an hour.
+     * Binance's weights for this endpoint:
+     *
+     *     1 symbol .................. 2
+     *     2 … 20 symbols ............ 2
+     *     21 … 100 symbols .......... 40
+     *     more than 100, or none .... 80
+     *
+     * Rows are normalised to the shape below (missing fields become 0.0). The bid and ask come
+     * from this same payload, so a caller that already has the tickers needs no extra
+     * bookTicker weight to compute spreads:
+     *
+     *     ['symbol'=>string, 'last'=>float, 'bid'=>float, 'ask'=>float,
+     *      'change_pct'=>float, 'quote_vol'=>float, 'high'=>float, 'low'=>float]
+     *
+     * `change_pct` is the 24 h price change in percent, `quote_vol` the 24 h volume in the
+     * quote asset (USDT), which is the liquidity measure the scanner filters on.
+     *
+     * Like exchangeInfo()/prices(), an explicit symbol list that trips `-1121 invalid symbol`
+     * is retried per symbol so one typo costs one symbol instead of the whole batch.
+     *
+     * @param array $symbols concrete symbols, or [] for every symbol on the exchange (weight 80)
+     * @return array list of normalised rows, in the order the exchange returned them
+     */
+    public function ticker24h(array $symbols = []): array
+    {
+        $requested = array_values(array_unique(array_map('strval', $symbols)));
+        $wanted    = $this->dropInvalid($requested);
+        if ($requested !== [] && $wanted === []) {
+            return [];      // every requested symbol is known-invalid; do NOT fall through to "all symbols"
+        }
+        $params = [];
+        if (count($wanted) === 1) {
+            $params['symbol'] = $wanted[0];
+        } elseif (count($wanted) > 1) {
+            $params['symbols'] = json_encode($wanted);
+        }
+        try {
+            $r = $this->request('GET', '/api/v3/ticker/24hr', $params, false, true, false);
+        } catch (BinanceException $e) {
+            if ($e->binanceCode !== -1121 || $wanted === []) {
+                throw $e;
+            }
+            if (count($wanted) === 1) {
+                $this->markInvalid($wanted[0]);
+                return [];
+            }
+            $out = [];
+            foreach ($wanted as $s) {
+                foreach ($this->ticker24h([$s]) as $row) {
+                    $out[] = $row;
+                }
+            }
+            return $out;
+        }
+        if (isset($r['symbol'])) {
+            $r = [$r];
+        }
+        $out = [];
+        foreach ($r as $row) {
+            if (!is_array($row) || !isset($row['symbol'])) {
+                continue;
+            }
+            $out[] = self::normalizeTicker24h($row);
+        }
+        return $out;
+    }
+
+    /**
+     * Normalise one raw /api/v3/ticker/24hr row to the scanner shape.
+     *
+     * @param array $t raw row
+     * @return array{symbol:string,last:float,bid:float,ask:float,change_pct:float,quote_vol:float,high:float,low:float}
+     */
+    public static function normalizeTicker24h(array $t): array
+    {
+        return [
+            'symbol'     => (string) ($t['symbol'] ?? ''),
+            'last'       => self::numField($t, 'lastPrice'),
+            'bid'        => self::numField($t, 'bidPrice'),
+            'ask'        => self::numField($t, 'askPrice'),
+            'change_pct' => self::numField($t, 'priceChangePercent'),
+            'quote_vol'  => self::numField($t, 'quoteVolume'),
+            'high'       => self::numField($t, 'highPrice'),
+            'low'        => self::numField($t, 'lowPrice'),
+        ];
+    }
+
+    /** Finite float from a raw API row (Binance sends numbers as strings). */
+    private static function numField(array $row, string $key): float
+    {
+        if (!isset($row[$key]) || !is_numeric($row[$key])) {
+            return 0.0;
+        }
+        $v = (float) $row[$key];
+        return is_finite($v) ? $v : 0.0;
+    }
+
+
     // ------------------------------------------------------------------ signed
 
     /**

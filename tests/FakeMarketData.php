@@ -55,6 +55,103 @@ final class FakeMarketData implements MarketDataInterface
         'BTCUSDT' => ['base' => 'BTC', 'stepSize' => '0.00001000', 'minQty' => '0.00001000', 'maxQty' => '9000.00000000', 'minNotional' => 5.0, 'tickSize' => '0.01000000'],
     ];
 
+    /**
+     * Fixture for `GET /api/v3/ticker/24hr` (docs/DESIGN-PORTFOLIO.md §5), built so the scanner
+     * ranking can be pinned down exactly. One entry per case the scanner has to get right:
+     *
+     *   liquid_volatile   SOLUSDT, DOGEUSDT, ETHUSDT - deep books, tight spreads, ATR inside the
+     *                     band. These are the rows that must come out on top, in that order.
+     *   name_only_lev     JUPUSDT - the base merely ENDS in "UP" with a two-letter underlying,
+     *                     so it is a real coin and must NOT be dropped as a leveraged token.
+     *   illiquid          ILLIQUSDT - 0.4 M quote volume with a 3.5 % ATR: the most volatile
+     *                     tradeable-looking row in the set, and it must still score zero.
+     *   wide_spread       WIDEUSDT - 0.2 % spread, 3 % ATR: same lesson from the other side.
+     *   atr_high/atr_low  NOISEUSDT (6.5 %) and FLATUSDT (0.2 %) - outside the ATR band.
+     *   dust_step         DUSTUSDT - one step costs 5 USDT, far over the dust limit.
+     *   stablecoin        USDCUSDT, FDUSDUSDT - in `scanner_exclude`, dropped outright.
+     *   leveraged         BTCUPUSDT, BTCDOWNUSDT, ETHBULLUSDT, XRPBEARUSDT - dropped outright.
+     *   not_trading       HALTUSDT (status BREAK) and NOSPOTUSDT (spot not allowed) - dropped.
+     *   other_quote       ETHBTC - does not end in the quote asset, dropped.
+     *
+     * `atr_pct` is carried on the row itself: `Scanner::rank()` reads it there, which is exactly
+     * how `Scanner::refresh()` hands the second pass the ATRs it fetched. The rows are listed in
+     * a deliberately scrambled order so a test that asserts the ranking is testing the sort.
+     */
+    const TICKER_CASES = [
+        'ILLIQUSDT' => ['case' => 'illiquid', 'base' => 'ILLIQ',
+            'last' => 3.0, 'bid' => 2.9997, 'ask' => 3.0003, 'change_pct' => 9.5,
+            'quote_vol' => 400000.0, 'atr_pct' => 3.5,
+            'stepSize' => '0.01000000', 'minNotional' => 5.0, 'tickSize' => '0.00100000'],
+        'SOLUSDT' => ['case' => 'liquid_volatile', 'base' => 'SOL',
+            'last' => 130.0, 'bid' => 129.995, 'ask' => 130.005, 'change_pct' => 4.2,
+            'quote_vol' => 400000000.0, 'atr_pct' => 1.8,
+            'stepSize' => '0.00100000', 'minNotional' => 5.0, 'tickSize' => '0.01000000'],
+        'USDCUSDT' => ['case' => 'stablecoin', 'base' => 'USDC',
+            'last' => 1.0, 'bid' => 0.9999, 'ask' => 1.0001, 'change_pct' => 0.01,
+            'quote_vol' => 900000000.0, 'atr_pct' => 0.02,
+            'stepSize' => '0.10000000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'BTCUPUSDT' => ['case' => 'leveraged', 'base' => 'BTCUP',
+            'last' => 12.0, 'bid' => 11.999, 'ask' => 12.001, 'change_pct' => 11.0,
+            'quote_vol' => 30000000.0, 'atr_pct' => 3.2,
+            'stepSize' => '0.01000000', 'minNotional' => 5.0, 'tickSize' => '0.00100000'],
+        'NOISEUSDT' => ['case' => 'atr_high', 'base' => 'NOISE',
+            'last' => 0.5, 'bid' => 0.49995, 'ask' => 0.50005, 'change_pct' => 18.0,
+            'quote_vol' => 80000000.0, 'atr_pct' => 6.5,
+            'stepSize' => '0.00100000', 'minNotional' => 5.0, 'tickSize' => '0.00001000'],
+        'ETHUSDT' => ['case' => 'liquid_volatile', 'base' => 'ETH',
+            'last' => 3000.0, 'bid' => 2999.99, 'ask' => 3000.01, 'change_pct' => 1.1,
+            'quote_vol' => 1200000000.0, 'atr_pct' => 0.7,
+            'stepSize' => '0.00010000', 'minNotional' => 5.0, 'tickSize' => '0.01000000'],
+        'WIDEUSDT' => ['case' => 'wide_spread', 'base' => 'WIDE',
+            'last' => 1.001, 'bid' => 1.0, 'ask' => 1.002, 'change_pct' => 7.0,
+            'quote_vol' => 20000000.0, 'atr_pct' => 3.0,
+            'stepSize' => '0.10000000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'JUPUSDT' => ['case' => 'name_only_lev', 'base' => 'JUP',
+            'last' => 1.0, 'bid' => 0.9999, 'ask' => 1.0001, 'change_pct' => 2.5,
+            'quote_vol' => 30000000.0, 'atr_pct' => 0.9,
+            'stepSize' => '0.00100000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'FDUSDUSDT' => ['case' => 'stablecoin', 'base' => 'FDUSD',
+            'last' => 1.0, 'bid' => 0.9999, 'ask' => 1.0001, 'change_pct' => 0.0,
+            'quote_vol' => 500000000.0, 'atr_pct' => 0.03,
+            'stepSize' => '0.10000000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'DOGEUSDT' => ['case' => 'liquid_volatile', 'base' => 'DOGE',
+            'last' => 0.2, 'bid' => 0.19999, 'ask' => 0.20001, 'change_pct' => 3.0,
+            'quote_vol' => 150000000.0, 'atr_pct' => 1.0,
+            'stepSize' => '1.00000000', 'minNotional' => 1.0, 'tickSize' => '0.00001000'],
+        'FLATUSDT' => ['case' => 'atr_low', 'base' => 'FLAT',
+            'last' => 10.0, 'bid' => 9.9995, 'ask' => 10.0005, 'change_pct' => 0.2,
+            'quote_vol' => 60000000.0, 'atr_pct' => 0.2,
+            'stepSize' => '0.00100000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'ETHBULLUSDT' => ['case' => 'leveraged', 'base' => 'ETHBULL',
+            'last' => 4.0, 'bid' => 3.999, 'ask' => 4.001, 'change_pct' => 9.0,
+            'quote_vol' => 25000000.0, 'atr_pct' => 2.9,
+            'stepSize' => '0.01000000', 'minNotional' => 5.0, 'tickSize' => '0.00100000'],
+        'DUSTUSDT' => ['case' => 'dust_step', 'base' => 'DUST',
+            'last' => 5.0, 'bid' => 4.9995, 'ask' => 5.0005, 'change_pct' => 5.0,
+            'quote_vol' => 9000000.0, 'atr_pct' => 1.5,
+            'stepSize' => '1.00000000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'XRPBEARUSDT' => ['case' => 'leveraged', 'base' => 'XRPBEAR',
+            'last' => 0.8, 'bid' => 0.7999, 'ask' => 0.8001, 'change_pct' => 8.0,
+            'quote_vol' => 15000000.0, 'atr_pct' => 2.7,
+            'stepSize' => '0.01000000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'HALTUSDT' => ['case' => 'not_trading', 'base' => 'HALT', 'status' => 'BREAK',
+            'last' => 7.0, 'bid' => 6.9993, 'ask' => 7.0007, 'change_pct' => 6.0,
+            'quote_vol' => 40000000.0, 'atr_pct' => 2.0,
+            'stepSize' => '0.00100000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'BTCDOWNUSDT' => ['case' => 'leveraged', 'base' => 'BTCDOWN',
+            'last' => 2.0, 'bid' => 1.9995, 'ask' => 2.0005, 'change_pct' => 12.0,
+            'quote_vol' => 18000000.0, 'atr_pct' => 3.1,
+            'stepSize' => '0.01000000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'NOSPOTUSDT' => ['case' => 'not_trading', 'base' => 'NOSPOT', 'spotAllowed' => false,
+            'last' => 2.0, 'bid' => 1.9998, 'ask' => 2.0002, 'change_pct' => 3.0,
+            'quote_vol' => 50000000.0, 'atr_pct' => 1.5,
+            'stepSize' => '0.00100000', 'minNotional' => 5.0, 'tickSize' => '0.00010000'],
+        'ETHBTC' => ['case' => 'other_quote', 'base' => 'ETH', 'quote' => 'BTC',
+            'last' => 0.05, 'bid' => 0.049995, 'ask' => 0.050005, 'change_pct' => 1.5,
+            'quote_vol' => 20000.0, 'atr_pct' => 1.4,
+            'stepSize' => '0.00010000', 'minNotional' => 0.0001, 'tickSize' => '0.00000100'],
+    ];
+
     /** @var array symbol => interval => parsed rows [openTime, open, high, low, close, volume, closeTime] */
     private $klines = [];
     /** @var array symbol => ['bid' => float, 'ask' => float, 'last' => float] */
@@ -69,6 +166,8 @@ final class FakeMarketData implements MarketDataInterface
     private $failNext = [];
     /** @var array extra/overridden symbol info rows */
     private $extraInfo = [];
+    /** @var array|null scripted /ticker/24hr rows; null uses the built-in fixture */
+    private $tickers = null;
 
     /**
      * @param array    $klines       symbol => interval => fixture name | absolute path | array of raw or parsed rows
@@ -204,6 +303,134 @@ final class FakeMarketData implements MarketDataInterface
     public function resetCalls(): void
     {
         $this->calls = [];
+    }
+
+
+    /* ------------------------------------------------------- 24h ticker (scanner) */
+
+    /**
+     * Script the rows `ticker24h()` answers with. Pass [] to go back to the built-in fixture.
+     * @param array $rows rows in the Binance::normalizeTicker24h() shape
+     */
+    public function setTicker24h(array $rows): void
+    {
+        $this->tickers = $rows === [] ? null : array_values($rows);
+    }
+
+    /**
+     * `GET /api/v3/ticker/24hr` (weight 80 with no symbol). Declared by MarketDataInterface —
+     * `Scanner` still discovers it with method_exists(), so it stays safe either way.
+     *
+     * @param array $symbols [] for every symbol, else the subset to return
+     * @return array rows ['symbol','last','bid','ask','change_pct','quote_vol','high','low']
+     *               plus the fixture's `atr_pct`
+     */
+    public function ticker24h(array $symbols = []): array
+    {
+        $this->hit('ticker24h');
+        $rows = $this->tickers === null ? self::ticker24hFixture() : $this->tickers;
+        if ($symbols === []) {
+            return $rows;
+        }
+        $want = [];
+        foreach ($symbols as $s) {
+            $want[strtoupper(trim((string) $s))] = true;
+        }
+        $out = [];
+        foreach ($rows as $row) {
+            if (is_array($row) && isset($want[strtoupper((string) ($row['symbol'] ?? ''))])) {
+                $out[] = $row;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * The whole TICKER_CASES table as normalised /ticker/24hr rows, in the scrambled order the
+     * const declares them (so a ranking assertion really tests the sort).
+     *
+     * @param bool $withAtr false strips `atr_pct`, which is how the FIRST pass of
+     *                      Scanner::refresh() sees the rows: every survivor gates `atr_unknown`
+     * @param array $only   optional list of `case` tags to keep ([] keeps everything)
+     */
+    public static function ticker24hFixture(bool $withAtr = true, array $only = []): array
+    {
+        $keep = [];
+        foreach ($only as $tag) {
+            $keep[(string) $tag] = true;
+        }
+        $rows = [];
+        foreach (self::TICKER_CASES as $symbol => $c) {
+            if ($keep !== [] && !isset($keep[(string) $c['case']])) {
+                continue;
+            }
+            $row = [
+                'symbol'     => (string) $symbol,
+                'last'       => (float) $c['last'],
+                'bid'        => (float) $c['bid'],
+                'ask'        => (float) $c['ask'],
+                'change_pct' => (float) $c['change_pct'],
+                'quote_vol'  => (float) $c['quote_vol'],
+                'high'       => (float) $c['last'] * (1.0 + (float) $c['atr_pct'] / 100.0),
+                'low'        => (float) $c['last'] * (1.0 - (float) $c['atr_pct'] / 100.0),
+            ];
+            if ($withAtr) {
+                $row['atr_pct'] = (float) $c['atr_pct'];
+            }
+            $rows[] = $row;
+        }
+        return $rows;
+    }
+
+    /** Parsed symbol info for every TICKER_CASES symbol, ready to pass to Scanner::rank(). */
+    public static function ticker24hInfo(): array
+    {
+        $out = [];
+        foreach (self::TICKER_CASES as $symbol => $c) {
+            $out[(string) $symbol] = self::caseInfoRow($c);
+        }
+        return $out;
+    }
+
+    /** Symbols of the TICKER_CASES rows carrying one `case` tag. */
+    public static function ticker24hCase(string $case): array
+    {
+        $out = [];
+        foreach (self::TICKER_CASES as $symbol => $c) {
+            if ((string) $c['case'] === $case) {
+                $out[] = (string) $symbol;
+            }
+        }
+        return $out;
+    }
+
+    /** One TICKER_CASES entry as a parsed exchangeInfo row (DESIGN.md §6 shape). */
+    private static function caseInfoRow(array $c): array
+    {
+        $step = (string) $c['stepSize'];
+        return [
+            'base'                 => (string) $c['base'],
+            'quote'                => isset($c['quote']) ? (string) $c['quote'] : 'USDT',
+            'status'               => isset($c['status']) ? (string) $c['status'] : 'TRADING',
+            'spotAllowed'          => !array_key_exists('spotAllowed', $c) || (bool) $c['spotAllowed'],
+            'quoteOrderQtyAllowed' => true,
+            'stepSize'             => $step,
+            'minQty'               => $step,
+            'maxQty'               => '9000000.00000000',
+            'marketStepSize'       => '0.00000000',
+            'marketMinQty'         => '0.00000000',
+            'minNotional'          => (float) $c['minNotional'],
+            'applyMinToMarket'     => true,
+            'tickSize'             => (string) $c['tickSize'],
+            'basePrecision'        => 8,
+            'quotePrecision'       => 8,
+            'bidMultiplierUp'      => 0.0,
+            'bidMultiplierDown'    => 0.0,
+            'askMultiplierUp'      => 0.0,
+            'askMultiplierDown'    => 0.0,
+            'avgPriceMins'         => 0,
+            'maxNumOrders'         => 200,
+        ];
     }
 
     /* ------------------------------------------------------------ interface */
@@ -548,6 +775,19 @@ final class FakePaperExchange implements ExchangeInterface
     public function serverTimeMs(): int
     {
         return $this->md->serverTimeMs();
+    }
+
+    /**
+     * `GET /api/v3/ticker/24hr`, forwarded to the scripted market data when it has one.
+     * MarketDataInterface declares it, and the method_exists() guard mirrors how Scanner
+     * probes for it, so an exchange without one simply reports nothing to scan.
+     */
+    public function ticker24h(array $symbols = []): array
+    {
+        if (!method_exists($this->md, 'ticker24h')) {
+            return [];
+        }
+        return $this->md->ticker24h($symbols);
     }
 
     /* ------------------------------------------------------------ account */

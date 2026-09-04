@@ -278,6 +278,169 @@ counting against the daily and weekly loss caps either way, so a bad grid still 
 
 ---
 
+## Portfolio mode: three sleeves at once
+
+Portfolio mode (`portfolio_enabled`, off by default) runs the three methods **at the same time**,
+each with its own slice of capital and its own symbols, so the dashboard can show which one is
+actually working. With it off, nothing changes: the bot runs the single engine selected above,
+exactly as it does today.
+
+A **sleeve** is one method with a budget and an exclusive symbol set. The sleeve key *is* the engine
+name, so there is one sleeve per method: `signal`, `grid`, `pmm`.
+
+**The budget is an accounting boundary, not an exchange one.** Binance holds a single balance; the
+bot enforces the split itself. That is the honest framing to keep in mind: nothing on the exchange
+stops one method from spending another's money, only this code does. It works because two sleeves
+**never share a symbol** - the settings validator rejects an overlap outright, naming both sleeves,
+because otherwise one sleeve would sell inventory the other bought. A base balance on a symbol no
+sleeve owns is reported separately as *unattributed* and is excluded from every sleeve's numbers
+(it still counts in total equity for the global kill switch).
+
+The global survival layer is unchanged and still governs everything: the equity floor and the
+drawdown kill switch use **total** equity, halt every sleeve, and cancel every sleeve's resting
+orders before liquidating anything.
+
+| key | default | notes |
+|---|---|---|
+| `portfolio_enabled` | `false` | off = the single-engine behaviour described above, unchanged |
+| `sleeves` | signal / grid / pmm | per sleeve: `enabled`, `budget_usdt`, `symbols` |
+| `sleeve_reserve_pct` | `5` | percent of total quote held back, never allocated |
+| `sleeve_max_drawdown_pct` | `25` | a sleeve below `budget x (1 - this)` stops opening new exposure |
+| `scanner_enabled` | `true` | |
+| `scanner_refresh_min` | `60` | how often the 24 h ticker is refreshed (weight 80 per refresh) |
+| `scanner_min_quote_vol` | `5000000` | 24 h quote volume floor in USDT - the liquidity filter |
+| `scanner_max_spread_pct` | `0.06` | |
+| `scanner_min_atr_pct` | `0.5` | ATR14 on 15m, percent of price |
+| `scanner_max_atr_pct` | `4.0` | above this is untradeable noise, not opportunity |
+| `scanner_top_n` | `10` | how many rows the scanner card shows |
+| `scanner_exclude` | stablecoin pairs | `USDCUSDT`, `FDUSDUSDT`, `TUSDUSDT`, `BUSDUSDT`, `EURUSDT` |
+
+**What the validator enforces on save** (all of it inline against the offending sleeve): a symbol
+belongs to at most one sleeve; every symbol is upper-case and ends with `quote_asset`; `grid` and
+`pmm` take exactly one symbol each (their engines are single-symbol); the enabled budgets together
+fit inside `total quote x (1 - sleeve_reserve_pct/100)`; and each budget is at least **20x** the
+required size of its symbols - about 118 USDT for a 130 USDT coin with a 5 USDT minimum notional.
+Those last two are what make portfolio mode a **funded-account feature**: three sleeves cannot be
+funded out of 10 USDT, and the validator will say so rather than let you pretend otherwise.
+
+**Per sleeve, per tick:** the sleeves run in a rotating order (persisted in `sleeve_cursor`) so a
+long tick never starves the same sleeve twice; each engine is restricted to its own symbols and to
+its own `available` budget = `max(0, budget + realised - inventory_cost - reserved)`; sells are
+never budget-blocked, because reducing inventory returns capital to the sleeve. A sleeve whose
+equity falls to `budget x (1 - sleeve_max_drawdown_pct/100)` pauses itself - it stops opening new
+exposure while the other sleeves keep trading, which is what makes the comparison safe. You can also
+pause and resume one sleeve by hand from the portfolio card.
+
+### Reading the comparison card
+
+The **Portfolio** card on the dashboard is one row per sleeve. Left to right:
+
+| column | what it means | how to read it |
+|---|---|---|
+| Sleeve | `signal` / `grid` / `pmm` | the sleeve key *is* the method |
+| Symbols | the symbols this sleeve owns | exclusive: no symbol appears twice down the column |
+| Budget | `budget_usdt` from Settings | an accounting figure, not a balance on Binance |
+| Equity | `budget + realised + unrealised` | the sleeve's own mark-to-market |
+| Realised | closed PnL: `positions.pnl_usdt` + `cycles.pnl_usdt` for this engine and mode | the only number that is actually money |
+| Unrealised | `inventory_value - inventory_cost` | at the bid, so it is what you would get if you sold now |
+| PnL % | `(equity - budget) / budget` | the row colour follows its sign |
+| Trades / cycles | signal entries / engine round trips | your sample size - see below |
+| Win rate | wins over closed round trips | meaningless under a few hundred trades |
+| Fees | commission paid by this sleeve | compare it with `Realised`: for `pmm` it usually exceeds it |
+| Used % | `1 - available/budget` | how much of the sleeve's slice is committed |
+| Status | running / paused / drawdown-paused / blocked | `blocked` names the reason (halted, live-blocked, ...) |
+
+Above the table is a row of per-sleeve controls: **Pause** / **Resume** for each sleeve, plus a
+**Re-anchor** button on the grid sleeve. That last one matters in portfolio mode, because the engine
+card that normally carries "Re-anchor grid" is hidden there - without it a grid sleeve that hit its
+range exit could never be resumed from the panel. Below the table the card totals budget, sleeve
+equity, realised and unrealised across the sleeves, and reports the **reserve**, the sleeve drawdown
+threshold and any **unattributed base** - base on a symbol no sleeve owns, which is excluded from
+every sleeve's numbers and still counts in total equity for the global kill switch.
+
+Below the table, the **"best method so far"** line names the leader by *realised* PnL together with
+its sample size, and repeats the caveat in plain words: a handful of trades proves nothing. Treat
+anything under a few hundred closed round trips per sleeve as noise, not as evidence of an edge.
+Unrealised PnL is deliberately **not** used to pick the leader - an open grid ladder can carry a
+large paper gain that a range exit erases.
+
+The three overlaid sparklines under the card are `sleeve_equity`, sampled once per sleeve per tick.
+Read the *shape*, not the endpoint: a sleeve that grinds upward and a sleeve that spikes and gives
+it back can finish the week at the same number.
+
+**The honest caveat about the numbers you will see.** The shipped defaults budget **1000 USDT per
+sleeve** because that is roughly the smallest amount at which three sleeves can each place orders
+that clear Binance's 5 USDT minimum notional with enough room for the dust rule. Results measured at
+that size **do not transfer down**. On a 10 USDT account:
+
+* a 5 USDT minimum notional is half the account, so position sizing, the `0.65 x quoteFree` clamp
+  and the dust rule dominate every decision - the strategy barely gets a vote;
+* the grid cannot hold a ladder at all: `grid_levels x grid_order_usdt` alone exceeds the balance;
+* fixed per-trade costs (0.1 % a side, plus a full step of dust on every buy) are a far larger
+  share of a small ticket, so the same win rate produces a worse expectancy;
+* the validator will refuse the configuration outright rather than let you run a comparison whose
+  result cannot mean anything (each budget must cover about 20 minimum-size orders).
+
+So: portfolio mode is a **funded-account feature**, and a sleeve comparison run at 1000 USDT per
+sleeve tells you nothing about how the same method behaves on 10 USDT. Compare like with like, or
+do not compare at all.
+
+### Moving a symbol between sleeves
+
+Both the **Assign to...** button on the scanner card and the **Settings -> Portfolio** form refuse
+to move a symbol into a sleeve while that symbol still carries inventory booked to a *different*
+engine - open FIFO lots, or resting orders. This is not fussiness: FIFO consumption is scoped to the
+selling engine, so if the `pmm` sleeve were handed a symbol whose lots belong to `grid`, a pmm sale
+would match no lot at all. It would write **no** `cycles` row - the proceeds would simply leave the
+books - while the grid lot's `remaining` never decreased, and the sleeve's unrealised would fall
+permanently until the drawdown pause parked it. Flatten the symbol under the engine that bought it
+first, then move it. Removing a symbol, editing a budget or disabling a sleeve is never blocked.
+
+### The volatility scanner
+
+The scanner ranks USDT pairs by *tradeable* volatility so the sleeves can be pointed at coins that
+actually move. It costs **weight 80** per refresh, so it runs at most every `scanner_refresh_min`
+minutes (hourly by default), never per tick, and never when a tick is already past half its time
+budget.
+
+It keeps spot pairs that end in `quote_asset`, drops the `scanner_exclude` list, leveraged tokens
+(`...UP`, `...DOWN`, `...BULL`, `...BEAR`) and anything not `TRADING`, then scores what is left:
+
+```
+score = atr_pct x liquidity_factor x spread_factor
+```
+
+so volatility alone can never win - an illiquid or wide-spread coin is pushed toward zero, and a
+coin outside the ATR band (too quiet, or untradeable noise) scores zero with the reason recorded.
+A row that fails a gate is **kept and explained** in the `gates` column, not dropped, so the panel
+can tell you why a coin you expected is not eligible.
+
+**Volatility is not one thing: it helps the grid and hurts the market maker.** The same ATR that
+makes a coin a good grid candidate makes it a bad one to quote both sides of:
+
+* **grid** earns from *oscillation*. Higher ATR inside a range means rungs are crossed more often,
+  so more round trips clear the 0.2 % cost. Its enemy is not volatility but **trend** - price
+  walking out of the range, which the range exit bounds.
+* **pmm** earns the *spread* and is short volatility by construction. A fast move fills whichever
+  side of the quote is on the wrong side of it and leaves the maker holding inventory that has
+  already moved against them - the classic adverse-selection loss. At VIP0 fees (0.1 % maker, the
+  same as taker) a 0.01-0.05 % spread does not begin to pay for that, which is why `pmm` is
+  expected to lose money here and is demo-only by default.
+* **signal** wants ATR in a *band*: too quiet and the mean-reversion edge is smaller than the fees,
+  too wild and the stop is hit by noise. That is exactly what `atr_min_pct` / `atr_max_pct` gate.
+
+So do not read the scanner's ranking as one league table. The top of it is where you point the grid
+sleeve; for `pmm` the interesting column is the *spread*, and a top-ranked ATR row is a reason to be
+careful, not a reason to quote it.
+
+**The scanner never reassigns a sleeve's symbols on its own.** It ranks and explains; you apply a
+suggestion with the per-row **Assign to...** button. That assignment is refused - with the reason -
+when another sleeve already owns the symbol, and when the target sleeve still holds inventory
+(open lots, an open position or a resting order), because a silent symbol change under a live grid
+would strand that inventory.
+
+---
+
 ## Recommended rollout
 
 0. **Pick the engine first.** The steps below describe the signal engine. `grid` and `pmm` are
@@ -453,11 +616,19 @@ always sell it by hand on Binance; the next reconciliation will notice.
   used request weight, last error), the open position with its live stop/target/trailing state, an
   equity sparkline, the watchlist table (filters, required size, ATR, spread, last score and gates),
   closed positions, a histogram of why no trade was taken in the last 24 hours, and the log tail. When an engine is active the dashboard also shows an **Engine** card (engine, symbol, anchor, distance to each range edge, live order count, inventory and unrealised at bid), an **Open orders** table with a per-order Cancel and **Cancel all orders**, a **Cycles** table with its KPIs, and the **Re-anchor grid** and **Flatten inventory** actions.
+* **Portfolio mode** adds two more cards: a **Portfolio** card (one row per sleeve - symbols,
+  budget, equity, realised and unrealised PnL, trades/cycles, win rate, fees, used %, status -
+  coloured by PnL sign, with the "best method so far" line and its sample-size caveat, three
+  overlaid equity sparklines and a Pause/Resume button per sleeve) and a **Scanner** card (rank,
+  price, 24 h change, ATR %, spread, 24 h quote volume, step value, required size, score, the gates
+  that rejected a row, and an **Assign to...** control per row).
 * **Actions**: Start, Pause, Reset halt, Panic sell (sells at market and disables trading; needs a
   confirmation tick box), Run tick now, Reset paper account, Logout.
 * **Settings**: every parameter with validation (the take-profit must be at least three times the
   round-trip fee, the stop between 0.2 % and 5 %, symbols must end with the quote asset, ...), the
-  cron command, the cron key, and "Test API connection".
+  cron command, the cron key, and "Test API connection". The **Portfolio** section holds
+  `portfolio_enabled`, the per-sleeve enabled / budget / symbols fields and the scanner thresholds;
+  a sleeve that fails validation is flagged inline, next to the sleeve at fault.
 * The dashboard refreshes itself every 20 seconds through `index.php?api=status`.
 
 Sessions expire after 30 minutes of inactivity; five wrong passwords lock the IP for 15 minutes.
@@ -567,6 +738,30 @@ and re-anchor), `engine-pmm` (both quotes around mid, refresh, inventory skew), 
 cap take the ladder off the book) and `engine-demo-only` (the demo-only rule, proved over a real
 ladder and a real lot, across the tick and every panel action).
 
+Portfolio mode adds `sleeve-alloc` (budget arithmetic: available shrinks with inventory cost and
+resting buys and never goes negative, a sell restores it), `sleeve-exclusive` (overlapping symbols
+are a validation error, a sleeve holding inventory refuses a reassignment, `ownerOf` resolves),
+`sleeve-budget-cap` (an engine cannot place an order above `available`, the signal entry size is
+clamped to it, sells are never blocked), `sleeve-drawdown` (a sleeve past its drawdown stops while
+the others keep trading, and the global kill switch still halts everything), `portfolio-tick`
+(three sleeves in one tick each trade only their own symbols, the rotating cursor advances, and the
+time budget skips the rest and records it), `scanner-rank` (deterministic ranking on a fixture,
+stablecoins and leveraged tokens excluded, gates recorded instead of dropped, the ATR band rejected
+at both ends) and `portfolio-off` (with `portfolio_enabled = false` the two runs produce
+byte-identical tables and no sleeve or scanner code runs at all).
+
+Three further groups prove the isolation rules the whole design rests on, over real portfolio ticks
+rather than on the validator: `sleeve-no-cross-trade` gives the grid sleeve real inventory in one
+symbol, drives the pmm sleeve all the way through a live sale of its own inventory out of the same
+wallet, and asserts that the pmm sleeve places no order on the grid's symbol, books no lot or cycle
+there, and leaves the grid's lot with every unit it started with - including the direct check that
+FIFO consumption scoped to the wrong engine takes nothing at all. `portfolio-isolation` proves that
+flattening one sleeve's symbol leaves the other sleeve's resting orders live, and that a sleeve
+which aborts the tick still hands the rotating cursor on so the sleeves behind it run next tick.
+`portfolio-range-exit` proves a grid range exit in portfolio mode pauses that grid alone
+(`grid_paused_reason`) and never writes the global `paused_until` / `pause_reason` the other
+sleeves read - while single-engine mode still writes both, unchanged.
+
 ---
 
 ## Files and data
@@ -576,6 +771,7 @@ trader/
   index.php      panel        cron.php   tick        config.php  configuration helpers
   lib/           the code     assets/    css + js    tests/      offline tests
   docs/DESIGN.md the design contract every file follows;  docs/DESIGN-ENGINES.md the same for grid + pmm
+  docs/DESIGN-PORTFOLIO.md  the contract for portfolio mode (sleeves) and the volatility scanner
   data/          runtime (auto-created): config.json (secrets, 0600), trader.sqlite (positions,
                  orders, trades, signals, equity, logs - 30 days retention), bot.log (rotates at
                  2 MB), tick.lock

@@ -21,6 +21,18 @@ interface MarketDataInterface
     /** @return int time offset in ms (server - local) */
     public function syncTime(): int;
     public function serverTimeMs(): int;
+    /**
+     * 24 h rolling window statistics, normalised by Binance::normalizeTicker24h():
+     * ['symbol','last','bid','ask','change_pct','quote_vol','high','low'].
+     *
+     * WEIGHT: 1 symbol = 2, 2..20 = 2, 21..100 = 40, more than 100 OR NONE = 80.
+     * Never call this on a per-tick path; the hourly Scanner::refresh(), guarded by
+     * Scanner::due(), is the only caller that passes an empty list.
+     *
+     * @param array $symbols concrete symbols, or [] for every symbol on the exchange
+     * @return array list of normalised rows
+     */
+    public function ticker24h(array $symbols = []): array;
 }
 
 /**
@@ -89,6 +101,12 @@ final class BinanceMarketData implements MarketDataInterface
     public function serverTimeMs(): int
     {
         return $this->api->serverTimeMs();
+    }
+
+    /** @see MarketDataInterface::ticker24h() - weight 80 with no symbol list. */
+    public function ticker24h(array $symbols = []): array
+    {
+        return $this->api->ticker24h($symbols);
     }
 }
 
@@ -164,6 +182,12 @@ final class LiveExchange implements ExchangeInterface
     public function serverTimeMs(): int
     {
         return $this->api->serverTimeMs();
+    }
+
+    /** @see MarketDataInterface::ticker24h() - weight 80 with no symbol list. */
+    public function ticker24h(array $symbols = []): array
+    {
+        return $this->api->ticker24h($symbols);
     }
 
     // ---- account / orders
@@ -423,6 +447,15 @@ final class PaperExchange implements ExchangeInterface
     public function serverTimeMs(): int
     {
         return $this->md->serverTimeMs();
+    }
+
+    /**
+     * @see MarketDataInterface::ticker24h() - delegated, never simulated: the 24 h window is
+     * market data, not account state, so paper mode reports the real market.
+     */
+    public function ticker24h(array $symbols = []): array
+    {
+        return $this->md->ticker24h($symbols);
     }
 
     // ---- account / orders

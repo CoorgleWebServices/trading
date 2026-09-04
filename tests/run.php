@@ -49,7 +49,7 @@ register_shutdown_function(static function () use ($tmpRoot): void {
 
 /* ------------------------------------------------------------ lib loading */
 
-$libs = ['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'EngineOrders', 'EngineGrid', 'EnginePmm', 'Bot', 'Panel'];
+$libs = ['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'Sleeve', 'Scanner', 'EngineOrders', 'EngineGrid', 'EnginePmm', 'Bot', 'Panel'];
 $missing = [];
 foreach ($libs as $lib) {
     $file = $PROJECT . '/lib/' . $lib . '.php';
@@ -265,6 +265,7 @@ if (interface_exists('ExchangeInterface', false)) {
         public function symbolInfo(array $symbols): array { return $this->inner->symbolInfo($symbols); }
         public function syncTime(): int { return $this->inner->syncTime(); }
         public function serverTimeMs(): int { return $this->inner->serverTimeMs(); }
+        public function ticker24h(array $symbols = []): array { return $this->inner->ticker24h($symbols); }
 
         public function marketBuy(string $symbol, float $quoteUsdt, array $info, string $clientId): array
         {
@@ -291,6 +292,54 @@ if (interface_exists('ExchangeInterface', false)) {
             }
             return $this->inner->getOrder($symbol, $clientId);
         }
+    }
+}
+
+/**
+ * Exchange decorator whose bookTicker() throws for ONE symbol, the way a 5xx from
+ * /api/v3/ticker/bookTicker reaches the bot. Everything else is forwarded, including the
+ * engine order surface, so a portfolio tick runs normally around the sleeve that fails.
+ */
+if (interface_exists('ExchangeInterface', false)) {
+    final class BookFailExchange implements ExchangeInterface
+    {
+        /** @var ExchangeInterface */
+        private $inner;
+        /** @var string */
+        private $symbol;
+        /** @var int bookTicker() calls that threw */
+        public $failures = 0;
+
+        public function __construct(ExchangeInterface $inner, string $symbol)
+        {
+            $this->inner  = $inner;
+            $this->symbol = strtoupper($symbol);
+        }
+
+        public function bookTicker(string $symbol): array
+        {
+            if (strtoupper($symbol) === $this->symbol) {
+                $this->failures++;
+                throw new BinanceException('Internal error; unable to process your request. (simulated)', -1000, 500);
+            }
+            return $this->inner->bookTicker($symbol);
+        }
+
+        public function mode(): string { return $this->inner->mode(); }
+        public function account(): array { return $this->inner->account(); }
+        public function klines(string $symbol, string $interval, int $limit): array { return $this->inner->klines($symbol, $interval, $limit); }
+        public function prices(array $symbols): array { return $this->inner->prices($symbols); }
+        public function symbolInfo(array $symbols): array { return $this->inner->symbolInfo($symbols); }
+        public function syncTime(): int { return $this->inner->syncTime(); }
+        public function serverTimeMs(): int { return $this->inner->serverTimeMs(); }
+        public function ticker24h(array $symbols = []): array { return $this->inner->ticker24h($symbols); }
+        public function marketBuy(string $symbol, float $quoteUsdt, array $info, string $clientId): array { return $this->inner->marketBuy($symbol, $quoteUsdt, $info, $clientId); }
+        public function marketSell(string $symbol, string $qtyStr, array $info, string $clientId): array { return $this->inner->marketSell($symbol, $qtyStr, $info, $clientId); }
+        public function getOrder(string $symbol, string $clientId): ?array { return $this->inner->getOrder($symbol, $clientId); }
+        public function limitOrder(string $symbol, string $side, string $qtyStr, string $priceStr, array $info, string $clientId, bool $postOnly): array { return $this->inner->limitOrder($symbol, $side, $qtyStr, $priceStr, $info, $clientId, $postOnly); }
+        public function cancelOrder(string $symbol, string $clientId): array { return $this->inner->cancelOrder($symbol, $clientId); }
+        public function cancelAllOrders(string $symbol): array { return $this->inner->cancelAllOrders($symbol); }
+        public function openOrders(string $symbol): array { return $this->inner->openOrders($symbol); }
     }
 }
 
@@ -2285,6 +2334,1013 @@ T::group('panel-engine', ['Panel', 'Db', 'Util'], static function (): void {
     T::strContains((string) $s3['text']['eng_state'], 'BLOCKED', 'the engine state says BLOCKED');
     $s4 = Panel::status(engineCfg(['mode' => 'live', 'allow_live_engines' => true]), $db);
     T::ok(empty($s4['show']['engine_live_blocked']), 'allow_live_engines clears the block flag');
+});
+
+/* ============================================================ portfolio (DESIGN-PORTFOLIO.md §8) */
+
+/**
+ * Three sleeves, one per method, on three DISTINCT symbols - the shape §1 calls the only safe
+ * one, because two sleeves sharing a symbol would have one sell what the other bought.
+ */
+function pfSleeves(array $over = []): array
+{
+    return array_merge([
+        'signal' => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['SOLUSDT']],
+        'grid'   => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['DOGEUSDT']],
+        'pmm'    => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['XRPUSDT']],
+    ], $over);
+}
+
+/**
+ * The keys DESIGN-PORTFOLIO.md §2 ADDS, and nothing else. Layered on top of an existing config
+ * this is exactly what an upgrade writes into config.json, which is what `portfolio-off` needs
+ * to prove is inert while `portfolio_enabled` is false.
+ */
+function pfBlock(array $over = []): array
+{
+    return array_merge([
+        'portfolio_enabled'       => false,
+        'sleeves'                 => pfSleeves(),
+        'sleeve_reserve_pct'      => 5.0,
+        'sleeve_max_drawdown_pct' => 25.0,
+        'scanner_enabled'         => true,
+        'scanner_refresh_min'     => 60,
+        'scanner_min_quote_vol'   => 5000000.0,
+        'scanner_max_spread_pct'  => 0.06,
+        'scanner_min_atr_pct'     => 0.5,
+        'scanner_max_atr_pct'     => 4.0,
+        'scanner_top_n'           => 10,
+        'scanner_exclude'         => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT'],
+    ], $over);
+}
+
+/**
+ * Portfolio config (DESIGN-PORTFOLIO.md §2). The account-wide survival caps are deliberately
+ * wide open so the only thing that can stop a sleeve in these groups is the sleeve rule under
+ * test; `equity_floor_usdt` is raised back in the kill-switch case. The scanner is off here:
+ * it costs weight 80 and has its own group.
+ */
+function pfCfg(array $over = []): array
+{
+    return cfg(array_merge(pfBlock(['portfolio_enabled' => true, 'scanner_enabled' => false]), [
+        'enabled'                 => true,
+        'mode'                    => 'paper',
+        'symbols'                 => ['SOLUSDT'],
+        // the sleeves carry the engine; the single-engine keys stay out of the way
+        'engine'                  => 'signal',
+        'engine_symbol'           => '',
+        'allow_live_engines'      => false,
+        'post_only'               => true,
+        'engine_max_orders'       => 12,
+        'grid_levels'             => 3,
+        'grid_spacing_pct'        => 0.60,
+        'grid_order_usdt'         => 6.5,
+        'grid_range_up_pct'       => 4.0,
+        'grid_range_down_pct'     => 6.0,
+        'grid_exit_liquidates'    => false,
+        'pmm_spread_pct'          => 0.25,
+        'pmm_order_usdt'          => 6.5,
+        'pmm_refresh_sec'         => 864000,   // never age a quote out inside one test
+        'pmm_target_base_pct'     => 50,
+        'pmm_max_base_pct'        => 80,
+        'paper_start_usdt'        => 200.0,
+        'adaptive'                => false,
+        'max_trades_per_day'      => 50,
+        'max_orders_per_hour'     => 500,
+        'daily_loss_cap_pct'      => 50.0,
+        'weekly_loss_cap_pct'     => 90.0,
+        'equity_floor_usdt'       => 1.0,
+        'hwm_drawdown_pct'        => 90.0,
+    ], $over));
+}
+
+/** Book for the three sleeve symbols; only SOLUSDT has candles (only the signal sleeve reads any). */
+function pfMd(): FakeMarketData
+{
+    $md = new FakeMarketData([
+        'SOLUSDT' => ['15m' => 'klines_15m_oversold', '1h' => 'klines_1h_uptrend'],
+    ]);
+    $md->setPrice('SOLUSDT', 129.75, 129.80);
+    $md->setPrice('DOGEUSDT', 0.19990, 0.20010);
+    $md->setPrice('XRPUSDT', 1.99900, 2.00100);
+    return $md;
+}
+
+/** Distinct symbols an engine touched in `engine_orders`. */
+function pfEngineSymbols(Db $db, string $engine): array
+{
+    $st = $db->pdo()->prepare('SELECT DISTINCT symbol FROM engine_orders WHERE engine = ? ORDER BY symbol');
+    $st->execute([$engine]);
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $s) {
+        $out[] = (string) $s;
+    }
+    return $out;
+}
+
+/** Distinct values of one column of one table, sorted (used to prove a sleeve stayed in its lane). */
+function pfDistinct(Db $db, string $table, string $column): array
+{
+    $st = $db->pdo()->query('SELECT DISTINCT ' . $column . ' FROM ' . $table . ' ORDER BY ' . $column);
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $v) {
+        $out[] = (string) $v;
+    }
+    return $out;
+}
+
+T::group('sleeve-alloc', ['Sleeve', 'Db', 'Util'], static function (): void {
+    $db  = freshDb('sleeve-alloc');
+    $cfg = pfCfg(['sleeves' => [
+        'signal' => ['enabled' => true,  'budget_usdt' => 100.0, 'symbols' => ['SOLUSDT', 'ETHUSDT']],
+        'grid'   => ['enabled' => true,  'budget_usdt' => 50.0,  'symbols' => ['DOGEUSDT']],
+        'pmm'    => ['enabled' => false, 'budget_usdt' => 10.0,  'symbols' => ['XRPUSDT']],
+    ]]);
+    $prices = ['SOLUSDT' => 130.0, 'ETHUSDT' => 3000.0, 'DOGEUSDT' => 0.21, 'XRPUSDT' => 2.0];
+    // BNB belongs to no sleeve: it is UNATTRIBUTED and must never show up in a sleeve's numbers
+    $wallet = static function (float $doge = 0.0, float $sol = 0.0, float $xrp = 0.0): array {
+        return [
+            'USDT' => ['free' => 100.0, 'locked' => 0.0],
+            'BNB'  => ['free' => 2.0,   'locked' => 0.0],
+            'DOGE' => ['free' => $doge, 'locked' => 0.0],
+            'SOL'  => ['free' => $sol,  'locked' => 0.0],
+            'XRP'  => ['free' => $xrp,  'locked' => 0.0],
+        ];
+    };
+
+    // ---- an untouched sleeve has its whole budget available
+    $s = Sleeve::state($cfg, $db, 'grid', $wallet(), $prices);
+    T::eq('grid', (string) $s['engine'], 'state reports the engine');
+    T::ok((bool) $s['enabled'], 'the grid sleeve is enabled');
+    T::eq(['DOGEUSDT'], $s['symbols'], 'the sleeve carries its own symbols');
+    T::near(50.0, (float) $s['budget'], 1e-9, 'budget');
+    T::near(0.0, (float) $s['inventory_cost'], 1e-9, 'nothing held yet');
+    T::near(0.0, (float) $s['reserved'], 1e-9, 'nothing reserved yet');
+    T::near(50.0, (float) $s['available'], 1e-9, 'an untouched sleeve may commit its whole budget');
+    T::near(50.0, (float) $s['equity'], 1e-9, 'equity = budget with no PnL');
+    T::near(0.0, (float) $s['used_pct'], 1e-9, 'used 0 %');
+    T::ok(!isset($s['inventory_qty']['BNBUSDT']), 'an unowned base is not in the sleeve inventory');
+
+    // ---- inventory: an open lot is cost, the base balance is value
+    $db->insertLot(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'DOGEUSDT', 'qty' => 100.0,
+        'remaining' => 100.0, 'price' => 0.20, 'fee_usdt' => 0.02, 'level' => 1,
+        'client_id' => 'lot-1', 'created_at' => Util::nowIso(time() - 600)]);
+    $s = Sleeve::state($cfg, $db, 'grid', $wallet(100.0), $prices);
+    T::near(100.0, (float) $s['inventory_qty']['DOGEUSDT'], 1e-9, 'the owned base is attributed to the sleeve');
+    T::near(21.0, (float) $s['inventory_value'], 1e-9, 'inventory valued at the price map');
+    T::near(20.0, (float) $s['inventory_cost'], 1e-9, 'inventory cost is the open lots at their cost basis');
+    T::near(1.0, (float) $s['unrealised'], 1e-9, 'unrealised = value - cost');
+    T::near(30.0, (float) $s['available'], 1e-9, 'available shrinks by the inventory cost');
+    T::near(51.0, (float) $s['equity'], 1e-9, 'equity = budget + realised + unrealised');
+
+    // ---- a resting BUY reserves the quote it committed
+    $db->insertEngineOrder(['client_id' => 'buy-1', 'order_id' => '1', 'mode' => 'paper', 'engine' => 'grid',
+        'symbol' => 'DOGEUSDT', 'side' => 'BUY', 'status' => 'NEW', 'price' => 0.19880, 'qty' => 50.0,
+        'quote' => 10.0, 'filled_qty' => 0.0, 'filled_quote' => 0.0, 'fee_usdt' => 0.0,
+        'level' => 2, 'purpose' => 'grid_buy', 'created_at' => Util::nowIso(time() - 300)]);
+    $s = Sleeve::state($cfg, $db, 'grid', $wallet(100.0), $prices);
+    T::near(10.0, (float) $s['reserved'], 1e-9, 'a resting BUY reserves its quote');
+    T::near(20.0, (float) $s['available'], 1e-9, 'available shrinks by inventory cost AND reserved quote');
+    T::near(60.0, (float) $s['used_pct'], 1e-9, 'used % = (cost + reserved) / budget');
+
+    // only the part still resting is reserved: what already filled has become inventory
+    $db->updateEngineOrder('buy-1', ['status' => 'PARTIALLY_FILLED', 'filled_qty' => 20.0, 'filled_quote' => 4.0]);
+    $s = Sleeve::state($cfg, $db, 'grid', $wallet(100.0), $prices);
+    T::near(6.0, (float) $s['reserved'], 1e-9, 'a partially filled BUY only reserves what is still resting');
+    T::near(24.0, (float) $s['available'], 1e-9, 'the filled part is not charged twice');
+
+    // ---- realised PnL from a closed round trip feeds both equity and availability
+    $db->insertCycle(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'DOGEUSDT', 'level' => 1,
+        'qty' => 50.0, 'buy_price' => 0.20, 'sell_price' => 0.2506, 'gross_usdt' => 12.53,
+        'fee_usdt' => 0.02, 'pnl_usdt' => 2.5, 'opened_at' => Util::todayUtc() . 'T00:00:01Z',
+        'closed_at' => Util::todayUtc() . 'T00:00:02Z']);
+    $s = Sleeve::state($cfg, $db, 'grid', $wallet(100.0), $prices);
+    T::eq(1, (int) $s['cycles'], 'the cycle is attributed by engine');
+    T::near(2.5, (float) $s['realised'], 1e-9, 'realised = cycles pnl');
+    T::near(2.5, (float) $s['pnl_today'], 1e-9, 'a cycle closed today counts in pnl_today');
+    T::near(53.5, (float) $s['equity'], 1e-9, 'equity = budget + realised + unrealised');
+    T::near(26.5, (float) $s['available'], 1e-9, 'realised profit is available to trade again');
+    T::eq(1, (int) $s['wins'], 'a profitable cycle is a win');
+    T::near(100.0, (float) $s['win_rate'], 1e-9, 'win rate');
+
+    // ---- a SELL restores availability: the lot is consumed and the base leaves the wallet
+    $db->consumeLots('DOGEUSDT', 100.0, 'paper', 'grid');
+    $db->insertCycle(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'DOGEUSDT', 'level' => 1,
+        'qty' => 100.0, 'buy_price' => 0.20, 'sell_price' => 0.215, 'gross_usdt' => 21.5,
+        'fee_usdt' => 0.02, 'pnl_usdt' => 1.5, 'opened_at' => Util::todayUtc() . 'T00:00:01Z',
+        'closed_at' => Util::todayUtc() . 'T00:00:03Z']);
+    $after = Sleeve::state($cfg, $db, 'grid', $wallet(0.0), $prices);
+    T::near(0.0, (float) $after['inventory_cost'], 1e-9, 'the consumed lot is no longer inventory');
+    T::near(0.0, (float) $after['inventory_value'], 1e-9, 'the sold base left the wallet');
+    T::near(4.0, (float) $after['realised'], 1e-9, 'both cycles are realised');
+    T::near(48.0, (float) $after['available'], 1e-9, 'selling gives the capital back to the sleeve');
+    T::ok((float) $after['available'] > (float) $s['available'], 'a sell strictly increases available');
+    T::near(54.0, (float) $after['equity'], 1e-9, 'equity after the round trips');
+
+    // ---- available is clamped at zero, never negative
+    $db->insertLot(['mode' => 'paper', 'engine' => 'pmm', 'symbol' => 'XRPUSDT', 'qty' => 25.0,
+        'remaining' => 25.0, 'price' => 2.0, 'fee_usdt' => 0.0, 'level' => null,
+        'client_id' => 'lot-x', 'created_at' => Util::nowIso(time() - 60)]);
+    $halved = array_merge($prices, ['XRPUSDT' => 1.0]);   // the pair halved under the sleeve
+    $p = Sleeve::state($cfg, $db, 'pmm', $wallet(0.0, 0.0, 25.0), $halved);
+    T::ok(!(bool) $p['enabled'], 'a disabled sleeve still reports its state');
+    T::near(50.0, (float) $p['inventory_cost'], 1e-9, 'the pmm lot is 50 USDT of cost against a 10 USDT budget');
+    T::near(25.0, (float) $p['inventory_value'], 1e-9, 'and 25 USDT of value after the pair halved');
+    T::near(0.0, (float) $p['available'], 1e-9, 'available is clamped at zero, never negative');
+    T::near(500.0, (float) $p['used_pct'], 1e-9, 'used % may exceed 100 when a sleeve is over its budget');
+    T::near(-15.0, (float) $p['equity'], 1e-9, 'equity may still be negative: it is budget + realised + unrealised');
+
+    // ---- the signal sleeve: closed positions are realised, an open one is inventory cost
+    closedPosition($db, 1.0, ['symbol' => 'SOLUSDT', 'closed_at' => Util::todayUtc() . 'T00:00:01Z']);
+    closedPosition($db, -0.4, ['symbol' => 'ETHUSDT', 'closed_at' => Util::todayUtc() . 'T00:00:02Z']);
+    $db->insertPosition([
+        'mode' => 'paper', 'symbol' => 'SOLUSDT', 'status' => 'OPEN', 'qty' => 0.05, 'dust_qty' => 0.0,
+        'entry_price' => 130.0, 'entry_eff' => 130.0, 'entry_quote' => 6.5, 'entry_fee_usdt' => 0.0065,
+        'stop_price' => 129.09, 'take_profit_price' => 131.3, 'trail_high' => 130.0, 'trailing_armed' => 0,
+        'score' => 80, 'entry_reason' => 'test', 'opened_at' => Util::nowIso(time() - 120),
+    ]);
+    $db->insertTrade(['position_id' => null, 'mode' => 'paper', 'symbol' => 'SOLUSDT', 'side' => 'BUY',
+        'order_id' => '1', 'client_id' => 'b-1', 'qty' => 0.05, 'price' => 130.0, 'quote' => 6.5,
+        'fee_usdt' => 0.0065, 'fee_asset' => 'SOL', 'raw' => '{}', 'created_at' => Util::nowIso(time() - 120)]);
+    $sig = Sleeve::state($cfg, $db, 'signal', $wallet(0.0, 0.05), $prices);
+    T::eq(2, (int) $sig['trades'], 'both closed positions are attributed by symbol');
+    T::near(0.6, (float) $sig['realised'], 1e-9, 'realised = sum of the closed positions');
+    T::eq(1, (int) $sig['wins'], 'one win');
+    T::eq(1, (int) $sig['losses'], 'one loss');
+    T::near(50.0, (float) $sig['win_rate'], 1e-9, 'win rate 50 %');
+    T::near(6.5, (float) $sig['inventory_cost'], 1e-9, 'an OPEN position is inventory cost at its entry quote');
+    T::near(6.5, (float) $sig['inventory_value'], 1e-9, 'the position base is valued from the price map');
+    T::near(0.0, (float) $sig['unrealised'], 1e-9, 'flat position, no unrealised');
+    T::near(0.0065, (float) $sig['fees'], 1e-9, 'fees come from the sleeve symbols trades');
+    T::near(94.1, (float) $sig['available'], 1e-9, 'available = budget + realised - cost - reserved');
+    T::near(100.6, (float) $sig['equity'], 1e-9, 'equity = budget + realised + unrealised');
+    T::near(0.6, (float) $sig['pnl_today'], 1e-9, 'both positions closed today');
+    T::ok(!isset($sig['inventory_qty']['DOGEUSDT']), 'the signal sleeve never sees the grid sleeve inventory');
+    T::ok(!isset($sig['inventory_qty']['BNBUSDT']), 'unattributed BNB is excluded from the signal sleeve');
+
+    // the identities the panel prints must hold for every sleeve
+    foreach (['signal', 'grid', 'pmm'] as $eng) {
+        $st = Sleeve::state($cfg, $db, $eng, $wallet(0.0, 0.05, 25.0), $prices);
+        T::near((float) $st['budget'] + (float) $st['realised'] + (float) $st['unrealised'],
+            (float) $st['equity'], 1e-9, $eng . ': equity = budget + realised + unrealised');
+        T::near(max(0.0, (float) $st['budget'] + (float) $st['realised'] - (float) $st['inventory_cost'] - (float) $st['reserved']),
+            (float) $st['available'], 1e-9, $eng . ': available = max(0, budget + realised - cost - reserved)');
+        T::ok((float) $st['available'] >= 0.0, $eng . ': available is never negative');
+    }
+});
+
+T::group('sleeve-exclusive', ['Sleeve', 'Risk', 'Db', 'Util'], static function (): void {
+    $db  = freshDb('sleeve-exclusive');
+    $cfg = pfCfg();
+
+    // ---- ownerOf resolves by symbol, and only by symbol
+    T::eq('signal', Sleeve::ownerOf($cfg, 'SOLUSDT'), 'ownerOf finds the signal sleeve');
+    T::eq('grid', Sleeve::ownerOf($cfg, 'DOGEUSDT'), 'ownerOf finds the grid sleeve');
+    T::eq('pmm', Sleeve::ownerOf($cfg, 'XRPUSDT'), 'ownerOf finds the pmm sleeve');
+    T::eq('signal', Sleeve::ownerOf($cfg, 'solusdt'), 'ownerOf is case-insensitive');
+    T::eq(null, Sleeve::ownerOf($cfg, 'BNBUSDT'), 'a symbol no sleeve owns is unattributed');
+    T::eq(null, Sleeve::ownerOf($cfg, ''), 'the empty symbol owns nothing');
+    T::ok(Sleeve::owns($cfg, 'grid', 'DOGEUSDT'), 'owns() agrees with ownerOf');
+    T::ok(!Sleeve::owns($cfg, 'signal', 'DOGEUSDT'), 'a sleeve does not own another sleeve symbol');
+
+    // a DISABLED sleeve still owns its symbols: its inventory must not silently change hands
+    $off = pfCfg(['sleeves' => pfSleeves(['pmm' => ['enabled' => false, 'budget_usdt' => 1000.0, 'symbols' => ['XRPUSDT']]])]);
+    T::eq('pmm', Sleeve::ownerOf($off, 'XRPUSDT'), 'a disabled sleeve still owns its symbols');
+    T::eq(['SOLUSDT', 'DOGEUSDT'], Sleeve::allSymbols($off, true), 'allSymbols(enabledOnly) skips the disabled sleeve');
+    T::eq(['SOLUSDT', 'DOGEUSDT', 'XRPUSDT'], Sleeve::allSymbols($off, false), 'allSymbols() covers every sleeve');
+
+    // ---- overlap is a validation ERROR naming the symbol and BOTH sleeves
+    $overlap = pfSleeves(['grid' => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['SOLUSDT']]]);
+    $res = Risk::validateConfig(['sleeves' => $overlap], $cfg);
+    $errors = isset($res[1]) && is_array($res[1]) ? $res[1] : [];
+    $joined = implode(' | ', $errors);
+    T::ok($errors !== [], 'overlapping sleeve symbols are rejected');
+    T::strContains($joined, 'SOLUSDT', 'the error names the shared symbol');
+    T::strContains($joined, 'signal sleeve', 'the error names the first sleeve');
+    T::strContains($joined, 'grid sleeve', 'the error names the second sleeve');
+    T::strContains($joined, 'may belong to only one sleeve', 'the error explains the rule');
+    $kept = isset($res[0]['sleeves']['grid']['symbols']) ? $res[0]['sleeves']['grid']['symbols'] : [];
+    T::eq(['DOGEUSDT'], $kept, 'a rejected sleeve map is not applied: the current one is kept');
+
+    // a legal reassignment IS applied
+    $moved = pfSleeves(['grid' => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['ADAUSDT']]]);
+    $ok = Risk::validateConfig(['sleeves' => $moved], $cfg);
+    T::eq(['ADAUSDT'], $ok[0]['sleeves']['grid']['symbols'], 'a non-overlapping reassignment is applied');
+    T::eq('grid', Sleeve::ownerOf($ok[0], 'ADAUSDT'), 'ownerOf follows the new configuration');
+    T::eq(null, Sleeve::ownerOf($ok[0], 'DOGEUSDT'), 'the old symbol is owned by nobody afterwards');
+
+    // grid and pmm are single-symbol engines
+    $two = Risk::validateConfig(['sleeves' => pfSleeves([
+        'grid' => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['DOGEUSDT', 'ADAUSDT']],
+    ])], $cfg);
+    T::strContains(implode(' | ', $two[1]), 'sleeve grid trades exactly one symbol', 'grid takes exactly one symbol');
+
+    // symbols must be upper-case and end with the quote asset
+    $bad = Risk::validateConfig(['sleeves' => pfSleeves([
+        'signal' => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['solusdt', 'SOLBTC']],
+    ])], $cfg);
+    T::strContains(implode(' | ', $bad[1]), 'must be uppercase and end with USDT', 'a non-quote symbol is rejected');
+
+    // ---- a sleeve holding inventory must refuse a reassignment: this is the state the panel
+    //      action reads (open lots, open/stuck positions, resting orders on the sleeve symbols)
+    $held = static function (array $c, string $engine) use ($db): array {
+        $out = [];
+        foreach (Sleeve::symbols($c, $engine) as $sym) {
+            foreach ($db->openLots($sym, 'paper') as $lot) {
+                $out[] = $sym . ':lot';
+            }
+            foreach ($db->openEngineOrders($sym, 'paper') as $o) {
+                $out[] = $sym . ':order';
+            }
+            if (countRows($db, "SELECT COUNT(*) FROM positions WHERE symbol = ? AND status IN ('OPEN','STUCK') AND mode = 'paper'", [$sym]) > 0) {
+                $out[] = $sym . ':position';
+            }
+        }
+        return $out;
+    };
+    T::eq([], $held($cfg, 'grid'), 'an empty sleeve holds nothing, so a reassignment is allowed');
+    $db->insertLot(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'DOGEUSDT', 'qty' => 100.0,
+        'remaining' => 100.0, 'price' => 0.20, 'fee_usdt' => 0.02, 'level' => 1,
+        'client_id' => 'lot-1', 'created_at' => Util::nowIso(time() - 600)]);
+    T::eq(['DOGEUSDT:lot'], $held($cfg, 'grid'), 'a sleeve holding an open lot reports it, so the reassignment is refused');
+    $s = Sleeve::state($cfg, $db, 'grid', ['DOGE' => ['free' => 100.0, 'locked' => 0.0]], ['DOGEUSDT' => 0.2]);
+    T::near(20.0, (float) $s['inventory_cost'], 1e-9, 'the inventory a reassignment would strand is real, priced cost');
+    $db->consumeLots('DOGEUSDT', 100.0, 'paper', 'grid');
+    T::eq([], $held($cfg, 'grid'), 'once the inventory is gone the sleeve may be reassigned again');
+});
+
+T::group('sleeve-budget-cap', ['Bot', 'Sleeve', 'Risk', 'Db', 'FakePaperExchange', 'FakeMarketData'], static function (): void {
+    $info = FakeMarketData::infoRow('SOLUSDT');
+
+    // ---- the signal engine's entry size is clamped to what the sleeve may still commit
+    $required = Risk::requiredSize($info, 130.0, 0.1);
+    T::ok($required > 5.0 && $required < 6.5, 'SOLUSDT requires between 5 and 6.5 USDT', (string) $required);
+    T::near(0.0, Risk::entrySize(pfCfg(), $info, 130.0, 5.0, 0.1), 1e-12, 'a 5 USDT budget cannot fund an entry');
+    T::near(6.5, Risk::entrySize(pfCfg(), $info, 130.0, 200.0, 0.1), 1e-12, 'a full budget funds the configured size');
+
+    // a signal sleeve whose available budget is under the required size never enters
+    $db  = freshDb('sleeve-cap-signal');
+    $md  = pfMd();
+    $ex  = new FakePaperExchange($md, 0.1, 200.0);
+    $cfg = pfCfg(['sleeves' => [
+        'signal' => ['enabled' => true, 'budget_usdt' => 6.0, 'symbols' => ['SOLUSDT']],
+    ]]);
+    $t0 = FakeMarketData::SERVER_TIME_MS;
+    $r  = (new Bot($cfg, $db, $ex, $t0))->tick();
+    T::eq('ok', $r['status'], 'capped signal sleeve tick ok', $r['summary']);
+    T::eq(null, $db->openPosition(), 'a sleeve that cannot fund the required size does not enter');
+    T::eq(0, $ex->marketBuyCalls, 'and it never sends a market buy');
+    $sig = $db->latestSignals();
+    T::ok(isset($sig['SOLUSDT']), 'the symbol was still evaluated');
+    if (isset($sig['SOLUSDT'])) {
+        T::contains($sig['SOLUSDT']['reasons_list'], 'size_unaffordable', 'the sleeve budget shows up as size_unaffordable');
+    }
+    T::near(200.0, $ex->free('USDT'), 1e-9, 'the wallet is untouched: the cap, not the wallet, blocked it');
+
+    // the same wallet with a real budget does enter, so the block above was the sleeve budget
+    $db2 = freshDb('sleeve-cap-signal-ok');
+    $ex2 = new FakePaperExchange(pfMd(), 0.1, 200.0);
+    $r2  = (new Bot(pfCfg(['sleeves' => [
+        'signal' => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['SOLUSDT']],
+    ]]), $db2, $ex2, $t0))->tick();
+    T::eq('ok', $r2['status'], 'funded signal sleeve tick ok', $r2['summary']);
+    T::ok($db2->openPosition() !== null, 'the same wallet enters once the sleeve budget allows it');
+
+    // ---- an engine cannot place an order that exceeds its sleeve's available budget
+    $db3 = freshDb('sleeve-cap-grid');
+    $md3 = pfMd();
+    $ex3 = new FakePaperExchange($md3, 0.1, 200.0);
+    $cfg3 = pfCfg(['sleeves' => [
+        'grid' => ['enabled' => true, 'budget_usdt' => 3.0, 'symbols' => ['DOGEUSDT']],
+    ]]);
+    $r3 = (new Bot($cfg3, $db3, $ex3, $t0))->tick();
+    T::eq('ok', $r3['status'], 'capped grid sleeve tick ok', $r3['summary']);
+    T::eq(0, countRows($db3, 'SELECT COUNT(*) FROM engine_orders'), 'a 3 USDT sleeve cannot fund a 6.5 USDT rung');
+    T::eq(0, $ex3->limitCalls, 'nothing was sent to the exchange at all');
+    T::strContains($r3['summary'], 'quote free short', 'the tick says why the rung was skipped');
+
+    $db4 = freshDb('sleeve-cap-grid-ok');
+    $ex4 = new FakePaperExchange(pfMd(), 0.1, 200.0);
+    $r4  = (new Bot(pfCfg(['sleeves' => [
+        'grid' => ['enabled' => true, 'budget_usdt' => 1000.0, 'symbols' => ['DOGEUSDT']],
+    ]]), $db4, $ex4, $t0))->tick();
+    T::eq('ok', $r4['status'], 'funded grid sleeve tick ok', $r4['summary']);
+    T::eq(1, countRows($db4, "SELECT COUNT(*) FROM engine_orders WHERE side = 'BUY'"), 'the same rung is placed once the budget allows it');
+
+    // ---- sells are NEVER budget-blocked: reducing inventory returns capital to the sleeve
+    $db5 = freshDb('sleeve-cap-sell');
+    $md5 = pfMd();
+    $md5->setPrice('DOGEUSDT', 0.19000, 0.19010);   // the lot is now above the book, so its sell can rest
+    $ex5 = new FakePaperExchange($md5, 0.1, 200.0);
+    $ex5->setBalance('DOGE', 32.0);
+    $db5->insertLot(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'DOGEUSDT', 'qty' => 32.0,
+        'remaining' => 32.0, 'price' => 0.19880, 'fee_usdt' => 0.006, 'level' => 1,
+        'client_id' => 'lot-1', 'created_at' => Util::nowIso(time() - 600)]);
+    $cfg5 = pfCfg(['sleeves' => [
+        'grid' => ['enabled' => true, 'budget_usdt' => 0.0, 'symbols' => ['DOGEUSDT']],
+    ]]);
+    $st = Sleeve::state($cfg5, $db5, 'grid', ['DOGE' => ['free' => 32.0, 'locked' => 0.0]], ['DOGEUSDT' => 0.19]);
+    T::near(0.0, (float) $st['available'], 1e-12, 'the sleeve has nothing left to commit');
+    $r5 = (new Bot($cfg5, $db5, $ex5, $t0))->tick();
+    T::eq('ok', $r5['status'], 'exhausted grid sleeve tick ok', $r5['summary']);
+    T::eq(0, countRows($db5, "SELECT COUNT(*) FROM engine_orders WHERE side = 'BUY'"), 'an exhausted sleeve buys nothing');
+    T::eq(1, countRows($db5, "SELECT COUNT(*) FROM engine_orders WHERE side = 'SELL'"), 'but its inventory is still offered for sale');
+    T::eq(1, $ex5->openOrderCount('DOGEUSDT'), 'the sell rests on the exchange');
+
+    // ---- EngineOrders::place() itself consults the budget (DESIGN-PORTFOLIO.md §3), so a
+    //      mis-sized engine can never spend another sleeve's capital
+    $db6  = freshDb('sleeve-cap-place');
+    $md6  = engineMd(FakeMarketData::SERVER_TIME_MS);
+    $ex6  = new FakePaperExchange($md6, 0.1, 200.0);
+    $info6 = FakeMarketData::infoRow('SOLUSDT');
+    $o6   = new EngineOrders(engineCfg(), $db6, $ex6, $info6, $t0);
+    T::eq(null, $o6->availableQuote(), 'single-engine mode leaves place() uncapped');
+    $o6->setAvailableQuote(4.0);
+    T::near(4.0, (float) $o6->availableQuote(), 1e-12, 'the sleeve cap is remembered');
+    T::eq(null, $o6->place('BUY', 129.22, 6.5, 'grid_buy', 1), 'a 6.5 USDT buy is refused by a 4 USDT budget');
+    T::eq(0, countRows($db6, 'SELECT COUNT(*) FROM engine_orders'), 'and nothing is written to the order book');
+    T::eq(0, $ex6->limitCalls, 'and nothing is sent to the exchange');
+    $o6->setAvailableQuote(50.0);
+    T::ok($o6->place('BUY', 129.22, 6.5, 'grid_buy', 1) !== null, 'the same buy is placed once the budget allows it');
+});
+
+T::group('sleeve-drawdown', ['Bot', 'Sleeve', 'Risk', 'Db', 'FakePaperExchange', 'FakeMarketData'], static function (): void {
+    $db = freshDb('sleeve-drawdown');
+    $md = pfMd();
+    $ex = new FakePaperExchange($md, 0.1, 200.0);
+    $t0 = FakeMarketData::SERVER_TIME_MS;
+
+    // the grid sleeve has lost 30 % of a 100 USDT budget; the loss is old enough that the
+    // account-wide daily and weekly caps cannot be what stops it
+    $old = Util::nowIso(time() - 30 * 86400);
+    $db->insertCycle(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'DOGEUSDT', 'level' => 1,
+        'qty' => 100.0, 'buy_price' => 0.25, 'sell_price' => 0.15, 'gross_usdt' => 15.0,
+        'fee_usdt' => 0.04, 'pnl_usdt' => -30.0, 'opened_at' => $old, 'closed_at' => $old]);
+
+    $cfg = pfCfg(['sleeves' => pfSleeves([
+        'grid' => ['enabled' => true, 'budget_usdt' => 100.0, 'symbols' => ['DOGEUSDT']],
+    ])]);
+    $state = Sleeve::state($cfg, $db, 'grid', [], ['DOGEUSDT' => 0.2]);
+    T::near(70.0, (float) $state['equity'], 1e-9, 'the grid sleeve is at 70 of its 100 USDT budget');
+    T::ok((float) $state['equity'] <= 100.0 * (1.0 - Risk::sleeveMaxDrawdownPct($cfg) / 100.0),
+        'that is at or past the 25 % sleeve drawdown limit');
+
+    $r = (new Bot($cfg, $db, $ex, $t0))->tick();
+    T::eq('ok', $r['status'], 'drawdown tick ok', $r['summary']);
+    T::ok((string) $db->getState('sleeve_paused_grid', '') !== '', 'the drawn-down sleeve is recorded as paused');
+    T::strContains($r['summary'], 'sleeve grid drawdown-paused', 'the tick says which sleeve paused');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'grid'"), 'the paused sleeve opens no new exposure');
+
+    // the other sleeves are untouched by one sleeve's drawdown
+    T::ok($db->openPosition() !== null, 'the signal sleeve keeps trading');
+    $pos = $db->openPosition();
+    if ($pos !== null) {
+        T::eq('SOLUSDT', (string) $pos['symbol'], 'and it traded its own symbol');
+    }
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'pmm'"), 'the pmm sleeve keeps quoting');
+    T::eq('', (string) $db->getState('sleeve_paused_pmm', ''), 'the healthy sleeve is not paused');
+    T::eq('0', (string) $db->getState('halted', '0'), 'one sleeve drawing down does not halt the account');
+
+    // the pause lifts by itself once the sleeve recovers
+    $db->insertCycle(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'DOGEUSDT', 'level' => 1,
+        'qty' => 100.0, 'buy_price' => 0.15, 'sell_price' => 0.25, 'gross_usdt' => 25.0,
+        'fee_usdt' => 0.04, 'pnl_usdt' => 25.0, 'opened_at' => $old, 'closed_at' => $old]);
+    $r = (new Bot($cfg, $db, $ex, $t0 + 60000))->tick();
+    T::eq('ok', $r['status'], 'recovery tick ok', $r['summary']);
+    T::eq('', (string) $db->getState('sleeve_paused_grid', ''), 'the pause lifts when the sleeve recovers');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'grid'"), 'and the sleeve trades again');
+
+    // ---- the GLOBAL kill switch still halts everything, cancelling every sleeve order first
+    $live = countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE status IN ('NEW','PARTIALLY_FILLED','SENDING','UNKNOWN')");
+    T::ok($live >= 2, 'both engine sleeves have resting orders before the kill switch', (string) $live);
+    $kill = pfCfg(['sleeves' => pfSleeves(['grid' => ['enabled' => true, 'budget_usdt' => 100.0, 'symbols' => ['DOGEUSDT']]]),
+        'equity_floor_usdt' => 100000.0]);
+    $r = (new Bot($kill, $db, $ex, $t0 + 120000))->tick();
+    T::eq('halted', $r['status'], 'the equity floor halts the whole portfolio', $r['summary']);
+    T::eq('1', (string) $db->getState('halted', '0'), 'halted flag set');
+    T::eq('equity_floor', (string) $db->getState('halt_reason', ''), 'halt reason');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE status IN ('NEW','PARTIALLY_FILLED','SENDING','UNKNOWN')"),
+        'every sleeve order was cancelled by the kill switch');
+    T::eq(0, $ex->openOrderCount(), 'nothing is left resting on the exchange');
+    T::eq(null, $db->openPosition(), 'the open position was closed by the kill switch');
+    T::strContains((string) $db->getState('no_trade_reason', ''), 'halted:', 'the tick records the halt');
+});
+
+T::group('portfolio-tick', ['Bot', 'Sleeve', 'FakePaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    $db  = freshDb('portfolio-tick');
+    $md  = pfMd();
+    $ex  = new FakePaperExchange($md, 0.1, 200.0);
+    $cfg = pfCfg();
+    $t0  = FakeMarketData::SERVER_TIME_MS;
+
+    T::eq('0', (string) $db->getState('sleeve_cursor', '0'), 'the rotating cursor starts at 0');
+
+    $r = (new Bot($cfg, $db, $ex, $t0))->tick();
+    T::eq('ok', $r['status'], 'portfolio tick1 ok', $r['summary']);
+    T::strContains((string) $db->getState('no_trade_reason', ''), 'portfolio:', 'the tick reports itself as a portfolio tick');
+
+    // ---- every sleeve ran, and each one stayed on its own symbol
+    T::strContains((string) $db->getState('no_trade_reason', ''), 'signal=', 'the signal sleeve ran');
+    T::strContains((string) $db->getState('no_trade_reason', ''), 'grid=', 'the grid sleeve ran');
+    T::strContains((string) $db->getState('no_trade_reason', ''), 'pmm=', 'the pmm sleeve ran');
+
+    T::eq(['SOLUSDT'], pfDistinct($db, 'positions', 'symbol'), 'the signal sleeve only ever traded SOLUSDT');
+    T::eq(['SOLUSDT'], pfDistinct($db, 'orders', 'symbol'), 'and only sent market orders for SOLUSDT');
+    T::eq(['DOGEUSDT'], pfEngineSymbols($db, 'grid'), 'the grid sleeve only ever touched DOGEUSDT');
+    T::eq(['XRPUSDT'], pfEngineSymbols($db, 'pmm'), 'the pmm sleeve only ever touched XRPUSDT');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE symbol = 'SOLUSDT'"),
+        'no engine ever quoted the signal sleeve symbol');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM positions WHERE symbol IN ('DOGEUSDT','XRPUSDT')"),
+        'the signal engine never opened a position on an engine sleeve symbol');
+    T::eq(['SOLUSDT'], pfDistinct($db, 'signals', 'symbol'), 'only the signal sleeve symbol was evaluated');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'grid'"), 'one grid rung');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'pmm'"), 'one pmm quote');
+    $pos = $db->openPosition();
+    T::ok($pos !== null && (string) $pos['symbol'] === 'SOLUSDT', 'the signal sleeve entered its own symbol');
+
+    // every sleeve wrote its own equity sample
+    T::eq(3, countRows($db, 'SELECT COUNT(*) FROM sleeve_equity'), 'one sleeve_equity sample per sleeve');
+    foreach (['signal', 'grid', 'pmm'] as $eng) {
+        $rows = $db->sleeveEquitySeries($eng, 10, 'paper');
+        T::eq(1, count($rows), $eng . ': one equity sample');
+        if ($rows !== []) {
+            T::near(1000.0, (float) $rows[0]['budget'], 1e-9, $eng . ': the sample carries the budget');
+        }
+    }
+
+    // ---- the cursor advances so no sleeve is starved by a long tick
+    T::eq('1', (string) $db->getState('sleeve_cursor', ''), 'the cursor advanced after a full pass');
+    $r = (new Bot($cfg, $db, $ex, $t0 + 60000))->tick();
+    T::eq('ok', $r['status'], 'portfolio tick2 ok', $r['summary']);
+    T::eq('2', (string) $db->getState('sleeve_cursor', ''), 'the cursor keeps rotating');
+    T::eq(['DOGEUSDT'], pfEngineSymbols($db, 'grid'), 'tick2: the grid sleeve is still only on DOGEUSDT');
+    T::eq(['XRPUSDT'], pfEngineSymbols($db, 'pmm'), 'tick2: the pmm sleeve is still only on XRPUSDT');
+    T::eq(6, countRows($db, 'SELECT COUNT(*) FROM sleeve_equity'), 'tick2 sampled every sleeve again');
+
+    // ---- the time budget stops the loop early and records exactly which sleeves were skipped
+    $db2 = freshDb('portfolio-budget');
+    $ex2 = new FakePaperExchange(pfMd(), 0.1, 200.0);
+    $r2  = (new Bot(pfCfg(['tick_time_budget_ms' => 1]), $db2, $ex2, $t0))->tick();
+    T::eq('ok', $r2['status'], 'time-budget tick ok', $r2['summary']);
+    $reason = (string) $db2->getState('no_trade_reason', '');
+    T::strContains($reason, 'skipped:', 'the tick records that it stopped early');
+    T::strContains($reason, 'grid', 'the skipped grid sleeve is named');
+    T::strContains($reason, 'pmm', 'the skipped pmm sleeve is named');
+    T::strContains($reason, '(time_budget)', 'and the reason is the time budget');
+    T::strContains($r2['summary'], 'time budget', 'the summary says the budget was exceeded');
+    T::strContains($reason, 'signal=', 'the first sleeve still ran: a slow tick never starves everything');
+    T::eq(0, countRows($db2, 'SELECT COUNT(*) FROM engine_orders'), 'the skipped sleeves placed nothing');
+    T::eq(1, countRows($db2, 'SELECT COUNT(*) FROM sleeve_equity'), 'only the sleeve that ran sampled its equity');
+    T::eq('1', (string) $db2->getState('sleeve_cursor', ''), 'the next tick starts at the first sleeve this one skipped');
+    T::ok($db2->openPosition() !== null, 'the sleeve that did run traded normally');
+});
+
+/**
+ * The exclusivity rule of DESIGN-PORTFOLIO.md §1, driven through REAL portfolio ticks rather
+ * than asserted on the validator: sleeve A (grid) is given actual inventory in symbol X
+ * (DOGEUSDT), sleeve B (pmm) is configured for symbol Y (XRPUSDT), and B is pushed all the way
+ * through a live sale of its own inventory while A's is sitting in the same wallet.
+ *
+ * A sleeve budget is an accounting boundary, not an exchange one: Binance shows both sleeves
+ * one balance, so nothing but this code stops B from selling A's base. The assertions below are
+ * what "must never" means in practice - B places no order on X, books no lot or cycle on X, and
+ * A's lot comes out of B's whole sell path with its `remaining` untouched.
+ */
+T::group('sleeve-no-cross-trade', ['Bot', 'Sleeve', 'Risk', 'FakePaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    $db  = freshDb('sleeve-no-cross');
+    $md  = pfMd();
+    $ex  = new FakePaperExchange($md, 0.1, 200.0);
+    // the pmm sleeve is deliberately made willing to SELL: with the inventory target under the
+    // level its own fills reach, its ask is sized up rather than skewed away. That is the whole
+    // point - a sleeve that never sells could not cross into another sleeve's inventory anyway.
+    $cfg = pfCfg(['pmm_target_base_pct' => 2, 'pmm_max_base_pct' => 98]);
+    $t0  = FakeMarketData::SERVER_TIME_MS;
+
+    T::eq('grid', (string) Sleeve::ownerOf($cfg, 'DOGEUSDT'), 'sleeve A (grid) owns symbol X = DOGEUSDT');
+    T::eq('pmm', (string) Sleeve::ownerOf($cfg, 'XRPUSDT'), 'sleeve B (pmm) owns symbol Y = XRPUSDT');
+
+    // tick 0: both sleeves post their first quote. 1: DOGE drops through the grid's first rung,
+    // so sleeve A ends up holding real base. 2: XRP drops through the pmm bid, so sleeve B holds
+    // its own. 4: XRP rallies through the pmm ask, so sleeve B actually SELLS while A's DOGE is
+    // sitting in the very same wallet.
+    $dogeQty = 0.0;
+    for ($i = 0; $i < 7; $i++) {
+        if ($i === 1) {
+            $md->setPrice('DOGEUSDT', 0.19860, 0.19870);
+        }
+        if ($i === 2) {
+            $md->setPrice('XRPUSDT', 1.99400, 1.99450);
+        }
+        if ($i === 4) {
+            $md->setPrice('XRPUSDT', 2.05000, 2.05100);
+        }
+        $r = (new Bot($cfg, $db, $ex, $t0 + $i * 60000))->tick();
+        T::eq('ok', $r['status'], 'cross-trade tick ' . $i . ' ok', $r['summary']);
+        if ($i === 1) {
+            $lots = $db->openLots('DOGEUSDT', 'paper');
+            $dogeQty = $lots === [] ? 0.0 : (float) $lots[0]['remaining'];
+        }
+    }
+
+    // ---- the premise: A really does hold X, and B really did sell Y
+    T::ok($dogeQty > 0.0, 'sleeve A holds real inventory in X after its rung filled');
+    $aLots = $db->openLots('DOGEUSDT', 'paper');
+    T::eq(1, count($aLots), 'X carries exactly one open lot');
+    T::eq('grid', $aLots === [] ? '' : (string) $aLots[0]['engine'], "and it is booked to sleeve A's engine");
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'pmm' AND side = 'SELL' AND status = 'FILLED'"),
+        'sleeve B really did fill a sell of its own inventory');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM cycles WHERE engine = 'pmm' AND symbol = 'XRPUSDT'"),
+        "and booked the round trip against its own symbol");
+
+    // ---- B never touched X
+    T::eq(['XRPUSDT'], pfEngineSymbols($db, 'pmm'), 'sleeve B only ever placed orders on its own symbol Y');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE symbol = 'DOGEUSDT' AND engine <> 'grid'"),
+        'no order on X was ever placed by any engine but A');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM lots WHERE symbol = 'DOGEUSDT' AND engine <> 'grid'"),
+        'no lot on X was ever booked to any engine but A');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM cycles WHERE symbol = 'DOGEUSDT'"),
+        "nothing ever sold A's inventory: X has no realised cycle at all");
+    T::eq(['SOLUSDT'], pfDistinct($db, 'positions', 'symbol'), 'the signal sleeve stayed on its own symbol too');
+
+    // ---- A's inventory came through B's whole sell path untouched
+    $after = $db->openLots('DOGEUSDT', 'paper');
+    T::near($dogeQty, $after === [] ? 0.0 : (float) $after[0]['remaining'], 1e-12,
+        "A's lot still has every unit it started with after B sold");
+    T::near($dogeQty, (float) $ex->free('DOGE') + (float) $ex->locked('DOGE'), 1e-9,
+        'and the wallet still holds exactly that base, free plus locked');
+
+    // ---- the mechanism, asserted directly: FIFO consumption is engine-scoped, so even a sell
+    //      booked under B can never reach A's lot (this is why the panel refuses to hand a
+    //      symbol carrying foreign inventory to another sleeve rather than letting it through)
+    T::eq([], $db->openLots('DOGEUSDT', 'paper', 'pmm'), "B's FIFO view of X is empty");
+    T::eq([], $db->consumeLots('DOGEUSDT', $dogeQty, 'paper', 'pmm'), "and consuming X as B takes nothing");
+    $stillThere = $db->openLots('DOGEUSDT', 'paper');
+    T::near($dogeQty, $stillThere === [] ? 0.0 : (float) $stillThere[0]['remaining'], 1e-12,
+        "the attempt left A's lot exactly as it was");
+
+    // ---- attribution: the shared wallet is split by symbol ownership, never by balance
+    $acct   = $ex->account();
+    $prices = ['DOGEUSDT' => 0.1986, 'XRPUSDT' => 2.05, 'SOLUSDT' => 129.75];
+    $bState = Sleeve::state($cfg, $db, 'pmm', $acct, $prices);
+    $aState = Sleeve::state($cfg, $db, 'grid', $acct, $prices);
+    T::ok(!isset($bState['inventory_qty']['DOGEUSDT']), "B's inventory never includes X");
+    T::near($dogeQty, (float) ($aState['inventory_qty']['DOGEUSDT'] ?? 0.0), 1e-9, "A's inventory is all of X");
+
+    // ---- and the config can never be edited into the overlap in the first place
+    $bad = $cfg['sleeves'];
+    $bad['pmm']['symbols'] = ['DOGEUSDT'];
+    $v = Risk::validateConfig(['sleeves' => $bad], $cfg);
+    $errs = isset($v[1]) && is_array($v[1]) ? $v[1] : [];
+    T::ok($errs !== [], 'pointing B at X is a validation error, not a silent overlap');
+});
+
+/**
+ * Two isolation rules that only show up once a sleeve goes wrong (DESIGN-PORTFOLIO.md §6.3-6.4):
+ * a per-symbol flatten must not disarm the other sleeves, and a sleeve that ABORTS the tick must
+ * still hand the rotating cursor on, or it would own the first slot for ever and the sleeves
+ * behind it would never sync their ladders again.
+ */
+T::group('portfolio-isolation', ['Bot', 'Sleeve', 'FakePaperExchange', 'FakeMarketData', 'BookFailExchange', 'Db'], static function (): void {
+    $db  = freshDb('portfolio-isolation');
+    $md  = pfMd();
+    $ex  = new FakePaperExchange($md, 0.1, 200.0);
+    $cfg = pfCfg();
+    $t0  = FakeMarketData::SERVER_TIME_MS;
+
+    for ($i = 0; $i < 3; $i++) {
+        if ($i === 1) {
+            $md->setPrice('DOGEUSDT', 0.19860, 0.19870);
+        }
+        (new Bot($cfg, $db, $ex, $t0 + $i * 60000))->tick();
+    }
+    $gridLive = countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'grid' AND status = 'NEW'");
+    $pmmLive  = countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'pmm' AND status = 'NEW'");
+    T::ok($gridLive > 0, 'the grid sleeve has resting orders before the flatten');
+    T::ok($pmmLive > 0, 'and so does the pmm sleeve');
+
+    // ---- flatten ONE sleeve's symbol: the other sleeve's book must survive it
+    $bot  = new Bot($cfg, $db, $ex, $t0 + 3 * 60000);
+    $flat = $bot->flattenInventory('XRPUSDT');
+    T::eq('XRPUSDT', (string) $flat['symbol'], 'the flatten went to the symbol it was given, not the grid sleeve default');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'pmm' AND status = 'NEW'"),
+        "flattening one sleeve's symbol clears that sleeve's book");
+    T::eq($gridLive, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'grid' AND status = 'NEW'"),
+        "and leaves every resting order of the other sleeve live");
+    T::ok(count($db->openLots('DOGEUSDT', 'paper')) > 0, "the other sleeve's inventory is untouched as well");
+
+    // ---- a sleeve that aborts the tick still passes the cursor on
+    $db2 = freshDb('portfolio-abort');
+    $md2 = pfMd();
+    $ex2 = new FakePaperExchange($md2, 0.1, 200.0);
+    (new Bot($cfg, $db2, $ex2, $t0))->tick();
+    T::ok($db2->openPosition() !== null, 'the signal sleeve holds a position to manage');
+    T::eq('1', (string) $db2->getState('sleeve_cursor', ''), 'the cursor is on the signal sleeve for the next tick');
+    $db2->setState('sleeve_cursor', '0');
+
+    // step 5 reads the book for the open position with an ESSENTIAL step: a BinanceException
+    // there aborts the whole tick from inside the first sleeve
+    $fail = new BookFailExchange($ex2, 'SOLUSDT');
+    $r    = (new Bot($cfg, $db2, $fail, $t0 + 60000))->tick();
+    T::eq('error', $r['status'], 'the essential book call aborts the tick', $r['summary']);
+    T::ok($fail->failures > 0, 'and it really was the book call that threw');
+    T::eq('1', (string) $db2->getState('sleeve_cursor', ''), 'the cursor still advanced past the sleeve that aborted');
+
+    // the next tick therefore starts at the sleeve behind it, and that sleeve trades
+    $r2 = (new Bot($cfg, $db2, $ex2, $t0 + 120000))->tick();
+    T::eq('ok', $r2['status'], 'the next tick runs normally', $r2['summary']);
+    T::strContains((string) $db2->getState('no_trade_reason', ''), 'grid=', 'the sleeve behind the aborting one ran');
+    T::ok(countRows($db2, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'grid'") > 0,
+        'and it got its ladder onto the book: an aborting sleeve cannot starve the others');
+});
+
+/**
+ * A grid range exit in PORTFOLIO mode is sleeve-local (DESIGN-PORTFOLIO.md §6.4): it must pause
+ * that grid alone, through `grid_paused_reason`, and must NOT write the global `paused_until` /
+ * `pause_reason` keys `Risk::entryBlockReason()` reads for every engine - which in single-engine
+ * mode it does, and still must.
+ */
+T::group('portfolio-range-exit', ['Bot', 'EngineGrid', 'Risk', 'FakePaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    $db  = freshDb('portfolio-range-exit');
+    $md  = pfMd();
+    $ex  = new FakePaperExchange($md, 0.1, 200.0);
+    $cfg = pfCfg();
+    $t0  = FakeMarketData::SERVER_TIME_MS;
+
+    (new Bot($cfg, $db, $ex, $t0))->tick();
+    T::near(0.2, (float) $db->getState('grid_anchor', '0'), 1e-9, 'the grid sleeve anchored at the mid');
+    T::eq('', (string) $db->getState('grid_paused_reason', ''), 'and starts unpaused');
+
+    // mid above anchor x (1 + grid_range_up_pct/100) = 0.208
+    $md->setPrice('DOGEUSDT', 0.21000, 0.21010);
+    $r = (new Bot($cfg, $db, $ex, $t0 + 60000))->tick();
+    T::eq('ok', $r['status'], 'the range-exit tick still completes', $r['summary']);
+
+    T::eq('grid_range_exit', (string) $db->getState('grid_paused_reason', ''), 'the grid sleeve records its own pause');
+    T::eq('', (string) $db->getState('paused_until', ''), 'and never writes the GLOBAL pause in portfolio mode');
+    T::eq('', (string) $db->getState('pause_reason', ''), 'nor the global pause reason');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'grid' AND status = 'NEW'"),
+        'the range exit took the grid ladder off the book');
+    T::ok(countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE engine = 'pmm' AND status = 'NEW'") > 0,
+        "the pmm sleeve's quote is still live: one sleeve's range exit is not the account's");
+    T::eq('', (string) Risk::entryBlockReason($cfg, $db, 150.0, 200.0, 'signal'),
+        'and the signal sleeve is not blocked by it either');
+
+    // the single-engine path is unchanged: there the range exit IS the account-wide pause
+    $db2 = freshDb('single-range-exit');
+    $md2 = new FakeMarketData([]);
+    $md2->setPrice('DOGEUSDT', 0.19990, 0.20010);
+    $ex2  = new FakePaperExchange($md2, 0.1, 200.0);
+    $cfg2 = pfCfg(['portfolio_enabled' => false, 'engine' => 'grid', 'engine_symbol' => 'DOGEUSDT', 'symbols' => ['DOGEUSDT']]);
+    (new Bot($cfg2, $db2, $ex2, $t0))->tick();
+    $md2->setPrice('DOGEUSDT', 0.21000, 0.21010);
+    (new Bot($cfg2, $db2, $ex2, $t0 + 60000))->tick();
+    T::eq('grid_range_exit', (string) $db2->getState('pause_reason', ''), 'single-engine mode still writes the global pause');
+    T::ok((string) $db2->getState('paused_until', '') !== '', 'and still parks paused_until in the future');
+});
+
+T::group('scanner-rank', ['Scanner', 'FakeMarketData', 'Db', 'Risk'], static function (): void {
+    $cfg     = pfCfg(['scanner_enabled' => true]);
+    $tickers = FakeMarketData::ticker24hFixture();
+    $info    = FakeMarketData::ticker24hInfo();
+    $rows    = Scanner::rank($tickers, $info, $cfg);
+
+    $bySymbol = [];
+    $order    = [];
+    foreach ($rows as $r) {
+        $bySymbol[(string) $r['symbol']] = $r;
+        $order[] = (string) $r['symbol'];
+    }
+
+    // ---- deterministic ranking: volatile AND liquid AND tight first
+    T::eq(['SOLUSDT', 'DOGEUSDT', 'ETHUSDT', 'JUPUSDT', 'NOISEUSDT', 'FLATUSDT', 'WIDEUSDT', 'DUSTUSDT', 'ILLIQUSDT'],
+        $order, 'the fixture ranks in exactly one order');
+    T::near(1.569231, (float) $bySymbol['SOLUSDT']['score'], 1e-6, 'SOLUSDT score = atr x liquidity x spread factor');
+    T::near(0.833333, (float) $bySymbol['DOGEUSDT']['score'], 1e-6, 'DOGEUSDT score');
+    T::near(0.692222, (float) $bySymbol['ETHUSDT']['score'], 1e-6, 'ETHUSDT score');
+    T::near(0.533445, (float) $bySymbol['JUPUSDT']['score'], 1e-6, 'JUPUSDT score');
+    T::eq($order, array_map(static function (array $r): string { return (string) $r['symbol']; },
+        Scanner::rank($tickers, $info, $cfg)), 'ranking the same fixture twice gives the same order');
+    $shuffled = array_reverse($tickers);
+    T::eq($order, array_map(static function (array $r): string { return (string) $r['symbol']; },
+        Scanner::rank($shuffled, $info, $cfg)), 'the ranking does not depend on the input order');
+
+    // ---- volatility alone never wins
+    T::ok((float) $bySymbol['ILLIQUSDT']['atr_pct'] > (float) $bySymbol['SOLUSDT']['atr_pct'],
+        'the illiquid pair is the more volatile one');
+    T::ok((float) $bySymbol['WIDEUSDT']['atr_pct'] > (float) $bySymbol['SOLUSDT']['atr_pct'],
+        'so is the wide-spread pair');
+    T::near(0.0, (float) $bySymbol['ILLIQUSDT']['score'], 1e-12, 'the illiquid pair scores zero');
+    T::near(0.0, (float) $bySymbol['WIDEUSDT']['score'], 1e-12, 'the wide-spread pair scores zero');
+    T::ok(array_search('ILLIQUSDT', $order, true) > array_search('SOLUSDT', $order, true),
+        'the illiquid pair ranks below the volatile-but-liquid one');
+    T::ok(array_search('WIDEUSDT', $order, true) > array_search('SOLUSDT', $order, true),
+        'the wide-spread pair ranks below the volatile-but-liquid one');
+    T::near(0.5, Scanner::liquidityFactor(5000000.0, 5000000.0), 1e-12, 'a pair exactly at the volume floor keeps half its ATR');
+    T::near(0.0, Scanner::liquidityFactor(500000.0, 5000000.0), 1e-12, 'ten times below the floor scores zero');
+    T::near(1.0, Scanner::liquidityFactor(500000000.0, 5000000.0), 1e-12, 'the liquidity factor is capped at 1');
+    T::near(0.0, Scanner::spreadFactor(0.06, 0.06), 1e-12, 'a book as wide as the limit scores zero');
+    T::near(1.0, Scanner::spreadFactor(0.0, 0.06), 1e-12, 'a zero spread keeps the whole score');
+
+    // ---- gates are RECORDED, the row is never dropped
+    T::eq(['illiquid'], $bySymbol['ILLIQUSDT']['gates'], 'the illiquid row is kept and says why');
+    T::eq(['spread_wide'], $bySymbol['WIDEUSDT']['gates'], 'the wide-spread row is kept and says why');
+    T::eq(['dust_step'], $bySymbol['DUSTUSDT']['gates'], 'a step that costs more than the dust limit is gated');
+    foreach (['ILLIQUSDT', 'WIDEUSDT', 'DUSTUSDT', 'NOISEUSDT', 'FLATUSDT'] as $sym) {
+        T::eq(0, (int) $bySymbol[$sym]['eligible'], $sym . ' is not eligible');
+        T::ok((float) $bySymbol[$sym]['quote_vol'] > 0.0, $sym . ' keeps its numbers for the panel');
+    }
+    foreach (['SOLUSDT', 'DOGEUSDT', 'ETHUSDT', 'JUPUSDT'] as $sym) {
+        T::eq(1, (int) $bySymbol[$sym]['eligible'], $sym . ' is eligible');
+        T::eq([], $bySymbol[$sym]['gates'], $sym . ' has no gate');
+        T::ok((float) $bySymbol[$sym]['required_size'] > 0.0, $sym . ' carries its required size');
+    }
+
+    // ---- ATR outside the band is rejected, in both directions
+    T::eq(['atr_high'], $bySymbol['NOISEUSDT']['gates'], 'an ATR above scanner_max_atr_pct is rejected as noise');
+    T::eq(['atr_low'], $bySymbol['FLATUSDT']['gates'], 'an ATR below scanner_min_atr_pct is rejected');
+    T::ok((float) $bySymbol['NOISEUSDT']['atr_pct'] > 4.0, 'the noisy pair really is outside the band');
+    T::ok((float) $bySymbol['FLATUSDT']['atr_pct'] < 0.5, 'the flat pair really is outside the band');
+    $noAtr    = Scanner::rank(FakeMarketData::ticker24hFixture(false), $info, $cfg);
+    $unknowns = 0;
+    foreach ($noAtr as $r) {
+        if (in_array('atr_unknown', $r['gates'], true) && $r['atr_pct'] === null) {
+            $unknowns++;
+        }
+    }
+    T::eq(count($noAtr), $unknowns, 'without an ATR every row gates atr_unknown and reports a null ATR');
+    T::eq(0, count(array_filter($noAtr, static function (array $r): bool { return (int) $r['eligible'] === 1; })),
+        'nothing is eligible before the ATR pass has run');
+
+    // ---- stablecoins, leveraged tokens and untradeable symbols never rank at all
+    foreach (array_merge(FakeMarketData::ticker24hCase('stablecoin'),
+                         FakeMarketData::ticker24hCase('leveraged'),
+                         FakeMarketData::ticker24hCase('not_trading'),
+                         FakeMarketData::ticker24hCase('other_quote')) as $sym) {
+        T::ok(!isset($bySymbol[$sym]), $sym . ' is dropped before it can rank');
+    }
+    T::ok(isset($bySymbol['JUPUSDT']), 'a coin whose name merely ends in UP is NOT a leveraged token');
+    T::ok(Scanner::isLeveraged('BTCUP') && Scanner::isLeveraged('ADADOWN')
+        && Scanner::isLeveraged('XRPBULL') && Scanner::isLeveraged('ETHBEAR'), 'the four leveraged suffixes are caught');
+    T::ok(!Scanner::isLeveraged('JUP') && !Scanner::isLeveraged('SUP') && !Scanner::isLeveraged('BEAR')
+        && !Scanner::isLeveraged('UP'), 'coins that merely contain the suffix are kept');
+    $noExcl = Scanner::rank($tickers, $info, pfCfg(['scanner_exclude' => []]));
+    $names  = array_map(static function (array $r): string { return (string) $r['symbol']; }, $noExcl);
+    T::contains($names, 'USDCUSDT', 'the stablecoins are excluded by scanner_exclude, nothing else');
+
+    // ---- refresh() stores exactly that ranking
+    $db = freshDb('scanner-rank');
+    $md = new FakeMarketData([]);          // no klines: the fixture ATRs are what the ranking uses
+    $md->setTicker24h($tickers);
+    $scanner = new Scanner($cfg, $db, $md);
+    T::ok($scanner->enabled(), 'the scanner is enabled');
+    T::ok($scanner->due(), 'a scanner that never ran is due');
+    $stored = $scanner->refresh($info, true);
+    T::eq(count($rows), count($stored), 'refresh stores one row per ranked pair');
+    T::eq(1, $md->callCount('ticker24h'), 'refresh spends exactly one weight-80 ticker call');
+    T::eq(count($rows), countRows($db, 'SELECT COUNT(*) FROM scanner'), 'the whole set is written to the scanner table');
+    $top = $db->scannerRows(3);
+    T::eq('SOLUSDT', (string) $top[0]['symbol'], 'the panel reads the leader first');
+    T::eq(4, count($db->scannerRows(50, true)), 'four eligible pairs');
+    $stored_by = [];
+    foreach ($db->scannerRows(50) as $sr) {
+        $stored_by[(string) $sr['symbol']] = $sr;
+    }
+    T::eq(['illiquid'], $stored_by['ILLIQUSDT']['gates_list'], 'the stored row keeps its gates');
+    T::eq(0, (int) $stored_by['ILLIQUSDT']['eligible'], 'and stays in the table, marked ineligible');
+    T::near(1.569231, (float) $stored_by['SOLUSDT']['score'], 1e-6, 'the stored score is the ranked one');
+    T::ok($db->scannerAge() !== null && $db->scannerAge() >= 0, 'the scanner age is known');
+    T::ok((string) $db->getState('scanner_at', '') !== '', 'scanner_at is stamped');
+    T::ok(!$scanner->due(), 'the scanner is not due again straight away');
+    T::eq([], $scanner->refresh($info), 'and an un-forced refresh does nothing');
+    T::eq(1, $md->callCount('ticker24h'), 'so no second weight-80 call is made');
+});
+
+T::group('portfolio-off', ['Bot', 'PaperExchange', 'FakeMarketData', 'Db', 'Sleeve'], static function (): void {
+    /**
+     * Regression guard: with portfolio_enabled = false the tick must be byte-for-byte the
+     * single-engine tick of DESIGN-ENGINES.md. The baseline config has no portfolio keys at
+     * all (a config.json written before portfolio mode existed); the comparison config carries
+     * the full sleeve and scanner block with the switch off. Wall-clock columns are the only
+     * thing normalised away - both runs use the same injected exchange clock.
+     */
+    $volatile = ['ts' => true, 'created_at' => true, 'updated_at' => true, 'closed_at' => true,
+                 'opened_at' => true, 'last_at' => true];
+    $skipState = ['last_tick_at' => true, 'last_tick_ms' => true, 'symbol_info_at' => true,
+                  'symbol_metrics' => true, 'day_start_date' => true, 'cooldown_until' => true,
+                  'last_loss_at' => true];
+
+    /** PaperExchange mints order ids from the wall clock: paper-<ms>-<n> -> paper-<ts>-<n>. */
+    $ids = static function ($v) {
+        return is_string($v) ? (string) preg_replace('/paper-\\d{10,}-/', 'paper-<ts>-', $v) : $v;
+    };
+
+    /** Blank the wall-clock stamps Binance/PaperExchange put inside a stored `raw` payload. */
+    $scrub = null;
+    $scrub = static function ($v) use (&$scrub, $ids) {
+        if (!is_array($v)) {
+            return $ids($v);
+        }
+        $stamps = ['transactTime' => true, 'time' => true, 'updateTime' => true, 'workingTime' => true];
+        $out = [];
+        foreach ($v as $k => $inner) {
+            $out[$k] = isset($stamps[(string) $k]) ? '<ts>' : $scrub($inner);
+        }
+        return $out;
+    };
+
+    $snapshot = static function (Db $db) use ($volatile, $skipState, $scrub, $ids): array {
+        $out    = [];
+        $tables = [];
+        foreach ($db->pdo()->query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN) as $t) {
+            $tables[] = (string) $t;
+        }
+        foreach ($tables as $table) {
+            if ($table === 'logs' || $table === 'sqlite_sequence') {
+                continue;   // log text carries timings and row ids; it is not tick state
+            }
+            $rows  = $db->pdo()->query('SELECT * FROM "' . $table . '"')->fetchAll(PDO::FETCH_ASSOC);
+            $clean = [];
+            foreach ($rows as $row) {
+                $r = [];
+                foreach ($row as $k => $v) {
+                    if (isset($volatile[$k])) {
+                        $r[$k] = ($v === null || $v === '') ? $v : '<ts>';
+                    } elseif ($k === 'raw' && is_string($v) && $v !== '') {
+                        $decoded = json_decode($v, true);
+                        $r[$k]   = is_array($decoded) ? json_encode($scrub($decoded)) : $v;
+                    } elseif ($table === 'state' && $k === 'value' && isset($skipState[(string) $row['key']])) {
+                        $r[$k] = '<volatile>';
+                    } else {
+                        $r[$k] = $ids($v);
+                    }
+                }
+                $clean[] = $r;
+            }
+            usort($clean, static function (array $a, array $b): int {
+                return strcmp((string) json_encode($a), (string) json_encode($b));
+            });
+            $out[$table] = $clean;
+        }
+        return $out;
+    };
+
+    $run = static function (array $cfg, string $tag): array {
+        $db = freshDb($tag);
+        $md = new FakeMarketData([
+            'SOLUSDT'  => ['15m' => 'klines_15m_oversold',   '1h' => 'klines_1h_uptrend'],
+            'DOGEUSDT' => ['15m' => 'klines_15m_overbought', '1h' => 'klines_1h_uptrend'],
+        ]);
+        $md->setPrice('SOLUSDT', 129.75, 129.80);
+        $ex = new PaperExchange($md, $db, 0.1, 10.0);
+        $t0 = FakeMarketData::SERVER_TIME_MS;
+        $r1 = (new Bot($cfg, $db, $ex, $t0))->tick();
+        $md->setPrice('SOLUSDT', 131.50, 131.55);
+        $r2 = (new Bot($cfg, $db, $ex, $t0 + 120000))->tick();
+        return ['db' => $db, 'r1' => $r1, 'r2' => $r2];
+    };
+
+    // the ONLY difference between the two configs is the portfolio block of DESIGN-PORTFOLIO.md §2
+    $base = botCfg();
+    $with = botCfg(pfBlock());
+    T::eq([], array_diff_key($base, $with), 'the comparison config is a strict superset of the baseline');
+    T::eq(array_keys(pfBlock()), array_keys(array_diff_key($with, $base)), 'and adds exactly the portfolio keys');
+    foreach ($base as $k => $v) {
+        if ($v !== $with[$k]) {
+            T::ok(false, 'the two configs differ only in the portfolio block', 'key ' . $k);
+        }
+    }
+    T::ok(!isset($base['portfolio_enabled']), 'the baseline config predates portfolio mode');
+    T::ok(!Sleeve::portfolioEnabled($with), 'portfolio mode is off for the comparison config');
+    T::ok(Sleeve::all($with) !== [], 'the sleeves are configured, they are just never used');
+    T::ok(!empty($with['scanner_enabled']), 'and the scanner is enabled, so it too must stay inert');
+
+    $a = $run($base, 'portfolio-off-base');
+    $b = $run($with, 'portfolio-off-cfg');
+
+    T::eq($a['r1']['status'], $b['r1']['status'], 'tick1 status is identical');
+    T::eq($a['r1']['summary'], $b['r1']['summary'], 'tick1 summary is identical');
+    T::eq($a['r2']['status'], $b['r2']['status'], 'tick2 status is identical');
+    T::eq($a['r2']['summary'], $b['r2']['summary'], 'tick2 summary is identical');
+    T::strContains($a['r1']['summary'], 'entered:SOLUSDT', 'the baseline really did trade');
+    T::strContains($a['r2']['summary'], 'exited:take_profit', 'and really did close the round trip');
+
+    $sa = $snapshot($a['db']);
+    $sb = $snapshot($b['db']);
+    T::eq(array_keys($sa), array_keys($sb), 'both runs created the same tables');
+    foreach ($sa as $table => $rowsA) {
+        $rowsB = isset($sb[$table]) ? $sb[$table] : null;
+        T::eq(json_encode($rowsA), json_encode($rowsB), 'table ' . $table . ' is identical with portfolio mode off');
+    }
+
+    // and no sleeve code left a trace
+    T::eq(0, countRows($b['db'], 'SELECT COUNT(*) FROM sleeve_equity'), 'no sleeve equity was sampled');
+    T::eq(0, countRows($b['db'], 'SELECT COUNT(*) FROM scanner'), 'the scanner never ran');
+    T::eq(null, $b['db']->getState('sleeve_cursor', null), 'no rotating cursor was written');
+    T::eq(null, $b['db']->getState('scanner_at', null), 'no scanner timestamp was written');
+    T::eq(null, $b['db']->getState('sleeve_paused_signal', null), 'no sleeve pause state was written');
+    $reason = (string) $b['db']->getState('no_trade_reason', '');
+    T::ok(strpos($reason, 'portfolio') === false && strpos($reason, 'sleeve') === false,
+        'the no-trade reason is the single-engine one', $reason);
 });
 
 /* ============================================================ summary */

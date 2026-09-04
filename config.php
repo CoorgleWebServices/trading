@@ -87,7 +87,72 @@ function trader_config_defaults(): array
         'pmm_refresh_sec'             => 60,
         'pmm_target_base_pct'         => 50.0,
         'pmm_max_base_pct'            => 80.0,
+
+        // --- portfolio mode (docs/DESIGN-PORTFOLIO.md §2). Same reason as the engine keys:
+        //     a config.json written before portfolio mode existed still comes back complete.
+        //     `sleeves` is a nested map, so trader_config_merge() normalises it separately
+        //     (trader_config_cast() only handles flat lists).
+        'portfolio_enabled'           => false,
+        'sleeve_reserve_pct'          => 5.0,
+        'sleeve_max_drawdown_pct'     => 25.0,
+        'scanner_enabled'             => true,
+        'scanner_refresh_min'         => 60,
+        'scanner_min_quote_vol'       => 5000000.0,
+        'scanner_max_spread_pct'      => 0.06,
+        'scanner_min_atr_pct'         => 0.5,
+        'scanner_max_atr_pct'         => 4.0,
+        'scanner_top_n'               => 10,
+        'scanner_exclude'             => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT'],
+        'sleeves'                     => [
+            'signal' => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['SOLUSDT', 'ETHUSDT']],
+            'grid'   => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['DOGEUSDT']],
+            'pmm'    => ['enabled' => false, 'budget_usdt' => 1000.0, 'symbols' => ['XRPUSDT']],
+        ],
     ];
+}
+
+/**
+ * Normalise the nested `sleeves` map of DESIGN-PORTFOLIO.md §2 to
+ * [engine => ['enabled'=>bool,'budget_usdt'=>float,'symbols'=>string[]]].
+ * Unknown engine keys are kept (Risk::validateConfig() reports them); scalars are coerced.
+ */
+function trader_config_sleeves($value, array $default): array
+{
+    if (!is_array($value)) {
+        return $default;
+    }
+    $out = [];
+    foreach ($value as $engine => $sleeve) {
+        $engine = strtolower(trim((string) $engine));
+        if ($engine === '' || !is_array($sleeve)) {
+            continue;
+        }
+        $symbols = [];
+        $raw = isset($sleeve['symbols']) ? $sleeve['symbols'] : [];
+        if (is_string($raw)) {
+            $parts = preg_split('/[\s,;]+/', $raw);
+            $raw = $parts === false ? [] : $parts;
+        }
+        if (is_array($raw)) {
+            foreach ($raw as $sym) {
+                if (!is_scalar($sym)) {
+                    continue;
+                }
+                $sym = strtoupper(trim((string) $sym));
+                if ($sym !== '' && !in_array($sym, $symbols, true)) {
+                    $symbols[] = $sym;
+                }
+            }
+        }
+        $budget = isset($sleeve['budget_usdt']) && is_numeric($sleeve['budget_usdt'])
+            ? (float) $sleeve['budget_usdt'] : 0.0;
+        $out[$engine] = [
+            'enabled'     => trader_config_cast(isset($sleeve['enabled']) ? $sleeve['enabled'] : false, false),
+            'budget_usdt' => $budget < 0.0 ? 0.0 : $budget,
+            'symbols'     => $symbols,
+        ];
+    }
+    return $out === [] ? $default : $out;
 }
 
 /**
@@ -159,7 +224,9 @@ function trader_config_merge(array $cfg): array
 {
     $out = trader_config_defaults();
     foreach ($cfg as $k => $v) {
-        if (array_key_exists($k, $out)) {
+        if ($k === 'sleeves') {
+            $out['sleeves'] = trader_config_sleeves($v, $out['sleeves']);
+        } elseif (array_key_exists($k, $out)) {
             $out[$k] = trader_config_cast($v, $out[$k]);
         } else {
             $out[$k] = $v;

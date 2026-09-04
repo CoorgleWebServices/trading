@@ -4,6 +4,11 @@ declare(strict_types=1);
 require_once __DIR__ . '/Util.php';
 require_once __DIR__ . '/Db.php';
 require_once __DIR__ . '/Risk.php';
+// Portfolio mode (docs/DESIGN-PORTFOLIO.md) is optional: a checkout without lib/Sleeve.php
+// renders exactly the single-engine panel it always did.
+if (file_exists(__DIR__ . '/Sleeve.php')) {
+    require_once __DIR__ . '/Sleeve.php';
+}
 
 /**
  * Panel helpers (DESIGN.md §12): security headers, sessions, CSRF, escaping,
@@ -21,6 +26,10 @@ final class Panel
     const LOGIN_LOCK_MINUTES = 15;
     const CRON_STALE_SECONDS = 180;    // "cron not running" after 3 min
     const CSP = "default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'";
+    /** Round trips a sleeve needs before the "best method" line is allowed to look like a result. */
+    const PORTFOLIO_MIN_SAMPLE = 30;
+    /** DESIGN-PORTFOLIO.md §6.4 default, used only when the config key is absent. */
+    const SLEEVE_DRAWDOWN_DEFAULT = 25.0;
 
     /** @var bool guards against sending headers twice */
     private static $headersSent = false;
@@ -526,8 +535,16 @@ final class Panel
             if (!is_array($row)) {
                 continue;
             }
-            $html .= '<tr>';
-            foreach ($row as $cell) {
+            // a row is a plain list of cells, or ['cells' => [...], 'class' => 'row-ok'] when it
+            // carries a row colour (the portfolio card colours by PnL sign)
+            $class = '';
+            $cells = $row;
+            if (isset($row['cells']) && is_array($row['cells'])) {
+                $cells = $row['cells'];
+                $class = isset($row['class']) ? (string) $row['class'] : '';
+            }
+            $html .= '<tr' . ($class !== '' ? ' class="' . self::e($class) . '"' : '') . '>';
+            foreach ($cells as $cell) {
                 $html .= self::tableCell($cell);
             }
             $html .= '</tr>';
@@ -552,6 +569,8 @@ final class Panel
             $td .= self::pill($text, (string) $cell['pill']);
         } elseif (isset($cell['btn']) && is_array($cell['btn'])) {
             $td .= self::actionButton($cell['btn'], $text);
+        } elseif (isset($cell['assign']) && is_array($cell['assign'])) {
+            $td .= self::assignControl($cell['assign'], $text);
         } else {
             $td .= self::e($text);
         }
@@ -1024,6 +1043,16 @@ final class Panel
         $tables = array_merge($tables, $eng['tables']);
         $show   = array_merge($show, $eng['show']);
 
+        // ---- portfolio card, sleeve sparkline, scanner (DESIGN-PORTFOLIO.md §7).
+        // Additive: with portfolio_enabled = false every block above is untouched and
+        // show.portfolio / show.scanner keep the new cards hidden.
+        $pf     = self::portfolioBlock($cfg, $db, $st, $now, $tz);
+        $text   = array_merge($text, $pf['text']);
+        $levels = array_merge($levels, $pf['levels']);
+        $raw    = array_merge($raw, $pf['raw']);
+        $tables = array_merge($tables, $pf['tables']);
+        $show   = array_merge($show, $pf['show']);
+
         $text['now']         = self::fmtTime($nowIso, $tz) . ' ' . $tz;
         $text['api_key_fp']  = self::keyFingerprint((string) ($cfg['api_key'] ?? ''));
 
@@ -1038,6 +1067,9 @@ final class Panel
             'sparkline' => $spark,
             'position'  => $posPayload,
             'engine'    => $eng['payload'],
+            'portfolio' => $pf['portfolio'],
+            'scanner'   => $pf['scanner'],
+            'sleeve_sparkline' => $pf['sparkline'],
             'raw'       => $raw,
             'refresh_s' => 20,
         ];
@@ -1454,4 +1486,661 @@ final class Panel
         }
         return ['rows' => $rows, 'cols' => 11, 'empty' => 'No symbols configured'];
     }
+
+    /**
+     * Inline POST form for a per-row "Assign to…" control (DESIGN-PORTFOLIO.md §7):
+     * `['t' => 'Assign', 'assign' => ['action' => 'assign_symbol', 'name' => 'engine',
+     *   'fields' => ['symbol' => 'SOLUSDT'], 'options' => [['v' => 'grid', 't' => 'grid sleeve']]]]`.
+     * A select plus a submit button, because the CSP forbids an inline onchange handler; the
+     * CSRF token is included and assets/panel.js rebuilds the identical markup on a refresh.
+     */
+    public static function assignControl(array $spec, string $label = 'Assign'): string
+    {
+        $action  = isset($spec['action']) ? (string) $spec['action'] : '';
+        $name    = isset($spec['name']) && (string) $spec['name'] !== '' ? (string) $spec['name'] : 'engine';
+        $options = isset($spec['options']) && is_array($spec['options']) ? $spec['options'] : [];
+        if ($action === '' || $options === []) {
+            return '<span class="muted">' . self::e($spec['empty'] ?? '-') . '</span>';
+        }
+        $fields = isset($spec['fields']) && is_array($spec['fields']) ? $spec['fields'] : [];
+        $place  = isset($spec['placeholder']) ? (string) $spec['placeholder'] : 'Assign to…';
+        $h = '<form method="post" action="index.php" class="inline assign">' . self::csrfField()
+           . '<input type="hidden" name="action" value="' . self::e($action) . '">';
+        foreach ($fields as $k => $v) {
+            $h .= '<input type="hidden" name="' . self::e((string) $k) . '" value="' . self::e($v) . '">';
+        }
+        $h .= '<select name="' . self::e($name) . '" class="assign-select" required>';
+        $h .= '<option value="" selected disabled>' . self::e($place) . '</option>';
+        foreach ($options as $o) {
+            if (is_array($o)) {
+                $ov = isset($o['v']) ? (string) $o['v'] : '';
+                $ot = isset($o['t']) ? (string) $o['t'] : $ov;
+            } else {
+                $ov = (string) $o;
+                $ot = $ov;
+            }
+            if ($ov === '') {
+                continue;
+            }
+            $h .= '<option value="' . self::e($ov) . '">' . self::e($ot) . '</option>';
+        }
+        $h .= '</select><button type="submit" class="btn btn-mini">' . self::e($label !== '' ? $label : 'Assign') . '</button></form>';
+        return $h;
+    }
+
+    /**
+     * Geometry for several series drawn on ONE chart with a SHARED scale, so the sleeve
+     * equities can be compared by eye (DESIGN-PORTFOLIO.md §7). Pure geometry: the colours
+     * are CSS classes in assets/panel.css and nothing here emits a style attribute.
+     *
+     * @param array $seriesMap [key => float[]] oldest → newest
+     * @return array{w:int, h:int, count:int, min:float, max:float, series:array}
+     */
+    public static function multiSparkline(array $seriesMap, int $w = 600, int $h = 140, int $pad = 6): array
+    {
+        $clean = [];
+        $all   = [];
+        foreach ($seriesMap as $key => $values) {
+            $vals = [];
+            if (is_array($values)) {
+                foreach ($values as $v) {
+                    if (is_numeric($v) && is_finite((float) $v)) {
+                        $vals[] = (float) $v;
+                        $all[]  = (float) $v;
+                    }
+                }
+            }
+            $clean[(string) $key] = $vals;
+        }
+        $out = ['w' => $w, 'h' => $h, 'count' => count($all), 'min' => 0.0, 'max' => 0.0, 'series' => []];
+        if ($all === []) {
+            foreach ($clean as $key => $vals) {
+                $out['series'][$key] = ['key' => $key, 'points' => '', 'count' => 0,
+                    'first' => 0.0, 'last' => 0.0, 'min' => 0.0, 'max' => 0.0];
+            }
+            return $out;
+        }
+        $min = min($all);
+        $max = max($all);
+        $out['min'] = $min;
+        $out['max'] = $max;
+        $span = $max - $min;
+        if ($span <= 0) {
+            $span = max(abs($max) * 0.01, 0.01);
+            $min  = $min - $span / 2;
+        }
+        $iw = max(1, $w - 2 * $pad);
+        $ih = max(1, $h - 2 * $pad);
+        foreach ($clean as $key => $vals) {
+            $n   = count($vals);
+            $pts = [];
+            for ($i = 0; $i < $n; $i++) {
+                $x = $n === 1 ? $pad + $iw / 2 : $pad + $iw * $i / ($n - 1);
+                $y = $pad + $ih - ($vals[$i] - $min) / $span * $ih;
+                $pts[] = sprintf('%.1F,%.1F', $x, $y);
+            }
+            $out['series'][$key] = [
+                'key'   => $key,
+                'points' => implode(' ', $pts),
+                'count' => $n,
+                'first' => $n > 0 ? $vals[0] : 0.0,
+                'last'  => $n > 0 ? $vals[$n - 1] : 0.0,
+                'min'   => $n > 0 ? min($vals) : 0.0,
+                'max'   => $n > 0 ? max($vals) : 0.0,
+            ];
+        }
+        return $out;
+    }
+
+    /** Inline SVG for a multi-series sparkline (one polyline per series, CSS classes only). */
+    public static function svgMultiSparkline(array $spark, string $label = 'Sleeve equity history'): string
+    {
+        $w = (int) ($spark['w'] ?? 600);
+        $h = (int) ($spark['h'] ?? 140);
+        $series = isset($spark['series']) && is_array($spark['series']) ? $spark['series'] : [];
+        $svg = '<svg class="spark spark-multi" viewBox="0 0 ' . $w . ' ' . $h . '" preserveAspectRatio="none" role="img" aria-label="'
+             . self::e($label) . '">';
+        foreach ($series as $key => $s) {
+            $k = self::slug((string) $key);
+            $svg .= '<polyline class="spark-line spark-series spark-' . self::e($k) . '" points="'
+                  . self::e((string) ($s['points'] ?? '')) . '" data-sparkline-series="' . self::e((string) $key) . '"></polyline>';
+        }
+        return $svg . '</svg>';
+    }
+
+    /** Lower-case [a-z0-9_-] slug for a CSS class or a data-field suffix built from config data. */
+    public static function slug(string $v): string
+    {
+        $s = strtolower(trim($v));
+        $s = preg_replace('/[^a-z0-9_-]+/', '-', $s);
+        $s = is_string($s) ? trim($s, '-') : '';
+        return $s === '' ? 'x' : substr($s, 0, 32);
+    }
+
+    /**
+     * Portfolio card, per-sleeve equity sparkline and scanner table (DESIGN-PORTFOLIO.md §7).
+     *
+     * Always returns the whole shape, even with `portfolio_enabled = false`, so `?api=status`
+     * keeps one stable contract and assets/panel.js never has to test for missing keys;
+     * `show.portfolio` / `show.scanner` decide whether the dashboard renders the blocks.
+     *
+     * Reads the database only - no network, no clock beyond "now" - and every query is
+     * wrapped, so an install whose tables predate portfolio mode simply shows zeros.
+     *
+     * @return array{text: array, levels: array, raw: array, tables: array, show: array,
+     *   sparkline: array, portfolio: array, scanner: array}
+     */
+    private static function portfolioBlock(array $cfg, Db $db, callable $st, int $now, string $tz): array
+    {
+        $quote = strtoupper(trim((string) ($cfg['quote_asset'] ?? 'USDT')));
+        if ($quote === '') {
+            $quote = 'USDT';
+        }
+        $mode       = strtolower(trim((string) ($cfg['mode'] ?? 'paper')));
+        $haveSleeve = class_exists('Sleeve');
+        $on         = $haveSleeve && Sleeve::portfolioEnabled($cfg);
+
+        // With portfolio_enabled = false NO sleeve code runs at all: not one query, not one
+        // Sleeve:: call. The block is still returned in full (zeros) so ?api=status keeps one
+        // stable shape and panel.js never has to test for missing keys.
+        $sleeves = [];
+        if ($haveSleeve && $on) {
+            try {
+                $sleeves = Sleeve::all($cfg);
+            } catch (Throwable $e) {
+                $sleeves = [];
+            }
+        }
+
+        $halted     = $st('halted', '0') === '1';
+        $entriesOn  = !empty($cfg['enabled']);
+        $allowLive  = !empty($cfg['allow_live_engines']);
+        $ddPct      = self::f($cfg['sleeve_max_drawdown_pct'] ?? self::SLEEVE_DRAWDOWN_DEFAULT, self::SLEEVE_DRAWDOWN_DEFAULT);
+        if ($ddPct <= 0.0 || $ddPct > 100.0) {
+            $ddPct = self::SLEEVE_DRAWDOWN_DEFAULT;
+        }
+        $reservePct = self::f($cfg['sleeve_reserve_pct'] ?? 5.0, 5.0);
+
+        /* Market input. Base balances are only known to the panel in paper mode (the tick owns
+           the exchange account), so when they are not, the inventory valuation comes from the
+           last sleeve_equity sample the tick wrote - which is exactly what it was written for. */
+        $balances = [];
+        $prices   = [];
+        try {
+            $pb = $db->getStateJson('paper_balances', []);
+            if ($mode === 'paper' && is_array($pb)) {
+                $balances = $pb;
+            }
+        } catch (Throwable $e) {
+            $balances = [];
+        }
+        try {
+            $m = $db->getStateJson('symbol_metrics', []);
+            if (is_array($m)) {
+                $prices = $m;
+            }
+        } catch (Throwable $e) {
+            $prices = [];
+        }
+        $balancesKnown = $balances !== [];
+
+        $text   = [];
+        $levels = [];
+        $raw    = [];
+        $rows   = [];
+        $cards  = [];
+        $seriesMap = [];
+        $owned     = [];
+
+        $totBudget = 0.0;
+        $totEquity = 0.0;
+        $totReal   = 0.0;
+        $totUnreal = 0.0;
+        $totSample = 0;
+
+        foreach ($sleeves as $engineKey => $sleeve) {
+            $engine  = (string) $engineKey;
+            $enabled = !empty($sleeve['enabled']);
+            $budget  = self::f($sleeve['budget_usdt'] ?? 0.0);
+            $symbols = isset($sleeve['symbols']) && is_array($sleeve['symbols']) ? $sleeve['symbols'] : [];
+            foreach ($symbols as $sym) {
+                $owned[strtoupper((string) $sym)] = $engine;
+            }
+
+            $state = null;
+            try {
+                $state = Sleeve::state($cfg, $db, $engine, $balances, $prices);
+            } catch (Throwable $e) {
+                $state = null;
+            }
+            if (!is_array($state)) {
+                $state = [];
+            }
+
+            $realised  = self::f($state['realised'] ?? 0.0);
+            $invCost   = self::f($state['inventory_cost'] ?? 0.0);
+            $invValue  = self::f($state['inventory_value'] ?? 0.0);
+            $reserved  = self::f($state['reserved'] ?? 0.0);
+            $unreal    = self::f($state['unrealised'] ?? 0.0);
+            $trades    = (int) ($state['trades'] ?? 0);
+            $cycles    = (int) ($state['cycles'] ?? 0);
+            $wins      = (int) ($state['wins'] ?? 0);
+            $losses    = (int) ($state['losses'] ?? 0);
+            $fees      = self::f($state['fees'] ?? 0.0);
+            $pnlToday  = self::f($state['pnl_today'] ?? 0.0);
+            $sampleAt  = '';
+
+            $sample = null;
+            try {
+                $hist = $db->sleeveEquitySeries($engine, 1, $mode);
+                if ($hist !== []) {
+                    $sample = $hist[count($hist) - 1];
+                }
+            } catch (Throwable $e) {
+                $sample = null;
+            }
+            if ($sample !== null) {
+                $sampleAt = (string) ($sample['ts'] ?? '');
+                if (!$balancesKnown) {
+                    $invValue = self::f($sample['inventory_value'] ?? 0.0);
+                    $reserved = self::f($sample['reserved'] ?? 0.0);
+                    $unreal   = self::f($sample['unrealised'] ?? 0.0);
+                }
+            }
+
+            $equity  = $budget + $realised + $unreal;
+            $pnl     = $realised + $unreal;
+            $pnlPct  = $budget > 0.0 ? $pnl / $budget * 100.0 : 0.0;
+            $usedPct = $budget > 0.0 ? ($invCost + $reserved) / $budget * 100.0 : 0.0;
+            if (!is_finite($usedPct) || $usedPct < 0.0) {
+                $usedPct = 0.0;
+            }
+            $decided = $wins + $losses;
+            $round   = $trades + $cycles;
+
+            /* status: disabled → blocked → drawdown-paused → paused → running */
+            $ddFloor     = $budget > 0.0 ? $budget * (1.0 - $ddPct / 100.0) : 0.0;
+            $liveBlocked = $engine !== 'signal' && $mode === 'live' && !$allowLive;
+            $pausedState = trim((string) $st('sleeve_paused_' . $engine, ''));
+            $pausedFlag  = $pausedState !== '' && $pausedState !== '0';
+            if (!$enabled) {
+                $stText  = 'disabled';
+                $stLevel = 'muted';
+            } elseif ($halted) {
+                $stText  = 'blocked (halted: ' . $st('halt_reason', 'unknown') . ')';
+                $stLevel = 'danger';
+            } elseif ($liveBlocked) {
+                $stText  = 'blocked (live, allow_live_engines off)';
+                $stLevel = 'danger';
+            } elseif ($budget > 0.0 && $equity <= $ddFloor) {
+                $stText  = 'drawdown-paused (equity ≤ ' . Util::money($ddFloor, 4) . ')';
+                $stLevel = 'danger';
+            } elseif ($engine === 'grid' && trim((string) $st('grid_paused_reason', '')) !== '') {
+                // sleeve-local range-exit pause: only a re-anchor resumes it
+                $stText  = 'paused (' . trim((string) $st('grid_paused_reason', '')) . ') - re-anchor to resume';
+                $stLevel = 'warn';
+            } elseif ($pausedFlag) {
+                $stText  = 'paused' . ($pausedState !== '1' ? ' (' . $pausedState . ')' : '');
+                $stLevel = 'warn';
+            } elseif (!$entriesOn) {
+                $stText  = 'paused (entries disabled)';
+                $stLevel = 'warn';
+            } else {
+                $stText  = 'running';
+                $stLevel = 'ok';
+            }
+
+            $card = [
+                'engine'          => $engine,
+                'enabled'         => $enabled,
+                'symbols'         => $symbols,
+                'budget'          => $budget,
+                'equity'          => $equity,
+                'realised'        => $realised,
+                'unrealised'      => $unreal,
+                'pnl'             => $pnl,
+                'pnl_pct'         => $pnlPct,
+                'pnl_today'       => $pnlToday,
+                'inventory_cost'  => $invCost,
+                'inventory_value' => $invValue,
+                'reserved'        => $reserved,
+                'available'       => self::f($state['available'] ?? 0.0),
+                'used_pct'        => $usedPct,
+                'trades'          => $trades,
+                'cycles'          => $cycles,
+                'sample'          => $round,
+                'wins'            => $wins,
+                'losses'          => $losses,
+                'win_rate'        => $decided > 0 ? $wins / $decided * 100.0 : 0.0,
+                'fees'            => $fees,
+                'expectancy'      => $round > 0 ? $realised / $round : 0.0,
+                'status'          => $stText,
+                'status_level'    => $stLevel,
+                'paused'          => $pausedFlag,
+                'blocked'         => $liveBlocked || $halted,
+                'sample_at'       => $sampleAt,
+            ];
+            $cards[$engine] = $card;
+
+            $totBudget += $budget;
+            $totEquity += $equity;
+            $totReal   += $realised;
+            $totUnreal += $unreal;
+            $totSample += $round;
+
+            $rowLevel = self::pnlLevel($pnl);
+            $rows[] = [
+                'class' => $pnl > 0 ? 'row-ok' : ($pnl < 0 ? 'row-danger' : ''),
+                'cells' => [
+                    ['t' => strtoupper($engine), 'c' => 'mono' . ($enabled ? '' : ' muted')],
+                    ['t' => $symbols === [] ? '-' : implode(', ', $symbols), 'c' => 'mono'],
+                    ['t' => Util::money($budget, 2), 'c' => 'num'],
+                    ['t' => Util::money($equity, 4), 'c' => 'num lvl-' . $rowLevel],
+                    ['t' => self::signed($realised, 4), 'c' => 'num lvl-' . self::pnlLevel($realised)],
+                    ['t' => self::signed($unreal, 4), 'c' => 'num lvl-' . self::pnlLevel($unreal)],
+                    ['t' => self::pct($pnlPct, 2, true), 'c' => 'num lvl-' . $rowLevel],
+                    ['t' => $trades . ' / ' . $cycles, 'c' => 'num'],
+                    ['t' => $decided > 0 ? Util::money($card['win_rate'], 1) . ' % (' . $wins . 'W/' . $losses . 'L)' : '-', 'c' => 'num'],
+                    ['t' => Util::money($fees, 4), 'c' => 'num'],
+                    ['t' => Util::money($usedPct, 1) . ' %', 'c' => 'num', 'bar' => $usedPct],
+                    ['t' => $stText, 'pill' => $stLevel],
+                ],
+            ];
+
+            $vals = [];
+            try {
+                foreach ($db->sleeveEquitySeries($engine, 288, $mode) as $r) {
+                    $vals[] = self::f($r['equity'] ?? 0.0);
+                }
+            } catch (Throwable $e) {
+                $vals = [];
+            }
+            $seriesMap[$engine] = $vals;
+        }
+
+        /* ---- "best method so far": the leader by REALISED pnl, with its sample size and the
+           plain caveat. A handful of trades proves nothing, so a small sample is never dressed
+           up as a winner: the line stays muted until there are enough round trips to mean
+           anything at all. */
+        $best = null;
+        foreach ($cards as $c) {
+            if ($c['sample'] <= 0) {
+                continue;
+            }
+            if ($best === null || $c['realised'] > $best['realised']) {
+                $best = $c;
+            }
+        }
+        $others = [];
+        foreach ($cards as $c) {
+            if ($best !== null && $c['engine'] === $best['engine']) {
+                continue;
+            }
+            if ($c['sample'] <= 0) {
+                continue;
+            }
+            $others[] = $c['engine'] . ' ' . self::signed($c['realised'], 4) . ' over ' . (int) $c['sample']
+                . ' round trip' . ((int) $c['sample'] === 1 ? '' : 's');
+        }
+        if ($best === null) {
+            $text['pf_best']   = 'No sleeve has closed a round trip yet - there is nothing to compare.';
+            $levels['pf_best'] = 'muted';
+            $text['pf_best_caveat'] = 'A comparison needs closed trades. Until every sleeve has a few hundred of them, '
+                . 'any ranking here is noise: the leader would be luck, not evidence of an edge.';
+        } else {
+            $n = (int) $best['sample'];
+            $text['pf_best'] = 'Best method so far: ' . strtoupper($best['engine']) . ' with ' . self::signed($best['realised'], 4)
+                . ' ' . $quote . ' realised over ' . $n . ' round trip' . ($n === 1 ? '' : 's')
+                . ' (' . (int) $best['trades'] . ' signal trade' . ((int) $best['trades'] === 1 ? '' : 's')
+                . ', ' . (int) $best['cycles'] . ' engine cycle' . ((int) $best['cycles'] === 1 ? '' : 's') . ')'
+                . ($others !== [] ? ' - then ' . implode(', ', $others) . '.' : '.');
+            $levels['pf_best'] = $n >= self::PORTFOLIO_MIN_SAMPLE ? self::pnlLevel($best['realised']) : 'muted';
+            $text['pf_best_caveat'] = $n < self::PORTFOLIO_MIN_SAMPLE
+                ? $n . ' round trip' . ($n === 1 ? '' : 's') . ' proves nothing. A handful of trades is noise: this ranking '
+                  . 'can flip on the very next one, and a leader on such a sample is as likely to be luck as skill. '
+                  . 'Do not read a winner into it - compare again after a few hundred round trips per sleeve.'
+                : $n . ' round trips is still a small sample. A few hundred per sleeve is what it takes before the '
+                  . 'difference between two methods means anything; treat this as a running tally, not a verdict.';
+        }
+        $raw['pf_best_engine'] = $best === null ? '' : $best['engine'];
+        $raw['pf_best_sample'] = $best === null ? 0 : (int) $best['sample'];
+
+        /* ---- unattributed inventory (§3): base the sleeves do not own is excluded from every
+           sleeve's numbers, so it has to be named somewhere or it silently disappears. */
+        $unattributed = [];
+        $balanceList  = $on ? $balances : [];
+        foreach ($balanceList as $asset => $bal) {
+            $asset = strtoupper((string) $asset);
+            if ($asset === '' || $asset === $quote) {
+                continue;
+            }
+            $qty = is_array($bal) ? self::f($bal['free'] ?? 0.0) + self::f($bal['locked'] ?? 0.0) : self::f($bal);
+            if ($qty <= 0.0) {
+                continue;
+            }
+            $sym = $asset . $quote;
+            if (isset($owned[$sym])) {
+                continue;
+            }
+            $px  = isset($prices[$sym]['price']) ? self::f($prices[$sym]['price']) : 0.0;
+            $unattributed[$sym] = Util::toDecimalString($qty, 8) . ' ' . $asset
+                . ($px > 0.0 ? ' (' . Util::money($qty * $px, 4) . ' ' . $quote . ')' : '');
+        }
+        if ($on) {
+            $held = [
+                'lots'      => ['SELECT DISTINCT symbol FROM lots WHERE remaining > 0', ' (engine lots)'],
+                'positions' => ["SELECT DISTINCT symbol FROM positions WHERE status IN ('OPEN','STUCK')", ' (open position)'],
+            ];
+            foreach ($held as $spec) {
+                try {
+                    $params = [];
+                    $sql    = $spec[0];
+                    if ($mode !== '') {
+                        $sql .= ' AND mode = ?';
+                        $params[] = $mode;
+                    }
+                    $q = $db->pdo()->prepare($sql);
+                    $q->execute($params);
+                    foreach ($q->fetchAll(PDO::FETCH_COLUMN) as $sym) {
+                        $sym = strtoupper((string) $sym);
+                        if ($sym !== '' && !isset($owned[$sym]) && !isset($unattributed[$sym])) {
+                            $unattributed[$sym] = $sym . $spec[1];
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // the table predates the engines: nothing to attribute, never a fatal
+                }
+            }
+        }
+        $text['pf_unattributed'] = $unattributed === []
+            ? ($on ? ($balancesKnown ? 'none' : 'none tracked locally') : '-')
+            : implode(' · ', $unattributed);
+        $levels['pf_unattributed'] = $unattributed === [] ? 'muted' : 'warn';
+
+        /* ---- totals */
+        $totPnl = $totReal + $totUnreal;
+        $text['pf_state']       = $on ? 'PORTFOLIO' : 'single engine';
+        $levels['pf_state']     = $on ? 'info' : 'muted';
+        $text['pf_sleeves']     = (string) count($cards) . ' sleeve' . (count($cards) === 1 ? '' : 's');
+        $text['pf_budget']      = Util::money($totBudget, 2) . ' ' . $quote;
+        $text['pf_equity']      = Util::money($totEquity, 4) . ' ' . $quote;
+        $levels['pf_equity']    = self::pnlLevel($totPnl);
+        $text['pf_realised']    = self::signed($totReal, 4);
+        $levels['pf_realised']  = self::pnlLevel($totReal);
+        $text['pf_unrealised']  = self::signed($totUnreal, 4);
+        $levels['pf_unrealised'] = self::pnlLevel($totUnreal);
+        $text['pf_reserve']     = Util::money($reservePct, 2) . ' % held back';
+        $text['pf_drawdown']    = Util::money($ddPct, 2) . ' % of budget';
+        $text['pf_sample']      = (string) $totSample . ' round trips across all sleeves';
+        $text['pf_valuation']   = $balancesKnown
+            ? 'inventory valued from the local paper balances'
+            : 'inventory valued from the last per-sleeve equity sample written by the tick';
+
+        $raw['pf_enabled']    = $on;
+        $raw['pf_budget']     = $totBudget;
+        $raw['pf_equity']     = $totEquity;
+        $raw['pf_realised']   = $totReal;
+        $raw['pf_unrealised'] = $totUnreal;
+        $raw['pf_sample']     = $totSample;
+
+        $tables = [];
+        $tables['portfolio'] = ['rows' => $rows, 'cols' => 12,
+            'empty' => $on ? 'No sleeves configured - add them in Settings → Portfolio' : 'Portfolio mode is off'];
+
+        /* ---- overlaid per-sleeve equity sparkline */
+        $spark = self::multiSparkline($seriesMap);
+        foreach ($cards as $engine => $c) {
+            $s = isset($spark['series'][$engine]) ? $spark['series'][$engine] : ['count' => 0, 'last' => 0.0, 'first' => 0.0];
+            $key = 'pf_leg_' . self::slug($engine);
+            $text[$key] = ((int) $s['count'] > 0 ? Util::money(self::f($s['last']), 4) : '-')
+                . ' · ' . (int) $s['count'] . ' pt';
+            $levels[$key] = (int) $s['count'] > 1 ? self::pnlLevel(self::f($s['last']) - self::f($s['first'])) : 'muted';
+        }
+        $text['pf_spark_min']   = $spark['count'] > 0 ? Util::money(self::f($spark['min']), 4) : '-';
+        $text['pf_spark_max']   = $spark['count'] > 0 ? Util::money(self::f($spark['max']), 4) : '-';
+        $text['pf_spark_count'] = (int) $spark['count'] . ' points';
+
+        /* ---- scanner (§5, §7) */
+        $scannerOn = !isset($cfg['scanner_enabled']) || !empty($cfg['scanner_enabled']);
+        $topN      = (int) self::f($cfg['scanner_top_n'] ?? 10, 10.0);
+        if ($topN < 1) {
+            $topN = 1;
+        } elseif ($topN > 100) {
+            $topN = 100;
+        }
+        $scanRows = [];
+        try {
+            $scanRows = $db->scannerRows($topN, false);
+        } catch (Throwable $e) {
+            $scanRows = [];
+        }
+        $age = null;
+        try {
+            $age = $db->scannerAge();
+        } catch (Throwable $e) {
+            $age = null;
+        }
+        $options = [];
+        if ($on) {
+            foreach ($sleeves as $engineKey => $sleeve) {
+                $options[] = ['v' => (string) $engineKey, 't' => (string) $engineKey . ' sleeve'];
+            }
+        }
+
+        $srows   = [];
+        $rank    = 0;
+        $payload = [];
+        foreach ($scanRows as $r) {
+            $rank++;
+            $sym      = strtoupper((string) ($r['symbol'] ?? ''));
+            $eligible = !empty($r['eligible']);
+            $gates    = isset($r['gates_list']) && is_array($r['gates_list']) ? $r['gates_list'] : [];
+            $gateText = implode(', ', array_map('strval', $gates));
+            $atr      = ($r['atr_pct'] === null || $r['atr_pct'] === '') ? null : self::f($r['atr_pct']);
+            $ownerNow = isset($owned[$sym]) ? $owned[$sym] : '';
+            $assign   = ['t' => 'Assign', 'assign' => [
+                'action'  => 'assign_symbol',
+                'name'    => 'engine',
+                'fields'  => ['symbol' => $sym],
+                'options' => $options,
+                'empty'   => $on ? '-' : 'portfolio off',
+            ]];
+            $srows[] = [
+                'class' => $eligible ? '' : 'row-muted',
+                'cells' => [
+                    ['t' => (string) $rank, 'c' => 'num'],
+                    ['t' => $sym . ($ownerNow !== '' ? ' (' . $ownerNow . ')' : ''), 'c' => 'mono'],
+                    ['t' => Util::money(self::f($r['price'] ?? 0.0), 6), 'c' => 'num'],
+                    ['t' => self::pct(self::f($r['change_pct'] ?? 0.0), 2, true), 'c' => 'num lvl-' . self::pnlLevel(self::f($r['change_pct'] ?? 0.0))],
+                    ['t' => $atr === null ? '-' : self::pct($atr, 2), 'c' => 'num'],
+                    ['t' => self::pct(self::f($r['spread_pct'] ?? 0.0), 3), 'c' => 'num'],
+                    ['t' => self::volume(self::f($r['quote_vol'] ?? 0.0)), 'c' => 'num'],
+                    ['t' => Util::money(self::f($r['step_value'] ?? 0.0), 6), 'c' => 'num'],
+                    ['t' => Util::money(self::f($r['required_size'] ?? 0.0), 2), 'c' => 'num'],
+                    ['t' => Util::money(self::f($r['score'] ?? 0.0), 4), 'c' => 'num'],
+                    ['t' => ($eligible ? 'eligible' : 'gated') . ($gateText !== '' ? ': ' . $gateText : ''),
+                     'c' => 'tags ' . ($eligible ? 'lvl-ok' : 'lvl-warn')],
+                    $assign,
+                ],
+            ];
+            $payload[] = [
+                'rank' => $rank, 'symbol' => $sym, 'price' => self::f($r['price'] ?? 0.0),
+                'change_pct' => self::f($r['change_pct'] ?? 0.0), 'atr_pct' => $atr,
+                'spread_pct' => self::f($r['spread_pct'] ?? 0.0), 'quote_vol' => self::f($r['quote_vol'] ?? 0.0),
+                'step_value' => self::f($r['step_value'] ?? 0.0), 'required_size' => self::f($r['required_size'] ?? 0.0),
+                'score' => self::f($r['score'] ?? 0.0), 'eligible' => $eligible, 'gates' => array_values($gates),
+                'owner' => $ownerNow,
+            ];
+        }
+        $tables['scanner'] = ['rows' => $srows, 'cols' => 12,
+            'empty' => $scannerOn ? 'No scan yet - the tick refreshes the ranking every scanner_refresh_min minutes' : 'The scanner is off'];
+
+        $refreshMin = (int) self::f($cfg['scanner_refresh_min'] ?? 60, 60.0);
+        $text['pf_scanner_state']   = $scannerOn ? 'ON' : 'OFF';
+        $levels['pf_scanner_state'] = $scannerOn ? 'ok' : 'muted';
+        $text['pf_scanner_age']     = $age === null ? 'never scanned' : self::duration($age) . ' ago';
+        $levels['pf_scanner_age']   = ($age !== null && $refreshMin > 0 && $age <= $refreshMin * 120) ? 'ok' : 'muted';
+        $text['pf_scanner_refresh'] = $refreshMin . ' min (weight 80 per refresh)';
+        $text['pf_scanner_rows']    = count($srows) . ' of top ' . $topN;
+        $raw['scanner_rows']        = count($srows);
+        $raw['scanner_age_s']       = $age;
+
+        return [
+            'text'      => $text,
+            'levels'    => $levels,
+            'raw'       => $raw,
+            'tables'    => $tables,
+            'sparkline' => $spark,
+            'show'      => [
+                'portfolio'      => $on,
+                'portfolio_off'  => !$on,
+                'scanner'        => $scannerOn && ($on || $srows !== []),
+                'sleeve_actions' => $on && $cards !== [],
+            ],
+            'portfolio' => [
+                'enabled'      => $on,
+                'mode'         => $mode,
+                'reserve_pct'  => $reservePct,
+                'max_drawdown_pct' => $ddPct,
+                'budget'       => $totBudget,
+                'equity'       => $totEquity,
+                'realised'     => $totReal,
+                'unrealised'   => $totUnreal,
+                'sample'       => $totSample,
+                'sleeves'      => array_values($cards),
+                'best'         => $best === null ? null : [
+                    'engine' => $best['engine'], 'realised' => $best['realised'], 'sample' => (int) $best['sample'],
+                    'trades' => (int) $best['trades'], 'cycles' => (int) $best['cycles'],
+                    'significant' => (int) $best['sample'] >= self::PORTFOLIO_MIN_SAMPLE,
+                ],
+                'caveat'        => $text['pf_best_caveat'],
+                'unattributed'  => array_values($unattributed),
+                'sparkline'     => $spark,
+            ],
+            'scanner'   => [
+                'enabled'     => $scannerOn,
+                'age_s'       => $age,
+                'refresh_min' => $refreshMin,
+                'top_n'       => $topN,
+                'rows'        => $payload,
+            ],
+        ];
+    }
+
+    /** Compact 24 h volume: 12.34 M / 987.65 k / 12.34 - the raw number is useless in a column. */
+    public static function volume(float $v): string
+    {
+        $a = abs($v);
+        if ($a >= 1000000000.0) {
+            return Util::money($v / 1000000000.0, 2) . ' B';
+        }
+        if ($a >= 1000000.0) {
+            return Util::money($v / 1000000.0, 2) . ' M';
+        }
+        if ($a >= 1000.0) {
+            return Util::money($v / 1000.0, 2) . ' k';
+        }
+        return Util::money($v, 2);
+    }
+
 }

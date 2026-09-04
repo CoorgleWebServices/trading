@@ -50,7 +50,7 @@ set_exception_handler(static function (Throwable $e): void {
 });
 
 // dependency order; guarded so partial checkouts (tests, single-file tools) do not fatally error
-foreach (['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'Bot', 'Panel'] as $trader_lib) {
+foreach (['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'Sleeve', 'Scanner', 'Bot', 'Panel'] as $trader_lib) {
     $trader_file = __DIR__ . '/lib/' . $trader_lib . '.php';
     if (file_exists($trader_file)) {
         require_once $trader_file;

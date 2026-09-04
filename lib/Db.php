@@ -75,6 +75,16 @@ final class Db
             'gross_usdt' => 'f', 'fee_usdt' => 'f', 'pnl_usdt' => 'f',
             'opened_at' => 's', 'closed_at' => 's',
         ],
+        'sleeve_equity' => [
+            'id' => 'i', 'ts' => 's', 'mode' => 's', 'engine' => 's',
+            'equity' => 'f', 'budget' => 'f', 'realised' => 'f', 'unrealised' => 'f',
+            'inventory_value' => 'f', 'reserved' => 'f',
+        ],
+        'scanner' => [
+            'symbol' => 's', 'ts' => 's', 'price' => 'f', 'change_pct' => 'f', 'quote_vol' => 'f',
+            'spread_pct' => 'f', 'atr_pct' => 'f', 'step_value' => 'f', 'min_notional' => 'f',
+            'required_size' => 'f', 'score' => 'f', 'eligible' => 'i', 'gates' => 's',
+        ],
     ];
 
     /* ------------------------------------------------------------ lifecycle */
@@ -212,6 +222,18 @@ CREATE TABLE IF NOT EXISTS cycles (
   opened_at TEXT, closed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_closed ON cycles(closed_at);
+CREATE TABLE IF NOT EXISTS sleeve_equity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, mode TEXT NOT NULL, engine TEXT NOT NULL,
+  equity REAL NOT NULL, budget REAL NOT NULL, realised REAL NOT NULL, unrealised REAL NOT NULL,
+  inventory_value REAL NOT NULL, reserved REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sleeve_equity ON sleeve_equity(mode, engine, ts);
+CREATE TABLE IF NOT EXISTS scanner (
+  symbol TEXT PRIMARY KEY, ts TEXT NOT NULL, price REAL, change_pct REAL, quote_vol REAL,
+  spread_pct REAL, atr_pct REAL, step_value REAL, min_notional REAL, required_size REAL,
+  score REAL, eligible INTEGER NOT NULL DEFAULT 0, gates TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scanner_score ON scanner(score);
 SQL;
         $this->pdo->exec($sql);
     }
@@ -710,6 +732,7 @@ SQL;
         $cutoff = Util::nowIso(time() - max(1, $days) * 86400);
         $this->pdo->prepare('DELETE FROM signals WHERE created_at < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM equity WHERE ts < ?')->execute([$cutoff]);
+        $this->pdo->prepare('DELETE FROM sleeve_equity WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM logs WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM login_attempts WHERE last_at IS NOT NULL AND last_at < ?')->execute([$cutoff]);
     }
@@ -973,6 +996,147 @@ SQL;
             'inventory_qty'  => (float) ($inv['qty'] ?? 0),
             'inventory_cost' => (float) ($inv['cost'] ?? 0),
         ];
+    }
+
+    /* ------------------------------------------------- sleeves and scanner */
+    /*
+     * Portfolio mode (docs/DESIGN-PORTFOLIO.md §4).
+     *
+     *   sleeve_equity  one equity sample per sleeve per tick, for the overlaid
+     *                  per-sleeve sparkline and the "best method so far" line
+     *   scanner        the latest volatility ranking, replaced wholesale by
+     *                  Scanner::refresh(); rejected rows are KEPT with their
+     *                  failed `gates` so the panel can explain the rejection
+     *
+     * Both tables are additive: with `portfolio_enabled = false` nothing ever
+     * writes to them and every other query behaves exactly as before.
+     */
+
+    /**
+     * Append one equity sample for one sleeve. `$row` may be a `Sleeve::state()`
+     * array with `mode` added: only the sleeve_equity columns are kept, `ts`
+     * defaults to now and any missing / non-finite number is stored as 0.
+     *
+     * @param array $row mode, engine, equity, budget, realised, unrealised,
+     *                   inventory_value, reserved (plus an optional ts)
+     */
+    public function insertSleeveEquity(array $row): int
+    {
+        $row['ts']     = (isset($row['ts']) && $row['ts'] !== '') ? (string) $row['ts'] : Util::nowIso();
+        $row['mode']   = isset($row['mode']) ? (string) $row['mode'] : '';
+        $row['engine'] = isset($row['engine']) ? (string) $row['engine'] : '';
+        foreach (['equity', 'budget', 'realised', 'unrealised', 'inventory_value', 'reserved'] as $col) {
+            $v = (isset($row[$col]) && is_numeric($row[$col])) ? (float) $row[$col] : 0.0;
+            $row[$col] = is_finite($v) ? $v : 0.0;
+        }
+        return $this->insertRow('sleeve_equity', $row);
+    }
+
+    /**
+     * Equity series for one sleeve, oldest → newest, at most $limit rows (the
+     * most recent ones). '' / null $engine means every sleeve, and the optional
+     * trailing $mode scopes the query the same way the analytics methods do.
+     */
+    public function sleeveEquitySeries(string $engine, int $limit = 288, ?string $mode = null): array
+    {
+        $params = [];
+        $sql    = 'SELECT * FROM sleeve_equity WHERE 1 = 1'
+                . self::engineClause($engine, $params)
+                . self::modeClause($mode, $params)
+                . ' ORDER BY id DESC LIMIT ?';
+        $params[] = max(1, $limit);
+        return array_reverse($this->fetchAll('sleeve_equity', $sql, $params));
+    }
+
+    /**
+     * Replace the whole scanner table with $rows (one row per symbol; the last
+     * row wins on a duplicate symbol). `gates` may be given as an array and is
+     * stored as JSON; `eligible` is coerced to 0/1; `ts` defaults to now.
+     * Rows without a symbol are ignored.
+     *
+     * @return int number of rows stored
+     */
+    public function replaceScanner(array $rows): int
+    {
+        $now   = Util::nowIso();
+        $clean = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $symbol = strtoupper(trim((string) ($row['symbol'] ?? '')));
+            if ($symbol === '') {
+                continue;
+            }
+            $row['symbol']   = $symbol;
+            $row['ts']       = (isset($row['ts']) && $row['ts'] !== '') ? (string) $row['ts'] : $now;
+            $row['eligible'] = empty($row['eligible']) ? 0 : 1;
+            if (isset($row['gates'])) {
+                if (is_array($row['gates'])) {
+                    $json = json_encode(array_values($row['gates']), JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+                    $row['gates'] = $json === false ? '[]' : $json;
+                } else {
+                    $row['gates'] = (string) $row['gates'];
+                }
+            }
+            $clean[$symbol] = $row;
+        }
+
+        $owns = !$this->pdo->inTransaction();
+        if ($owns) {
+            $this->pdo->beginTransaction();
+        }
+        try {
+            $this->pdo->exec('DELETE FROM scanner');
+            foreach ($clean as $row) {
+                $this->insertRow('scanner', $row);
+            }
+            if ($owns) {
+                $this->pdo->commit();
+            }
+        } catch (Throwable $e) {
+            if ($owns && $this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+        return count($clean);
+    }
+
+    /**
+     * Scanner rows, at most $limit, in the same total order as
+     * Scanner::compareRows: eligible first, then score (NULL scores last),
+     * then 24 h quote volume, then symbol. Ordering by score alone would let a
+     * gated row (score forced to 0) outrank an eligible one that also scores 0.
+     * `gates` stays the stored JSON string; `gates_list` carries it decoded.
+     */
+    public function scannerRows(int $limit = 10, bool $eligibleOnly = false): array
+    {
+        $sql = 'SELECT * FROM scanner WHERE 1 = 1';
+        if ($eligibleOnly) {
+            $sql .= ' AND eligible = 1';
+        }
+        $sql .= ' ORDER BY eligible DESC, score DESC, quote_vol DESC, symbol ASC LIMIT ?';
+        $rows = $this->fetchAll('scanner', $sql, [max(1, $limit)]);
+        foreach ($rows as $i => $r) {
+            $rows[$i]['gates_list'] = self::decodeReasons((string) ($r['gates'] ?? ''));
+        }
+        return $rows;
+    }
+
+    /** Age in seconds of the newest scanner row, or null when the table is empty. */
+    public function scannerAge(): ?int
+    {
+        $ts = $this->scalar('SELECT MAX(ts) FROM scanner');
+        if ($ts === null || (string) $ts === '') {
+            return null;
+        }
+        $t = Util::isoToTs((string) $ts);
+        if ($t === null) {
+            return null;
+        }
+        $age = time() - $t;
+        return $age < 0 ? 0 : $age;
     }
 
     /* ---------------------------------------------------------------- login */

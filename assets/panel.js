@@ -96,6 +96,57 @@
     return form;
   }
 
+  /* Per-row "Assign to…" control: the same markup Panel::assignControl() renders server-side.
+   * A select plus a submit button, never an inline onchange handler (CSP). */
+  function buildAssignForm(spec, label) {
+    var options = Array.isArray(spec.options) ? spec.options : [];
+    var fields = spec.fields && typeof spec.fields === 'object' ? spec.fields : {};
+    var form, select, opt, button, i, k, v, t, span;
+    if (!spec.action || options.length === 0) {
+      span = document.createElement('span');
+      span.className = 'muted';
+      span.textContent = spec.empty ? String(spec.empty) : '-';
+      return span;
+    }
+    form = document.createElement('form');
+    form.setAttribute('method', 'post');
+    form.setAttribute('action', 'index.php');
+    form.className = 'inline assign';
+    form.appendChild(hiddenInput('csrf', csrfToken()));
+    form.appendChild(hiddenInput('action', spec.action));
+    for (k in fields) {
+      if (Object.prototype.hasOwnProperty.call(fields, k)) {
+        form.appendChild(hiddenInput(k, fields[k]));
+      }
+    }
+    select = document.createElement('select');
+    select.name = spec.name ? String(spec.name) : 'engine';
+    select.className = 'assign-select';
+    select.required = true;
+    opt = document.createElement('option');
+    opt.value = '';
+    opt.selected = true;
+    opt.disabled = true;
+    opt.textContent = spec.placeholder ? String(spec.placeholder) : 'Assign to…';
+    select.appendChild(opt);
+    for (i = 0; i < options.length; i++) {
+      v = options[i] && typeof options[i] === 'object' ? options[i].v : options[i];
+      t = options[i] && typeof options[i] === 'object' && options[i].t ? options[i].t : v;
+      if (v === null || v === undefined || String(v) === '') { continue; }
+      opt = document.createElement('option');
+      opt.value = String(v);
+      opt.textContent = String(t);
+      select.appendChild(opt);
+    }
+    form.appendChild(select);
+    button = document.createElement('button');
+    button.type = 'submit';
+    button.className = 'btn btn-mini';
+    button.textContent = label || 'Assign';
+    form.appendChild(button);
+    return form;
+  }
+
   function buildCell(cell) {
     var td = document.createElement('td');
     var text, cls, svg, rect, wrap, span, pill;
@@ -139,6 +190,8 @@
       td.appendChild(pill);
     } else if (cell.btn && typeof cell.btn === 'object') {
       td.appendChild(buildActionForm(cell.btn, text));
+    } else if (cell.assign && typeof cell.assign === 'object') {
+      td.appendChild(buildAssignForm(cell.assign, text));
     } else {
       td.textContent = text;
     }
@@ -147,7 +200,7 @@
 
   function applyTables(tables) {
     var bodies = document.querySelectorAll('tbody[data-table]');
-    var i, j, k, name, table, rows, tr, td, cols;
+    var i, j, k, name, table, rows, tr, td, cols, cells, rowClass;
     if (!tables) { return; }
     for (i = 0; i < bodies.length; i++) {
       name = bodies[i].getAttribute('data-table');
@@ -171,10 +224,19 @@
         continue;
       }
       for (j = 0; j < rows.length; j++) {
-        if (!Array.isArray(rows[j])) { continue; }
+        cells = rows[j];
+        rowClass = '';
+        if (cells && !Array.isArray(cells) && typeof cells === 'object' && Array.isArray(cells.cells)) {
+          rowClass = cells['class'] ? String(cells['class']) : '';
+          cells = cells.cells;
+        }
+        if (!Array.isArray(cells)) { continue; }
         tr = document.createElement('tr');
-        for (k = 0; k < rows[j].length; k++) {
-          tr.appendChild(buildCell(rows[j][k]));
+        if (rowClass) {
+          tr.className = rowClass;
+        }
+        for (k = 0; k < cells.length; k++) {
+          tr.appendChild(buildCell(cells[k]));
         }
         bodies[i].appendChild(tr);
       }
@@ -190,6 +252,20 @@
     }
     if (area && typeof spark.area === 'string') {
       area.setAttribute('points', spark.area);
+    }
+  }
+
+  /* Overlaid per-sleeve sparkline: one polyline per series, matched by data-sparkline-series. */
+  function applyMultiSparkline(spark) {
+    var lines = document.querySelectorAll('[data-sparkline-series]');
+    var i, key, series;
+    if (!spark || !spark.series) { return; }
+    series = spark.series;
+    for (i = 0; i < lines.length; i++) {
+      key = lines[i].getAttribute('data-sparkline-series');
+      if (Object.prototype.hasOwnProperty.call(series, key) && series[key] && typeof series[key].points === 'string') {
+        lines[i].setAttribute('points', series[key].points);
+      }
     }
   }
 
@@ -210,6 +286,7 @@
     applyShow(s.show);
     applyTables(s.tables);
     applySparkline(s.sparkline);
+    applyMultiSparkline(s.sleeve_sparkline);
     setRefreshInfo('updated ' + new Date().toLocaleTimeString() + ' · auto-refresh every 20 s', '');
   }
 
@@ -328,9 +405,33 @@
     apply();
   }
 
+  /* Settings → Portfolio: the per-sleeve fields follow the portfolio_enabled checkbox. Same
+   * rule as the engine groups - visibility is the `is-hidden` CLASS from panel.css, never an
+   * inline style attribute, and never an inline handler. */
+  function installPortfolioToggle() {
+    var box = document.querySelector('input[type="checkbox"][name="portfolio_enabled"]');
+    var fields = document.querySelectorAll('[data-portfolio-fields]');
+    var i;
+    if (!box || fields.length === 0) {
+      return;
+    }
+    function apply() {
+      for (i = 0; i < fields.length; i++) {
+        if (box.checked) {
+          fields[i].classList.remove('is-hidden');
+        } else {
+          fields[i].classList.add('is-hidden');
+        }
+      }
+    }
+    box.addEventListener('change', apply);
+    apply();
+  }
+
   function init() {
     installConfirms();
     installEngineGroups();
+    installPortfolioToggle();
     startAutoRefresh();
   }
 

@@ -372,8 +372,14 @@ final class EngineGrid
             $sold = $this->liquidate($bid);
         }
 
-        $this->db->setState('paused_until', Util::nowIso(time() + self::PAUSE_SECONDS));
-        $this->db->setState('pause_reason', self::PAUSE_REASON);
+        // `paused_until`/`pause_reason` are the GLOBAL keys Risk::entryBlockReason() reads for
+        // every engine, so in portfolio mode writing them here would stop the signal and pmm
+        // sleeves as well - the opposite of the isolation of DESIGN-PORTFOLIO.md §6.4. The
+        // sleeve-local `grid_paused_reason` below already stops this grid until a re-anchor.
+        if (!$this->bool('portfolio_enabled', false)) {
+            $this->db->setState('paused_until', Util::nowIso(time() + self::PAUSE_SECONDS));
+            $this->db->setState('pause_reason', self::PAUSE_REASON);
+        }
         $this->db->setState('grid_paused_reason', self::PAUSE_REASON);
 
         $side = $mid > $anchor ? 'above' : 'below';
