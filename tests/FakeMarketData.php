@@ -1220,3 +1220,390 @@ final class FakePaperExchange implements ExchangeInterface
         return ($s === '' || $s === '-0') ? '0' : $s;
     }
 }
+
+/**
+ * Labelled observation fixtures for the learning groups (docs/DESIGN-LEARNING.md §8).
+ *
+ * `set()` generates a realistic observation set (the `observations` rows of
+ * DESIGN-LEARNING.md §2, ready for `Db::insertObservation()`) with a KNOWN embedded
+ * relationship, so a test can assert both halves of the claim:
+ *
+ *   * `Learn::insights()` / `Learn::adjustments()` FIND the relationship that was put
+ *     there on purpose - by default "low RSI genuinely wins more": every row whose
+ *     `rsi` is at or below 30 wins at `win_rate_good`, every other row at
+ *     `win_rate_bad`, and nothing else in the row correlates with the outcome;
+ *   * and they REJECT a feature that carries none. `spread_pct`, `hour_utc` and the
+ *     neutral `rsi_up` alternate on the row index, which is coprime with the win
+ *     pattern, so each of their buckets holds exactly the same win rate and average
+ *     PnL as every other - the honest answer there is "no conclusion", and a test
+ *     that sees `confident => true` for one of them has caught a real bug.
+ *
+ * Everything is deterministic: no clock, no randomness, no shuffle. Wins are spread
+ * evenly across the indices by the Bresenham rule
+ * `intdiv(($i+1)*$wins, $n) > intdiv($i*$wins, $n)`, which puts the win/loss pattern on
+ * a period of `n / gcd(n, wins)` - 5 for the default 80 % / 20 % rates - while the
+ * decorative features cycle on 2, 7 and 24. The two never line up, so a feature only
+ * separates the outcomes when this class was asked to make it separate them.
+ *
+ * `measure()` recomputes the outcome statistics of a slice straight from the rows,
+ * with no help from `Learn`, so a test can pin the fixture down before trusting
+ * anything the learner says about it.
+ */
+final class FakeObservations
+{
+    /**
+     * The score components of DESIGN-LEARNING.md §4, the captured feature that stands
+     * for each one (DESIGN-LEARNING.md §2 plus the two 1/0 flags Bot captures for the
+     * components no continuous feature covers), and the value that makes the
+     * component's condition hold ('good') or fail ('bad').
+     *
+     * Naming a component in `carriers` is what embeds a relationship for it: its
+     * condition then holds on exactly the winning-biased side of the set.
+     */
+    const CARRIERS = [
+        'rsi'      => ['feature' => 'rsi',       'good' => 26.0, 'bad' => 55.0, 'spread' => 0.9],
+        'bb'       => ['feature' => 'bb_pos',    'good' => 0.0,  'bad' => 0.5,  'spread' => 0.0],
+        'vol'      => ['feature' => 'vol_ratio', 'good' => 1.6,  'bad' => 0.9,  'spread' => 0.0],
+        'rsi_up'   => ['feature' => 'rsi_up',    'good' => 1.0,  'bad' => 0.0,  'spread' => 0.0],
+        'reversal' => ['feature' => 'reversal',  'good' => 1.0,  'bad' => 0.0,  'spread' => 0.0],
+        'trend'    => ['feature' => 'trend_up',  'good' => 1.0,  'bad' => 0.0,  'spread' => 0.0],
+    ];
+
+    /**
+     * The neutral feature vector. `rsi` 45 fires no component condition, `bb_pos` 0.5 is
+     * mid-band, `vol_ratio` 1.0 is under the 1.2 the `vol` component wants, `trend_up` 1
+     * is the same for every row (so the `trend` side is never split), and `reversal` 0
+     * never fires. Anything not listed here is derived from the row index.
+     */
+    const NEUTRAL = [
+        'rsi' => 45.0, 'atr_pct' => 0.90, 'atr1h_pct' => 1.20, 'bb_pos' => 0.50,
+        'vol_ratio' => 1.00, 'trend_up' => 1.0, 'reversal' => 0.0, 'step_value_pct' => 0.10,
+    ];
+
+    /** The two spread buckets the decorative `spread_pct` alternates between. */
+    const SPREADS = [0.005, 0.025];
+
+    /**
+     * A labelled observation set.
+     *
+     * @param array $opts
+     *   n              int    rows per side (default 120); n_good / n_bad override one side
+     *   carriers       array  component names from CARRIERS whose condition holds on the
+     *                         good side only (default ['rsi'] - "low RSI genuinely wins more")
+     *   win_rate_good  float  win rate of the good side (default 0.80)
+     *   win_rate_bad   float  win rate of the bad side  (default 0.20)
+     *   pnl_win        float  PnL of a win  (default +0.30 USDT)
+     *   pnl_loss       float  PnL of a loss (default -0.20 USDT)
+     *   mode/engine/symbol    scoping columns (default paper / signal / SOLUSDT)
+     *   end            string ISO instant every row is resolved strictly BEFORE
+     *                         (default one hour ago), oldest row first
+     *   spacing_sec    int    seconds between consecutive resolutions (default 60)
+     *   ts_offset_sec  int    ts − resolved_at, i.e. how long the trade was held in the
+     *                         record (default −1800; make it more negative to place `ts`
+     *                         before a recompute instant while `resolved_at` is after it)
+     *   hold_minutes   float  held_minutes column (default 30)
+     *   skipped        int    extra `skipped` control rows resolved to `not_taken`
+     *   flat           int    extra RESOLVED rows per side whose outcome is `flat`: they
+     *                         carry the side's conditions and a zero PnL, so they swell `n`
+     *                         without adding a single win or loss - the shape that proves
+     *                         the sample floor is counted on DECIDED outcomes, not on rows
+     *   open           int    extra `entered` rows per side that have NOT resolved yet (no
+     *                         outcome, no resolved_at): never evidence, but reported as a
+     *                         bucket's `open_now` censoring
+     *   score/threshold/entry_quote  the remaining columns
+     * @return array rows for Db::insertObservation(), oldest first
+     */
+    public static function set(array $opts = []): array
+    {
+        $o = array_merge([
+            'n'             => 120,
+            'n_good'        => null,
+            'n_bad'         => null,
+            'carriers'      => ['rsi'],
+            'win_rate_good' => 0.80,
+            'win_rate_bad'  => 0.20,
+            'pnl_win'       => 0.30,
+            'pnl_loss'      => -0.20,
+            'mode'          => 'paper',
+            'engine'        => 'signal',
+            'symbol'        => 'SOLUSDT',
+            'end'           => null,
+            'spacing_sec'   => 60,
+            'ts_offset_sec' => -1800,
+            'hold_minutes'  => 30.0,
+            'skipped'       => 0,
+            'flat'          => 0,
+            'open'          => 0,
+            'score'         => 70,
+            'threshold'     => 60,
+            'entry_quote'   => 6.5,
+        ], $opts);
+
+        $nGood = $o['n_good'] === null ? (int) $o['n'] : (int) $o['n_good'];
+        $nBad  = $o['n_bad'] === null ? (int) $o['n'] : (int) $o['n_bad'];
+        $nGood = $nGood > 0 ? $nGood : 0;
+        $nBad  = $nBad > 0 ? $nBad : 0;
+
+        $carriers = [];
+        foreach ((array) $o['carriers'] as $c) {
+            $c = (string) $c;
+            if (isset(self::CARRIERS[$c])) {
+                $carriers[] = $c;
+            }
+        }
+
+        $good = self::side(true, $nGood, (float) $o['win_rate_good'], $carriers, $o);
+        $bad  = self::side(false, $nBad, (float) $o['win_rate_bad'], $carriers, $o);
+
+        // interleave the two sides so neither owns a contiguous block of the timeline
+        $rows = [];
+        $max  = $nGood > $nBad ? $nGood : $nBad;
+        for ($j = 0; $j < $max; $j++) {
+            if (isset($good[$j])) {
+                $rows[] = $good[$j];
+            }
+            if (isset($bad[$j])) {
+                $rows[] = $bad[$j];
+            }
+        }
+        // resolved-but-undecided rows: they are evidence rows (TRADED_OUTCOMES holds
+        // 'flat') and so they count in `n`, but they are never a win or a loss
+        $nFlat = (int) $o['flat'] > 0 ? (int) $o['flat'] : 0;
+        for ($j = 0; $j < $nFlat; $j++) {
+            $rows[] = self::undecidedRow($j, true, $carriers, $o, 'flat');
+            $rows[] = self::undecidedRow($j, false, $carriers, $o, 'flat');
+        }
+        // still-open entries: no outcome at all, so they are excluded from every figure
+        // and only ever surface as a bucket's `open_now`
+        $nOpen = (int) $o['open'] > 0 ? (int) $o['open'] : 0;
+        for ($j = 0; $j < $nOpen; $j++) {
+            $rows[] = self::undecidedRow($j, true, $carriers, $o, '');
+            $rows[] = self::undecidedRow($j, false, $carriers, $o, '');
+        }
+        for ($j = 0; $j < (int) $o['skipped']; $j++) {
+            $rows[] = self::skippedRow($j, $o);
+        }
+
+        return self::stamp($rows, $o);
+    }
+
+    /** Insert a generated set through Db::insertObservation(); returns the number of rows. */
+    public static function seed(Db $db, array $rows): int
+    {
+        $n = 0;
+        foreach ($rows as $row) {
+            if (is_array($row) && $db->insertObservation($row) > 0) {
+                $n++;
+            }
+        }
+        return $n;
+    }
+
+    /**
+     * Outcome statistics of the rows whose $feature satisfies $op $value, computed here
+     * and NOT by Learn, so a test can pin the fixture down independently.
+     *
+     * @param string $op 'lte' | 'lt' | 'gte' | 'gt' | 'eq' | 'any'
+     * @return array{n:int,wins:int,losses:int,win_rate:float,avg_pnl:float,total_pnl:float}
+     */
+    public static function measure(array $rows, string $feature = '', string $op = 'any', float $value = 0.0): array
+    {
+        $n = 0;
+        $wins = 0;
+        $losses = 0;
+        $sum = 0.0;
+        foreach ($rows as $row) {
+            if (!is_array($row) || (string) ($row['decision'] ?? '') !== 'entered') {
+                continue;
+            }
+            if ($feature !== '') {
+                $f = isset($row['features']) && is_array($row['features']) ? $row['features'] : [];
+                if (!array_key_exists($feature, $f) || !is_numeric($f[$feature])) {
+                    continue;
+                }
+                if (!self::holds((float) $f[$feature], $op, $value)) {
+                    continue;
+                }
+            }
+            $n++;
+            $outcome = (string) ($row['outcome'] ?? '');
+            if ($outcome === 'win') {
+                $wins++;
+            } elseif ($outcome === 'loss') {
+                $losses++;
+            }
+            if (isset($row['pnl_usdt']) && is_numeric($row['pnl_usdt'])) {
+                $sum += (float) $row['pnl_usdt'];
+            }
+        }
+        $decided = $wins + $losses;
+        return [
+            'n'         => $n,
+            'wins'      => $wins,
+            'losses'    => $losses,
+            'win_rate'  => $decided > 0 ? $wins / $decided * 100.0 : 0.0,
+            'avg_pnl'   => $n > 0 ? $sum / $n : 0.0,
+            'total_pnl' => $sum,
+        ];
+    }
+
+    /** The distinct values one feature takes across a generated set, sorted ascending. */
+    public static function values(array $rows, string $feature): array
+    {
+        $seen = [];
+        foreach ($rows as $row) {
+            $f = (is_array($row) && isset($row['features']) && is_array($row['features'])) ? $row['features'] : [];
+            if (array_key_exists($feature, $f) && is_numeric($f[$feature])) {
+                $seen[(string) (float) $f[$feature]] = (float) $f[$feature];
+            }
+        }
+        $out = array_values($seen);
+        sort($out);
+        return $out;
+    }
+
+    /* ------------------------------------------------------------ internals */
+
+    /** One side of the set: $good true = the side every carrier condition holds on. */
+    private static function side(bool $good, int $n, float $winRate, array $carriers, array $o): array
+    {
+        if ($n <= 0) {
+            return [];
+        }
+        $wins = (int) round(Util::clamp($winRate, 0.0, 1.0) * $n);
+        $rows = [];
+        for ($i = 0; $i < $n; $i++) {
+            // Bresenham: the wins are spread evenly over the indices instead of sitting in
+            // one block, so no decorative feature can accidentally correlate with them
+            $isWin = intdiv(($i + 1) * $wins, $n) > intdiv($i * $wins, $n);
+            $rows[] = self::row($i, $good, $isWin, $carriers, $o);
+        }
+        return $rows;
+    }
+
+    /** One `entered` observation. */
+    private static function row(int $i, bool $good, bool $isWin, array $carriers, array $o): array
+    {
+        $f = self::NEUTRAL;
+        $f['spread_pct'] = self::SPREADS[$i % count(self::SPREADS)];
+        $f['hour_utc']   = (float) ($i % 24);
+        $f['dow']        = (float) ($i % 7);
+        $f['rsi_up']     = (float) ($i % 2);
+        foreach ($carriers as $c) {
+            $spec = self::CARRIERS[$c];
+            $base = $good ? (float) $spec['good'] : (float) $spec['bad'];
+            $f[(string) $spec['feature']] = $base + (float) $spec['spread'] * (float) ($i % 4);
+        }
+        $pnl   = $isWin ? (float) $o['pnl_win'] : (float) $o['pnl_loss'];
+        $quote = (float) $o['entry_quote'];
+        return [
+            'mode'         => (string) $o['mode'],
+            'engine'       => (string) $o['engine'],
+            'symbol'       => (string) $o['symbol'],
+            'decision'     => 'entered',
+            'skip_reason'  => null,
+            'score'        => (int) $o['score'],
+            'threshold'    => (int) $o['threshold'],
+            'features'     => $f,
+            // deliberately no position_id: these rows stand for closed trades whose
+            // positions are not part of the fixture, and a dangling id would invite
+            // Bot's resolution sweep to look for a row that never existed
+            'position_id'  => null,
+            'outcome'      => $isWin ? 'win' : 'loss',
+            'pnl_usdt'     => $pnl,
+            'pnl_pct'      => $quote > 0.0 ? $pnl / $quote * 100.0 : 0.0,
+            'exit_reason'  => $isWin ? 'take_profit' : 'stop_loss',
+            'held_minutes' => (float) $o['hold_minutes'],
+        ];
+    }
+
+    /**
+     * One `entered` row that is NOT a win and NOT a loss: `flat` when $outcome is 'flat'
+     * (resolved, zero PnL) and still open when $outcome is '' (no outcome column at all,
+     * which is what makes stamp() leave `resolved_at` off it).
+     */
+    private static function undecidedRow(int $i, bool $good, array $carriers, array $o, string $outcome): array
+    {
+        $row = self::row($i, $good, false, $carriers, $o);
+        $row['pnl_usdt'] = 0.0;
+        $row['pnl_pct']  = 0.0;
+        if ($outcome === 'flat') {
+            $row['outcome']     = 'flat';
+            $row['exit_reason'] = 'max_hold';
+            return $row;
+        }
+        unset($row['outcome'], $row['pnl_usdt'], $row['pnl_pct'], $row['exit_reason'], $row['held_minutes']);
+        return $row;
+    }
+
+    /** One `skipped` control row: the control group of DESIGN-LEARNING.md §2, never a win or a loss. */
+    private static function skippedRow(int $i, array $o): array
+    {
+        $f = self::NEUTRAL;
+        $f['spread_pct'] = self::SPREADS[$i % count(self::SPREADS)];
+        $f['hour_utc']   = (float) ($i % 24);
+        $f['dow']        = (float) ($i % 7);
+        $f['rsi_up']     = (float) ($i % 2);
+        $f['rsi']        = 26.0;         // the control group saw the winning condition and still did not trade
+        return [
+            'mode'        => (string) $o['mode'],
+            'engine'      => (string) $o['engine'],
+            'symbol'      => (string) $o['symbol'],
+            'decision'    => 'skipped',
+            'skip_reason' => 'below_threshold',
+            'score'       => 10,
+            'threshold'   => (int) $o['threshold'],
+            'features'    => $f,
+            'outcome'     => 'not_taken',
+        ];
+    }
+
+    /**
+     * Stamp `ts` and `resolved_at` on the rows: the last row resolves one `spacing_sec`
+     * before `end`, every earlier row one step before that, and `ts` sits
+     * `ts_offset_sec` from its own resolution.
+     */
+    private static function stamp(array $rows, array $o): array
+    {
+        $endTs = null;
+        if ($o['end'] !== null && (string) $o['end'] !== '') {
+            $endTs = Util::isoToTs((string) $o['end']);
+        }
+        if ($endTs === null) {
+            $endTs = time() - 3600;
+        }
+        $spacing = (int) $o['spacing_sec'] > 0 ? (int) $o['spacing_sec'] : 60;
+        $offset  = (int) $o['ts_offset_sec'];
+        $m       = count($rows);
+        $out     = [];
+        foreach (array_values($rows) as $k => $row) {
+            $resolved = $endTs - ($m - $k) * $spacing;
+            $row['ts'] = Util::nowIso($resolved + $offset);
+            if (array_key_exists('outcome', $row) && $row['outcome'] !== null) {
+                $row['resolved_at'] = Util::nowIso($resolved);
+            }
+            $out[] = $row;
+        }
+        return $out;
+    }
+
+    private static function holds(float $v, string $op, float $value): bool
+    {
+        if ($op === 'lte') {
+            return $v <= $value;
+        }
+        if ($op === 'lt') {
+            return $v < $value;
+        }
+        if ($op === 'gte') {
+            return $v >= $value;
+        }
+        if ($op === 'gt') {
+            return $v > $value;
+        }
+        if ($op === 'eq') {
+            return abs($v - $value) < 1e-12;
+        }
+        return true;
+    }
+}

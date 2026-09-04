@@ -108,6 +108,19 @@ function trader_config_defaults(): array
             'grid'   => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['DOGEUSDT']],
             'pmm'    => ['enabled' => false, 'budget_usdt' => 1000.0, 'symbols' => ['XRPUSDT']],
         ],
+
+        // --- learning (docs/DESIGN-LEARNING.md §5) plus the §7 BNB warning threshold. Same
+        //     reason as the engine and portfolio keys: a config.json written before learning
+        //     existed still comes back from trader_config() complete and correctly typed.
+        //     `learning_enabled` only captures observations and computes insights; nothing is
+        //     fed back into scoring until `learning_apply` is switched on, and even then
+        //     lib/Learn.php can write only the score weights and the effective threshold.
+        'learning_enabled'            => true,
+        'learning_apply'              => false,
+        'learn_min_samples'           => 60,
+        'learn_recompute_hours'       => 168,
+        'learn_window_days'           => 90,
+        'bnb_min_balance'             => 1.0,
     ];
 }
 

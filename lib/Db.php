@@ -85,6 +85,14 @@ final class Db
             'spread_pct' => 'f', 'atr_pct' => 'f', 'step_value' => 'f', 'min_notional' => 'f',
             'required_size' => 'f', 'score' => 'f', 'eligible' => 'i', 'gates' => 's',
         ],
+        'observations' => [
+            'id' => 'i', 'ts' => 's', 'mode' => 's', 'engine' => 's', 'symbol' => 's',
+            'decision' => 's', 'skip_reason' => 's',
+            'score' => 'i', 'threshold' => 'i', 'features' => 's',
+            'position_id' => 'i', 'cycle_id' => 'i',
+            'outcome' => 's', 'pnl_usdt' => 'f', 'pnl_pct' => 'f',
+            'exit_reason' => 's', 'held_minutes' => 'f', 'resolved_at' => 's',
+        ],
     ];
 
     /* ------------------------------------------------------------ lifecycle */
@@ -209,12 +217,14 @@ CREATE TABLE IF NOT EXISTS engine_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_engine_orders_live ON engine_orders(status, symbol);
 CREATE INDEX IF NOT EXISTS idx_engine_orders_created ON engine_orders(created_at);
+CREATE INDEX IF NOT EXISTS idx_engine_orders_scan ON engine_orders(mode, engine, symbol, side);
 CREATE TABLE IF NOT EXISTS lots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, engine TEXT NOT NULL, symbol TEXT NOT NULL,
   qty REAL NOT NULL, remaining REAL NOT NULL, price REAL NOT NULL, fee_usdt REAL NOT NULL DEFAULT 0,
   level INTEGER, client_id TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lots_open ON lots(symbol, remaining);
+CREATE INDEX IF NOT EXISTS idx_lots_scan ON lots(mode, engine, symbol);
 CREATE TABLE IF NOT EXISTS cycles (
   id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, engine TEXT NOT NULL, symbol TEXT NOT NULL,
   level INTEGER, qty REAL NOT NULL, buy_price REAL NOT NULL, sell_price REAL NOT NULL,
@@ -234,6 +244,22 @@ CREATE TABLE IF NOT EXISTS scanner (
   score REAL, eligible INTEGER NOT NULL DEFAULT 0, gates TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scanner_score ON scanner(score);
+CREATE TABLE IF NOT EXISTS observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL, mode TEXT NOT NULL, engine TEXT NOT NULL, symbol TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  skip_reason TEXT,
+  score INTEGER, threshold INTEGER,
+  features TEXT NOT NULL,
+  position_id INTEGER, cycle_id INTEGER,
+  outcome TEXT,
+  pnl_usdt REAL, pnl_pct REAL, exit_reason TEXT, held_minutes REAL,
+  resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_obs_open ON observations(outcome, mode);
+CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(mode, ts);
+CREATE INDEX IF NOT EXISTS idx_obs_position ON observations(position_id);
+CREATE INDEX IF NOT EXISTS idx_obs_cycle ON observations(cycle_id);
 SQL;
         $this->pdo->exec($sql);
     }
@@ -726,15 +752,35 @@ SQL;
         ];
     }
 
-    /** Keep signals/equity/logs for $days days. */
-    public function prune(int $days = 30): void
+    /**
+     * Keep signals/equity/logs for $days days, and observations for
+     * $observationDays (much longer: the learning window is 90 days by default
+     * and the evidence is worthless once it has been deleted).
+     *
+     * `engine_orders` is pruned on the same $days cutoff, but only for rows that
+     * are SPENT: terminal status, nothing ever filled on them, and no lot points
+     * back at them. A pmm install writes a couple of those a minute and they are
+     * pure noise once resolved - while a row that filled is the provenance of a
+     * lot and a cycle, so it is never deleted here. Nothing live is touched:
+     * ENGINE_LIVE_STATUSES rows may still be resting on the exchange.
+     */
+    public function prune(int $days = 30, int $observationDays = 365): void
     {
         $cutoff = Util::nowIso(time() - max(1, $days) * 86400);
+        $obsCutoff = Util::nowIso(time() - max(max(1, $days), $observationDays) * 86400);
         $this->pdo->prepare('DELETE FROM signals WHERE created_at < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM equity WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM sleeve_equity WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM logs WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM login_attempts WHERE last_at IS NOT NULL AND last_at < ?')->execute([$cutoff]);
+        $this->pdo->prepare('DELETE FROM observations WHERE ts < ?')->execute([$obsCutoff]);
+
+        $in     = implode(', ', array_fill(0, count(self::ENGINE_LIVE_STATUSES), '?'));
+        $params = array_merge([$cutoff], self::ENGINE_LIVE_STATUSES);
+        $this->pdo->prepare(
+            'DELETE FROM engine_orders WHERE created_at < ? AND filled_qty <= 0 AND status NOT IN (' . $in . ')'
+            . ' AND client_id NOT IN (SELECT client_id FROM lots WHERE client_id IS NOT NULL)'
+        )->execute($params);
     }
 
     /* --------------------------------------------------------------- engines */
@@ -939,6 +985,20 @@ SQL;
     }
 
     /**
+     * Cycles booked after $afterId, oldest first: the forward page the observation sweep
+     * walks, so a burst larger than one page is carried over instead of jumped past.
+     */
+    public function cyclesSince(int $afterId, ?string $mode = null, int $limit = 200): array
+    {
+        $params = [max(0, $afterId)];
+        $sql    = 'SELECT * FROM cycles WHERE id > ?'
+                . self::modeClause($mode, $params)
+                . ' ORDER BY id ASC LIMIT ?';
+        $params[] = max(1, $limit);
+        return $this->fetchAll('cycles', $sql, $params);
+    }
+
+    /**
      * Sum of cycles.pnl_usdt closed at or after $since (null/'' = all history);
      * null/'' $mode = every mode, exactly like the other analytics methods.
      */
@@ -1137,6 +1197,363 @@ SQL;
         }
         $age = time() - $t;
         return $age < 0 ? 0 : $age;
+    }
+
+    /* --------------------------------------------------------- observations */
+    /*
+     * Learning capture (docs/DESIGN-LEARNING.md §2).
+     *
+     * One row per entry evaluation, WHETHER OR NOT IT TRADED: the skipped rows
+     * are the control group, without which the bot would only ever learn from
+     * the trades it happened to take. `features` is a flat JSON object of
+     * numeric values only, so bucketing is uniform (lib/Learn.php).
+     *
+     * Resolution is one-way and happens once: `resolveObservation()` refuses to
+     * touch a row that already carries an outcome unless it is forced, so a
+     * repeated close booking (or a re-run reconcile) cannot count a trade twice.
+     * `skipped` rows resolve to `not_taken` the moment they are written; they
+     * carry no PnL and are never counted as wins or losses.
+     *
+     * This table is read-only evidence: nothing in Learn writes back to it, and
+     * no other table's behaviour depends on it.
+     */
+
+    /** The only outcomes an observation may carry (NULL while it is still open). */
+    const OBSERVATION_OUTCOMES = ['win', 'loss', 'flat', 'not_taken'];
+
+    /** The only fields resolveObservation() may write; the captured conditions are immutable. */
+    const OBSERVATION_RESOLVE_FIELDS = [
+        'outcome', 'pnl_usdt', 'pnl_pct', 'exit_reason', 'held_minutes', 'resolved_at',
+        'position_id', 'cycle_id',
+    ];
+
+    /**
+     * Insert one observation and return its id.
+     *
+     * Defaults: `ts` now, `engine` 'signal', `mode` '' (the caller normally passes
+     * the configured mode), `features` '{}', and `decision` derived from whether a
+     * position / cycle id was given. A `skipped` row without an explicit outcome is
+     * stored already resolved as `not_taken`.
+     *
+     * @param array $row ts, mode, engine, symbol, decision, skip_reason, score,
+     *                   threshold, features (array or JSON), position_id, cycle_id
+     */
+    public function insertObservation(array $row): int
+    {
+        $row['ts']     = (isset($row['ts']) && $row['ts'] !== '') ? (string) $row['ts'] : Util::nowIso();
+        $row['mode']   = isset($row['mode']) ? (string) $row['mode'] : '';
+        $row['engine'] = (isset($row['engine']) && (string) $row['engine'] !== '') ? (string) $row['engine'] : 'signal';
+        $row['symbol'] = strtoupper(trim((string) ($row['symbol'] ?? '')));
+
+        $decision = strtolower(trim((string) ($row['decision'] ?? '')));
+        if ($decision !== 'entered' && $decision !== 'skipped') {
+            $hasRef = (isset($row['position_id']) && $row['position_id'] !== '')
+                   || (isset($row['cycle_id']) && $row['cycle_id'] !== '');
+            $decision = $hasRef ? 'entered' : 'skipped';
+        }
+        $row['decision'] = $decision;
+        $row['features'] = self::encodeFeatures($row['features'] ?? []);
+
+        foreach (['score', 'threshold'] as $intCol) {
+            if (isset($row[$intCol]) && !is_numeric($row[$intCol])) {
+                unset($row[$intCol]);
+            }
+        }
+        if ($decision === 'skipped' && !isset($row['outcome'])) {
+            $row['outcome'] = 'not_taken';
+            if (!isset($row['resolved_at'])) {
+                $row['resolved_at'] = $row['ts'];
+            }
+        }
+        if (isset($row['outcome'])) {
+            $row['outcome'] = self::normaliseOutcome($row['outcome'], $decision);
+        }
+        return $this->insertRow('observations', $row);
+    }
+
+    /**
+     * Resolve one observation: outcome, PnL, exit reason, held minutes, resolved_at.
+     *
+     * Idempotent by design (DESIGN-LEARNING.md §8 `learn-capture`): a row that
+     * already carries an outcome is left untouched and the method returns false,
+     * unless $force is true. When no outcome is given it is derived from
+     * `pnl_usdt` (>0 win, <0 loss, 0 flat), and `resolved_at` defaults to now.
+     *
+     * @return bool true when the row was written
+     */
+    public function resolveObservation(int $id, array $fields, bool $force = false): bool
+    {
+        $row = $this->observation($id);
+        if ($row === null) {
+            return false;
+        }
+        if (!$force && $row['outcome'] !== null && (string) $row['outcome'] !== '') {
+            return false;
+        }
+        $set = [];
+        foreach (self::OBSERVATION_RESOLVE_FIELDS as $col) {
+            if (array_key_exists($col, $fields)) {
+                $set[$col] = $fields[$col];
+            }
+        }
+        if ($set === []) {
+            return false;
+        }
+        $decision = (string) ($row['decision'] ?? '');
+        $outcome  = '';
+        if (isset($set['outcome']) && trim((string) $set['outcome']) !== '') {
+            $outcome = self::normaliseOutcome($set['outcome'], $decision);
+        } elseif (isset($set['pnl_usdt']) && is_numeric($set['pnl_usdt'])) {
+            $pnl     = (float) $set['pnl_usdt'];
+            $outcome = $pnl > 0 ? 'win' : ($pnl < 0 ? 'loss' : 'flat');
+        } elseif ($decision === 'skipped') {
+            $outcome = 'not_taken';
+        }
+        if ($outcome !== '') {
+            $set['outcome'] = $outcome;
+            if (!isset($set['resolved_at']) || (string) $set['resolved_at'] === '') {
+                $set['resolved_at'] = Util::nowIso();
+            }
+        } else {
+            unset($set['outcome']);
+        }
+        foreach (['pnl_usdt', 'pnl_pct', 'held_minutes'] as $numCol) {
+            if (isset($set[$numCol]) && !is_numeric($set[$numCol])) {
+                unset($set[$numCol]);
+            }
+        }
+        $this->updateRow('observations', 'id', $id, $set);
+        return true;
+    }
+
+    public function observation(int $id): ?array
+    {
+        $row = $this->fetchOne('observations', 'SELECT * FROM observations WHERE id = ?', [$id]);
+        return $row === null ? null : self::withFeatures($row);
+    }
+
+    /**
+     * The observation attached to one position or cycle, or null.
+     * $kind is 'position' or 'cycle'. An unresolved row wins over a resolved one
+     * (that is the row a close wants to resolve), newest first otherwise.
+     */
+    public function observationFor(string $kind, int $refId): ?array
+    {
+        $kind = strtolower(trim($kind));
+        if ($kind === 'positions') {
+            $kind = 'position';
+        } elseif ($kind === 'cycles') {
+            $kind = 'cycle';
+        }
+        if ($kind !== 'position' && $kind !== 'cycle') {
+            return null;
+        }
+        $col = $kind === 'position' ? 'position_id' : 'cycle_id';
+        $row = $this->fetchOne(
+            'observations',
+            'SELECT * FROM observations WHERE ' . $col . ' = ? ORDER BY (outcome IS NULL) DESC, id DESC LIMIT 1',
+            [$refId]
+        );
+        return $row === null ? null : self::withFeatures($row);
+    }
+
+    /**
+     * Observations still waiting for an outcome (oldest first); null/'' $mode = every mode.
+     *
+     * The trailing $positionsOnly is additive and defaults to today's behaviour. When
+     * true the query returns only rows a POSITION can resolve (`position_id IS NOT
+     * NULL`), which is what Bot::obsResolvePositions() actually wants: without it the
+     * scan drags every open cycle row of a busy grid through PHP to discard it.
+     * Covered by idx_obs_open.
+     */
+    public function openObservations(?string $mode = null, int $limit = 1000, bool $positionsOnly = false): array
+    {
+        $params = [];
+        $sql    = 'SELECT * FROM observations WHERE outcome IS NULL' . self::modeClause($mode, $params)
+                . ($positionsOnly ? ' AND position_id IS NOT NULL' : '')
+                . ' ORDER BY id ASC LIMIT ?';
+        $params[] = max(1, $limit);
+        return self::withFeaturesAll($this->fetchAll('observations', $sql, $params));
+    }
+
+    /**
+     * Filtered observations, newest first by default.
+     *
+     * Supported $filter keys (all optional; every value may also be an array,
+     * which becomes an IN (...) list):
+     *   mode, engine, symbol, decision, outcome
+     *   since / until          on `ts`        (ISO, inclusive / inclusive)
+     *   resolved_since / resolved_before  on `resolved_at` (>= / <, exclusive upper
+     *                          bound: that is what makes a walk-forward recompute
+     *                          use only what was closed BEFORE its own instant)
+     *   resolved               bool: true = outcome IS NOT NULL, false = IS NULL
+     *   limit                  int, default 500
+     *   order                  'desc' (default) or 'asc' on ts, id
+     */
+    public function observations(array $filter = []): array
+    {
+        $params = [];
+        $sql    = 'SELECT * FROM observations WHERE 1 = 1';
+        foreach (['mode', 'engine', 'symbol', 'decision', 'outcome'] as $col) {
+            if (array_key_exists($col, $filter) && $filter[$col] !== null && $filter[$col] !== '') {
+                $sql .= self::inClause($col, $filter[$col], $params);
+            }
+        }
+        if (!empty($filter['since'])) {
+            $sql .= ' AND ts >= ?';
+            $params[] = (string) $filter['since'];
+        }
+        if (!empty($filter['until'])) {
+            $sql .= ' AND ts <= ?';
+            $params[] = (string) $filter['until'];
+        }
+        if (!empty($filter['resolved_since'])) {
+            $sql .= ' AND resolved_at IS NOT NULL AND resolved_at >= ?';
+            $params[] = (string) $filter['resolved_since'];
+        }
+        if (!empty($filter['resolved_before'])) {
+            $sql .= ' AND resolved_at IS NOT NULL AND resolved_at < ?';
+            $params[] = (string) $filter['resolved_before'];
+        }
+        if (array_key_exists('resolved', $filter) && $filter['resolved'] !== null) {
+            $sql .= empty($filter['resolved']) ? ' AND outcome IS NULL' : ' AND outcome IS NOT NULL';
+        }
+        $order = isset($filter['order']) && strtolower((string) $filter['order']) === 'asc' ? 'ASC' : 'DESC';
+        $limit = isset($filter['limit']) && is_numeric($filter['limit']) ? (int) $filter['limit'] : 500;
+        $sql   .= ' ORDER BY ts ' . $order . ', id ' . $order . ' LIMIT ?';
+        $params[] = max(1, $limit);
+        return self::withFeaturesAll($this->fetchAll('observations', $sql, $params));
+    }
+
+    /**
+     * Header counts for the Insights page: total rows, resolved rows, entered,
+     * skipped, wins and losses. null/'' $mode = every mode.
+     *
+     * @return array{total:int,resolved:int,entered:int,skipped:int,wins:int,losses:int}
+     */
+    public function observationCounts(?string $mode = null): array
+    {
+        $params = [];
+        $sql    = "SELECT COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END), 0) AS resolved,
+                    COALESCE(SUM(CASE WHEN decision = 'entered' THEN 1 ELSE 0 END), 0) AS entered,
+                    COALESCE(SUM(CASE WHEN decision = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped,
+                    COALESCE(SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END), 0) AS losses
+             FROM observations WHERE 1 = 1" . self::modeClause($mode, $params);
+        $st = $this->pdo->prepare($sql);
+        $st->execute($params);
+        $r = $st->fetch();
+        return [
+            'total'    => (int) ($r['total'] ?? 0),
+            'resolved' => (int) ($r['resolved'] ?? 0),
+            'entered'  => (int) ($r['entered'] ?? 0),
+            'skipped'  => (int) ($r['skipped'] ?? 0),
+            'wins'     => (int) ($r['wins'] ?? 0),
+            'losses'   => (int) ($r['losses'] ?? 0),
+        ];
+    }
+
+    /** ' AND col = ?' or ' AND col IN (?, ?, ...)', binding into $params. */
+    private static function inClause(string $col, $value, array &$params): string
+    {
+        if (!is_array($value)) {
+            $params[] = (string) $value;
+            return ' AND ' . $col . ' = ?';
+        }
+        $clean = [];
+        foreach ($value as $v) {
+            if (is_scalar($v)) {
+                $clean[] = (string) $v;
+            }
+        }
+        if ($clean === []) {
+            return '';
+        }
+        foreach ($clean as $v) {
+            $params[] = $v;
+        }
+        return ' AND ' . $col . ' IN (' . implode(', ', array_fill(0, count($clean), '?')) . ')';
+    }
+
+    /** Numeric-only flat JSON object (DESIGN-LEARNING §2); non-numeric values are dropped. */
+    private static function encodeFeatures($features): string
+    {
+        if (is_string($features)) {
+            $trimmed = trim($features);
+            if ($trimmed === '') {
+                return '{}';
+            }
+            $decoded = json_decode($trimmed, true);
+            return is_array($decoded) ? self::encodeFeatures($decoded) : '{}';
+        }
+        if (!is_array($features)) {
+            return '{}';
+        }
+        $out = [];
+        foreach ($features as $k => $v) {
+            $key = trim((string) $k);
+            if ($key === '') {
+                continue;
+            }
+            if (is_bool($v)) {
+                $out[$key] = $v ? 1 : 0;
+                continue;
+            }
+            if (!is_numeric($v)) {
+                continue;
+            }
+            $f = (float) $v;
+            if (!is_finite($f)) {
+                continue;
+            }
+            $out[$key] = $f;
+        }
+        $json = json_encode($out, JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION | JSON_FORCE_OBJECT);
+        return $json === false ? '{}' : $json;
+    }
+
+    /** Decode a stored features blob to [name => float]; always an array. */
+    public static function decodeFeatures($raw): array
+    {
+        $v = is_array($raw) ? $raw : json_decode((string) $raw, true);
+        if (!is_array($v)) {
+            return [];
+        }
+        $out = [];
+        foreach ($v as $k => $item) {
+            if (is_bool($item)) {
+                $out[(string) $k] = $item ? 1.0 : 0.0;
+            } elseif (is_numeric($item)) {
+                $out[(string) $k] = (float) $item;
+            }
+        }
+        return $out;
+    }
+
+    /** One of OBSERVATION_OUTCOMES; anything unknown becomes 'flat' ('not_taken' for a skip). */
+    private static function normaliseOutcome($value, string $decision): string
+    {
+        $v = strtolower(trim((string) $value));
+        if (in_array($v, self::OBSERVATION_OUTCOMES, true)) {
+            return $v;
+        }
+        return $decision === 'skipped' ? 'not_taken' : 'flat';
+    }
+
+    /** Attach `features_map` (decoded) to a row; `features` stays the stored JSON string. */
+    private static function withFeatures(array $row): array
+    {
+        $row['features_map'] = self::decodeFeatures($row['features'] ?? '{}');
+        return $row;
+    }
+
+    private static function withFeaturesAll(array $rows): array
+    {
+        foreach ($rows as $i => $r) {
+            $rows[$i] = self::withFeatures($r);
+        }
+        return $rows;
     }
 
     /* ---------------------------------------------------------------- login */

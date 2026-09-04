@@ -49,7 +49,7 @@ register_shutdown_function(static function () use ($tmpRoot): void {
 
 /* ------------------------------------------------------------ lib loading */
 
-$libs = ['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'Sleeve', 'Scanner', 'EngineOrders', 'EngineGrid', 'EnginePmm', 'Bot', 'Panel'];
+$libs = ['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'Sleeve', 'Scanner', 'EngineOrders', 'EngineGrid', 'EnginePmm', 'Learn', 'Bot', 'Panel'];
 $missing = [];
 foreach ($libs as $lib) {
     $file = $PROJECT . '/lib/' . $lib . '.php';
@@ -864,6 +864,95 @@ T::group('db', ['Db', 'Util'], static function (): void {
     T::eq(true, $db->loginAttempt('1.2.3.4')['locked'], 'login lockout after 5 failures');
     $db->loginOk('1.2.3.4');
     T::eq(false, $db->loginAttempt('1.2.3.4')['locked'], 'loginOk clears the lock');
+});
+
+/* ------------------------------------------------------------------- db-prune */
+
+/*
+ * Retention. Nothing may grow without bound on a shared host with a 90-day evidence
+ * window and a table that gains rows every minute.
+ *
+ * `observations` keeps a much longer horizon than the 30-day tail tables - the evidence
+ * is worthless once it has been deleted - and `engine_orders` is pruned only for rows
+ * that are SPENT: terminal status, nothing ever filled on them, and no lot pointing back
+ * at them. A row that filled is the provenance of a lot and a cycle and must survive.
+ */
+T::group('db-prune', ['Db', 'Util'], static function (): void {
+    $db  = freshDb('db-prune');
+    $old = Util::nowIso(time() - 400 * 86400);
+    $mid = Util::nowIso(time() - 45 * 86400);
+    $new = Util::nowIso(time() - 3600);
+
+    foreach ([$old, $mid, $new] as $ts) {
+        $db->insertSignal('SOLUSDT', 50, true, 130.0, ['rsi<=30']);
+        $db->pdo()->prepare('UPDATE signals SET created_at = ? WHERE id = (SELECT MAX(id) FROM signals)')->execute([$ts]);
+        $db->insertObservation(['ts' => $ts, 'mode' => 'paper', 'engine' => 'signal', 'symbol' => 'SOLUSDT',
+            'decision' => 'entered', 'features' => ['rsi' => 28.0], 'outcome' => 'win', 'pnl_usdt' => 0.1,
+            'resolved_at' => $ts]);
+    }
+    T::eq(3, countRows($db, 'SELECT COUNT(*) FROM signals'), 'three signals seeded');
+    T::eq(3, countRows($db, 'SELECT COUNT(*) FROM observations'), 'three observations seeded');
+
+    // engine_orders: one spent (cancelled, never filled, no lot), one filled, one still live
+    $db->insertEngineOrder(['client_id' => 'spent', 'mode' => 'paper', 'engine' => 'grid', 'symbol' => 'SOLUSDT',
+        'side' => 'BUY', 'status' => 'CANCELED', 'price' => 129.0, 'qty' => 0.05, 'quote' => 6.45,
+        'filled_qty' => 0.0, 'created_at' => $mid]);
+    $db->insertEngineOrder(['client_id' => 'filled', 'mode' => 'paper', 'engine' => 'grid', 'symbol' => 'SOLUSDT',
+        'side' => 'BUY', 'status' => 'FILLED', 'price' => 129.0, 'qty' => 0.05, 'quote' => 6.45,
+        'filled_qty' => 0.05, 'filled_quote' => 6.45, 'created_at' => $mid]);
+    $db->insertEngineOrder(['client_id' => 'live', 'mode' => 'paper', 'engine' => 'grid', 'symbol' => 'SOLUSDT',
+        'side' => 'BUY', 'status' => 'NEW', 'price' => 128.0, 'qty' => 0.05, 'quote' => 6.40,
+        'filled_qty' => 0.0, 'created_at' => $mid]);
+    // a cancelled order that produced a lot anyway (partial that was then cancelled and booked):
+    // its provenance is still referenced, so it must survive even though filled_qty reads 0 here
+    $db->insertEngineOrder(['client_id' => 'provenance', 'mode' => 'paper', 'engine' => 'grid', 'symbol' => 'SOLUSDT',
+        'side' => 'BUY', 'status' => 'CANCELED', 'price' => 129.5, 'qty' => 0.05, 'quote' => 6.47,
+        'filled_qty' => 0.0, 'created_at' => $mid]);
+    $db->insertLot(['mode' => 'paper', 'engine' => 'grid', 'symbol' => 'SOLUSDT', 'qty' => 0.05,
+        'remaining' => 0.05, 'price' => 129.5, 'fee_usdt' => 0.006, 'level' => 1,
+        'client_id' => 'provenance', 'created_at' => $mid]);
+    T::eq(4, countRows($db, 'SELECT COUNT(*) FROM engine_orders'), 'four engine orders seeded');
+
+    $db->prune(30, 365);
+
+    T::eq(1, countRows($db, 'SELECT COUNT(*) FROM signals'), 'signals older than 30 days are gone');
+    T::eq(2, countRows($db, 'SELECT COUNT(*) FROM observations'),
+        'observations keep a 365-day horizon: only the 400-day row went');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM observations WHERE ts = ?", [$old]),
+        'and it really is the oldest one that went');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE client_id = 'spent'"),
+        'a spent engine order is pruned');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE client_id = 'filled'"),
+        'an order that filled is kept: it is the provenance of a lot and a cycle');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE client_id = 'live'"),
+        'a NEW order is never pruned: it may still be resting on the exchange');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM engine_orders WHERE client_id = 'provenance'"),
+        'nor is one a lot still points at');
+    T::eq(1, countRows($db, 'SELECT COUNT(*) FROM lots'), 'and the lot itself is untouched');
+
+    // the observation horizon can never be shorter than the tail horizon: with a 60-day
+    // tail and a 30-day observation setting the 45-day row must survive, because 30 is
+    // raised to 60 rather than applied as-is
+    $db->prune(60, 30);
+    T::eq(2, countRows($db, 'SELECT COUNT(*) FROM observations'),
+        'observationDays below $days is raised to $days, never applied as-is');
+    T::eq(1, countRows($db, 'SELECT COUNT(*) FROM observations WHERE ts = ?', [$mid]),
+        'so the 45-day observation is still there');
+
+    // and the whole thing is safe to run on an empty database
+    $empty = freshDb('db-prune-empty');
+    $empty->prune(30, 365);
+    T::eq(0, countRows($empty, 'SELECT COUNT(*) FROM observations'), 'pruning an empty database is a no-op');
+
+    // the indexes the hot per-tick predicates need actually exist
+    $idx = [];
+    foreach ($db->pdo()->query("SELECT name FROM sqlite_master WHERE type = 'index'")->fetchAll(PDO::FETCH_COLUMN) as $n) {
+        $idx[(string) $n] = true;
+    }
+    foreach (['idx_obs_open', 'idx_obs_ts', 'idx_engine_orders_live', 'idx_engine_orders_scan',
+              'idx_lots_open', 'idx_lots_scan'] as $want) {
+        T::ok(isset($idx[$want]), 'index ' . $want . ' exists after migrate()');
+    }
 });
 
 /* ============================================================ 6. PaperExchange */
@@ -3341,6 +3430,1685 @@ T::group('portfolio-off', ['Bot', 'PaperExchange', 'FakeMarketData', 'Db', 'Slee
     $reason = (string) $b['db']->getState('no_trade_reason', '');
     T::ok(strpos($reason, 'portfolio') === false && strpos($reason, 'sleeve') === false,
         'the no-trade reason is the single-engine one', $reason);
+});
+
+/* ============================================================ learning (DESIGN-LEARNING.md §8) */
+
+/**
+ * The DESIGN-LEARNING.md §5 configuration block and nothing else, so a test can layer it on
+ * top of an existing config exactly the way an upgrade writes it into config.json.
+ */
+function learnBlock(array $over = []): array
+{
+    return array_merge([
+        'learning_enabled'      => true,
+        'learning_apply'        => false,
+        'learn_min_samples'     => 60,
+        'learn_recompute_hours' => 168,
+        'learn_window_days'     => 90,
+    ], $over);
+}
+
+/** DESIGN.md §3 defaults plus the learning block. */
+function learnCfg(array $over = []): array
+{
+    return cfg(array_merge(learnBlock(), $over));
+}
+
+/**
+ * The WHOLE configuration: DESIGN.md §3 + DESIGN-ENGINES.md §2 + DESIGN-PORTFOLIO.md §2 +
+ * DESIGN-LEARNING.md §5. `learn-caps` snapshots this and asserts a recompute leaves every
+ * byte of it alone, so it has to be the real table, not a convenient subset — it is read
+ * from config.php when that file is present.
+ */
+function learnFullCfg(array $over = []): array
+{
+    $base = function_exists('trader_config_defaults')
+        ? trader_config_defaults()
+        : cfg(array_merge(pfBlock(), [
+            'engine' => 'signal', 'allow_live_engines' => false, 'engine_symbol' => 'DOGEUSDT',
+            'engine_max_orders' => 12, 'post_only' => true,
+            'grid_levels' => 6, 'grid_spacing_pct' => 0.60, 'grid_order_usdt' => 1.30,
+            'grid_range_up_pct' => 4.0, 'grid_range_down_pct' => 6.0, 'grid_exit_liquidates' => false,
+            'pmm_spread_pct' => 0.25, 'pmm_order_usdt' => 1.30, 'pmm_refresh_sec' => 60,
+            'pmm_target_base_pct' => 50.0, 'pmm_max_base_pct' => 80.0,
+        ]));
+    return array_merge($base, learnBlock(), ['mode' => 'paper'], $over);
+}
+
+/**
+ * Every configuration key learning must never be able to touch (DESIGN-LEARNING.md §1 and §4):
+ * position size, take-profit, stop-loss, the trailing stop, the sleeve budgets and every kill
+ * switch (equity floor, drawdown, the loss caps, the trade caps and the cooldown ladder).
+ */
+function learnForbiddenCfgKeys(): array
+{
+    return [
+        'trade_usdt', 'take_profit_pct', 'take_profit_max_pct', 'stop_loss_pct',
+        'trailing_activate_pct', 'trailing_distance_pct', 'trailing_floor_pct', 'max_hold_minutes',
+        'equity_floor_usdt', 'hwm_drawdown_pct', 'daily_loss_cap_pct', 'weekly_loss_cap_pct',
+        'max_trades_per_day', 'max_orders_per_hour', 'max_consecutive_losses',
+        'cooldown_after_loss_min', 'cooldown_after_2_losses_min',
+        'entry_threshold', 'adaptive', 'enabled', 'mode', 'symbols', 'fee_pct',
+        'grid_order_usdt', 'pmm_order_usdt', 'grid_levels', 'engine', 'allow_live_engines',
+        'sleeves', 'portfolio_enabled', 'sleeve_reserve_pct', 'sleeve_max_drawdown_pct',
+    ];
+}
+
+/**
+ * Risk and kill-switch state, seeded with recognisable values before a recompute so the
+ * "nothing else moved" assertion is testing live rows and not an empty table.
+ */
+function learnRiskState(): array
+{
+    return [
+        'halted'               => '0',
+        'halt_reason'          => 'none',
+        'paused_until'         => '2026-12-31T00:00:00Z',
+        'pause_reason'         => 'weekly_cap',
+        'consecutive_losses'   => '2',
+        'cooldown_until'       => '2026-09-03T18:00:00Z',
+        'last_loss_at'         => '2026-09-03T11:00:00Z',
+        'equity_hwm'           => '123.456',
+        'day_start_equity'     => '100.5',
+        'day_start_date'       => '2026-09-03',
+        'effective_threshold'  => '80',
+        'effective_max_trades' => '3',
+        'api_paused_until'     => '',
+        'net_errors'           => '0',
+        'fee_pct_live'         => '0.075',
+        'sleeve_paused_signal' => '1',
+        'grid_anchor'          => '130.00',
+        'paper_balances'       => '{"USDT":10.0}',
+    ];
+}
+
+/** The whole `state` table as key => value. */
+function stateSnapshot(Db $db): array
+{
+    $out = [];
+    foreach ($db->pdo()->query('SELECT key, value FROM state ORDER BY key')->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $out[(string) $r['key']] = (string) $r['value'];
+    }
+    return $out;
+}
+
+/** Every table (except the log tail) as a JSON blob, so a diff can name the table that moved. */
+function tablesSnapshot(Db $db): array
+{
+    $out = [];
+    foreach ($db->pdo()->query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN) as $t) {
+        $t = (string) $t;
+        if ($t === 'sqlite_sequence' || $t === 'logs') {
+            continue;   // the log tail is diagnostics, not state; `state` is compared key by key
+        }
+        $rows  = $db->pdo()->query('SELECT * FROM "' . $t . '"')->fetchAll(PDO::FETCH_ASSOC);
+        $out[$t] = (string) json_encode($rows);
+    }
+    return $out;
+}
+
+/** Keys that differ between two snapshots (added, removed or changed), sorted. */
+function snapshotDiff(array $before, array $after): array
+{
+    $keys = [];
+    foreach ($after as $k => $v) {
+        if (!array_key_exists($k, $before) || $before[$k] !== $v) {
+            $keys[(string) $k] = true;
+        }
+    }
+    foreach ($before as $k => $v) {
+        if (!array_key_exists($k, $after)) {
+            $keys[(string) $k] = true;
+        }
+    }
+    $out = array_keys($keys);
+    sort($out);
+    return $out;
+}
+
+/**
+ * The PHP source of a project file with every comment stripped, so a doc block explaining
+ * that a function is never called cannot satisfy a grep for that function.
+ */
+function codeOf(string $relPath): string
+{
+    $src = (string) @file_get_contents(dirname(__DIR__) . '/' . $relPath);
+    if ($src === '') {
+        return '';
+    }
+    $out = '';
+    foreach (token_get_all($src) as $tok) {
+        if (is_array($tok)) {
+            if ($tok[0] === T_COMMENT || $tok[0] === T_DOC_COMMENT) {
+                $out .= ' ';
+                continue;
+            }
+            $out .= $tok[1];
+            continue;
+        }
+        $out .= $tok;
+    }
+    return $out;
+}
+
+/** An observation row for the pure bucketing tests (features array, no database). */
+function obsRow(array $features, string $outcome = 'win', float $pnl = 1.0, string $decision = 'entered'): array
+{
+    return ['features' => $features, 'outcome' => $outcome, 'pnl_usdt' => $pnl, 'decision' => $decision];
+}
+
+/* ------------------------------------------------------------------- learn-wilson */
+
+T::group('learn-wilson', ['Learn'], static function (): void {
+    /*
+     * The two-sided 95 % Wilson score interval, against published values. k = 0 and k = n are
+     * ordinary cases of the formula (that is the whole reason to prefer it over the normal
+     * approximation) and n = 0 must not divide by zero.
+     */
+    $cases = [
+        [5, 10, 0.236592, 0.763408],
+        [0, 10, 0.000000, 0.277535],
+        [10, 10, 0.722465, 1.000000],
+        [1, 2, 0.094530, 0.905470],
+        [80, 100, 0.711170, 0.866635],
+        [1, 100, 0.001767, 0.054487],
+    ];
+    foreach ($cases as $c) {
+        $w = Learn::wilson((int) $c[0], (int) $c[1]);
+        T::near((float) $c[2], (float) $w['lo'], 1e-4, 'wilson(' . $c[0] . ',' . $c[1] . ') lo');
+        T::near((float) $c[3], (float) $w['hi'], 1e-4, 'wilson(' . $c[0] . ',' . $c[1] . ') hi');
+    }
+
+    // k = 0 and k = n: finite, no division by zero, and the interval still has width
+    $z = Learn::wilson(0, 10);
+    T::ok(is_finite($z['lo']) && is_finite($z['hi']), 'k=0 gives finite bounds');
+    T::eq(0.0, $z['lo'], 'k=0 lower bound is exactly 0');
+    T::ok($z['hi'] > 0.0, 'k=0 upper bound is above 0 — 0 of 10 is not proof of 0 %');
+    $f = Learn::wilson(10, 10);
+    T::ok(is_finite($f['lo']) && is_finite($f['hi']), 'k=n gives finite bounds');
+    T::eq(1.0, $f['hi'], 'k=n upper bound is exactly 1');
+    T::ok($f['lo'] < 1.0, 'k=n lower bound is below 1 — 10 of 10 is not proof of 100 %');
+    T::near(1.0 - $z['hi'], $f['lo'], 1e-12, 'the interval is symmetric under k -> n−k');
+
+    // n = 0: the no-information interval, which overlaps everything and can never be confident
+    $n0 = Learn::wilson(0, 0);
+    T::eq(0.0, $n0['lo'], 'n=0 lo = 0 (no division by zero)');
+    T::eq(1.0, $n0['hi'], 'n=0 hi = 1 (no division by zero)');
+    T::eq(Learn::wilson(0, 0), Learn::wilson(5, 0), 'n=0 ignores k instead of dividing by it');
+    T::eq(Learn::wilson(0, 0), Learn::wilson(0, -7), 'a negative n is treated as no information');
+
+    // out-of-range k is clamped, never allowed to produce a bound outside [0, 1]
+    T::eq(Learn::wilson(10, 10), Learn::wilson(15, 10), 'k > n clamps to k = n');
+    T::eq(Learn::wilson(0, 10), Learn::wilson(-3, 10), 'k < 0 clamps to k = 0');
+
+    // invariants over a grid: every (k, n) pair up to 60, plus a few larger samples
+    $bad = 0;
+    $checked = 0;
+    foreach (array_merge(range(1, 60), [100, 250, 1000]) as $n) {
+        for ($k = 0; $k <= $n; $k++) {
+            $w = Learn::wilson($k, (int) $n);
+            $checked++;
+            if (!is_finite($w['lo']) || !is_finite($w['hi'])
+                || $w['lo'] < 0.0 || $w['hi'] > 1.0 || $w['lo'] > $w['hi']) {
+                $bad++;
+            }
+        }
+    }
+    T::ok($checked > 3000, 'the grid really covers a few thousand intervals', (string) $checked);
+    T::eq(0, $bad, 'every interval over the grid is finite, ordered and inside [0,1]');
+
+    // at the same observed rate the interval narrows as the sample grows
+    $narrows = true;
+    $prevWidth = null;
+    foreach ([4, 8, 16, 32, 64, 128, 256, 512] as $n) {
+        $half  = Learn::wilson(intdiv($n, 2), $n);
+        $width = $half['hi'] - $half['lo'];
+        if ($prevWidth !== null && $width >= $prevWidth) {
+            $narrows = false;
+        }
+        $prevWidth = $width;
+    }
+    T::ok($narrows, 'the interval narrows as the sample grows at a fixed 50 % win rate');
+    $mid = Learn::wilson(5, 10);
+    T::ok($mid['lo'] <= 0.5 && $mid['hi'] >= 0.5, 'the interval contains the observed rate');
+    T::ok(Learn::wilson(9, 10)['lo'] > Learn::wilson(5, 10)['lo'], 'a better rate lifts the lower bound');
+});
+
+/* ------------------------------------------------------------------- learn-buckets */
+
+T::group('learn-buckets', ['Learn'], static function (): void {
+    $edges = Learn::edgesFor('rsi');
+    T::eq([0, 20, 25, 30, 40, 50, 70, 100], $edges, 'default RSI edges (DESIGN-LEARNING.md §3)');
+
+    /*
+     * Bucket i covers [edge[i], edge[i+1]); the last one includes its upper edge. A value
+     * outside the edges lands in the nearest end bucket rather than vanishing.
+     */
+    $rows = [
+        obsRow(['rsi' => -10.0]),   // below the first edge -> first bucket
+        obsRow(['rsi' => 0.0]),     // exactly the first edge
+        obsRow(['rsi' => 19.999]),  // just under the second edge
+        obsRow(['rsi' => 20.0]),    // exactly on an edge -> the bucket ABOVE it
+        obsRow(['rsi' => 24.999]),
+        obsRow(['rsi' => 25.0]),
+        obsRow(['rsi' => 30.0]),
+        obsRow(['rsi' => 40.0]),
+        obsRow(['rsi' => 69.999]),
+        obsRow(['rsi' => 70.0]),
+        obsRow(['rsi' => 100.0]),   // the upper edge belongs to the last bucket
+        obsRow(['rsi' => 250.0]),   // above every edge -> the last bucket
+    ];
+    $before = (string) json_encode($rows);
+    $b = Learn::buckets($rows, 'rsi', $edges);
+    T::eq(7, count($b), 'one bucket per edge interval');
+    T::eq(['0-20', '20-25', '25-30', '30-40', '40-50', '50-70', '70-100'], array_column($b, 'label'), 'bucket labels');
+    T::eq([3, 2, 1, 1, 1, 1, 3], array_column($b, 'n'), 'edge values fall in the bucket above the edge');
+    T::eq(12, array_sum(array_column($b, 'n')), 'every row landed in exactly one bucket');
+    T::eq($before, (string) json_encode($rows), 'buckets() is pure: it does not touch its input');
+    T::eq((string) json_encode($b), (string) json_encode(Learn::buckets($rows, 'rsi', $edges)), 'buckets() is deterministic');
+
+    // empty buckets are REPORTED, not dropped — that is how the panel can say "no evidence here"
+    $sparse = Learn::buckets([obsRow(['rsi' => 45.0])], 'rsi', $edges);
+    T::eq(7, count($sparse), 'a single row still reports all seven buckets');
+    $empties = 0;
+    $wellFormed = true;
+    foreach ($sparse as $bucket) {
+        if ((int) $bucket['n'] === 0) {
+            $empties++;
+            if ((int) $bucket['wins'] !== 0 || (int) $bucket['losses'] !== 0
+                || (float) $bucket['win_rate'] !== 0.0 || (float) $bucket['avg_pnl'] !== 0.0
+                || !is_finite((float) $bucket['wilson_lo']) || !is_finite((float) $bucket['wilson_hi'])) {
+                $wellFormed = false;
+            }
+        }
+    }
+    T::eq(6, $empties, 'the six empty buckets are reported');
+    T::ok($wellFormed, 'an empty bucket reports zeroes and a finite no-information interval');
+
+    // outcome statistics inside one bucket
+    $stat = Learn::buckets([
+        obsRow(['rsi' => 22.0], 'win', 1.0),
+        obsRow(['rsi' => 22.5], 'win', 2.0),
+        obsRow(['rsi' => 23.0], 'win', 3.0),
+        obsRow(['rsi' => 24.0], 'loss', -2.0),
+        obsRow(['rsi' => 24.5], 'not_taken', 0.0, 'skipped'),
+    ], 'rsi', $edges);
+    $bucket = $stat[1];
+    T::eq('20-25', $bucket['label'], 'the statistics bucket is 20-25');
+    T::eq(5, (int) $bucket['n'], 'n counts every row in the bucket');
+    T::eq(3, (int) $bucket['wins'], 'wins');
+    T::eq(1, (int) $bucket['losses'], 'losses');
+    T::eq(1, (int) $bucket['skipped'], 'a not_taken row is counted as skipped');
+    T::eq(4, (int) $bucket['decided'], 'a skipped row is never a win or a loss');
+    T::near(75.0, (float) $bucket['win_rate'], 1e-9, 'win rate is over the decided rows');
+    T::near(0.8, (float) $bucket['avg_pnl'], 1e-9, 'avg PnL over the rows carrying one');
+    T::near(4.0, (float) $bucket['total_pnl'], 1e-9, 'total PnL');
+    $w = Learn::wilson(3, 4);
+    T::near((float) $w['lo'], (float) $bucket['wilson_lo'], 1e-12, 'the bucket carries wilson(wins, decided) lo');
+    T::near((float) $w['hi'], (float) $bucket['wilson_hi'], 1e-12, 'the bucket carries wilson(wins, decided) hi');
+
+    // categorical features: one bucket per distinct value, ordered by value
+    $cat = Learn::buckets([
+        obsRow(['trend_up' => 1.0]), obsRow(['trend_up' => 0.0]),
+        obsRow(['trend_up' => 1.0]), obsRow(['trend_up' => 0.0]), obsRow(['trend_up' => 1.0]),
+    ], 'trend_up', Learn::edgesFor('trend_up'));
+    T::eq([], Learn::edgesFor('trend_up'), 'trend_up is categorical (no edges)');
+    T::eq(2, count($cat), 'one bucket per distinct categorical value');
+    T::eq(['0', '1'], array_column($cat, 'label'), 'categorical buckets are ordered by value');
+    T::eq([2, 3], array_column($cat, 'n'), 'categorical bucket counts');
+
+    // rows without the feature are skipped, not counted as zero
+    $mixed = Learn::buckets([
+        obsRow(['rsi' => 22.0]), obsRow(['atr_pct' => 0.9]), obsRow([]), ['no features at all' => 1],
+        obsRow(['rsi' => 'not a number']),
+    ], 'rsi', $edges);
+    T::eq(1, array_sum(array_column($mixed, 'n')), 'a row with no numeric value for the feature is skipped');
+    T::eq(7, count($mixed), 'and the bucket list is still complete');
+
+    // the features column as stored JSON reads exactly like the decoded array
+    $json = Learn::buckets([
+        ['features' => (string) json_encode(['rsi' => 22.0]), 'outcome' => 'win', 'pnl_usdt' => 1.0, 'decision' => 'entered'],
+    ], 'rsi', $edges);
+    T::eq(1, array_sum(array_column($json, 'n')), 'features as a JSON string buckets the same way');
+
+    // a degenerate edge list falls back to categorical rather than dividing the world by zero
+    $one = Learn::buckets([obsRow(['rsi' => 22.0]), obsRow(['rsi' => 22.0]), obsRow(['rsi' => 99.0])], 'rsi', [0]);
+    T::eq(2, count($one), 'fewer than two edges is treated as categorical');
+    T::eq(3, array_sum(array_column($one, 'n')), 'and no row is lost');
+});
+
+/* ------------------------------------------------------------------- learn-capture */
+
+T::group('learn-capture', ['Bot', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    /*
+     * DESIGN-LEARNING.md §2: every entry evaluation writes one row whether or not it traded.
+     * The skipped rows are the control group — without them the bot would only ever learn from
+     * the trades it happened to take.
+     */
+    $db  = freshDb('learn-capture');
+    $md  = botMd();
+    $cfg = botCfg(learnBlock());
+    $ex  = new PaperExchange($md, $db, 0.1, 10.0);
+    $t0  = FakeMarketData::SERVER_TIME_MS;
+
+    $r1 = (new Bot($cfg, $db, $ex, $t0))->tick();
+    T::strContains($r1['summary'], 'entered:SOLUSDT', 'tick1 entered SOLUSDT');
+    $obs = $db->observations(['order' => 'asc', 'limit' => 50]);
+    T::eq(2, count($obs), 'one observation per evaluated symbol: the entry and the skip');
+    T::eq(2, countRows($db, 'SELECT COUNT(*) FROM observations'), 'and exactly two rows exist');
+
+    $entered = null;
+    $skipped = null;
+    foreach ($obs as $o) {
+        if ((string) $o['decision'] === 'entered') {
+            $entered = $o;
+        } else {
+            $skipped = $o;
+        }
+    }
+    T::ok($entered !== null, 'the entry wrote an `entered` observation');
+    T::ok($skipped !== null, 'the symbol that did not trade wrote a `skipped` observation');
+    $pos = $db->openPosition();
+    if ($entered !== null && $pos !== null) {
+        T::eq('SOLUSDT', (string) $entered['symbol'], 'entered row is SOLUSDT');
+        T::eq('paper', (string) $entered['mode'], 'entered row carries the mode');
+        T::eq('signal', (string) $entered['engine'], 'entered row carries the engine');
+        T::eq((int) $pos['id'], (int) $entered['position_id'], 'entered row points at the position');
+        T::eq(null, $entered['outcome'], 'entered row has no outcome while the position is open');
+        T::eq(null, $entered['resolved_at'], 'and no resolution stamp');
+        T::eq((int) $pos['score'], (int) $entered['score'], 'the score at decision time is captured');
+        T::eq(60, (int) $entered['threshold'], 'and the threshold it was measured against');
+        T::eq(Util::nowIso(intdiv($t0, 1000)), (string) $entered['ts'], 'ts uses the injected clock');
+        $f = $entered['features_map'];
+        T::ok(is_array($f), 'features decode to a map');
+        foreach (['rsi', 'atr_pct', 'atr1h_pct', 'bb_pos', 'vol_ratio', 'trend_up', 'spread_pct', 'hour_utc', 'dow', 'step_value_pct'] as $key) {
+            T::ok(isset($f[$key]) && is_numeric($f[$key]), 'feature ' . $key . ' captured and numeric',
+                isset($f[$key]) ? T::dump($f[$key]) : 'absent');
+        }
+        T::ok((float) $f['rsi'] > 20.0 && (float) $f['rsi'] < 30.0, 'the captured RSI is the oversold fixture', (string) $f['rsi']);
+        T::eq(1.0, (float) $f['trend_up'], 'the 1h regime gate is captured as 1');
+    }
+    if ($skipped !== null) {
+        T::eq('DOGEUSDT', (string) $skipped['symbol'], 'skipped row is the symbol that did not trade');
+        T::eq('not_taken', (string) $skipped['outcome'], 'a skip resolves to not_taken immediately');
+        T::eq((string) $skipped['ts'], (string) $skipped['resolved_at'], 'and is resolved at capture time');
+        T::eq(null, $skipped['pnl_usdt'], 'a skip carries no PnL');
+        T::eq(null, $skipped['position_id'], 'a skip points at no position');
+        T::ok((string) $skipped['skip_reason'] !== '', 'a skip records why', (string) $skipped['skip_reason']);
+        T::eq('size_unaffordable', (string) $skipped['skip_reason'], 'DOGE at 130 with stepSize 1 is size_unaffordable');
+    }
+    $counts = $db->observationCounts('paper');
+    T::eq(2, (int) $counts['total'], 'header count: two observations');
+    T::eq(1, (int) $counts['entered'], 'header count: one entered');
+    T::eq(1, (int) $counts['skipped'], 'header count: one skipped');
+    T::eq(0, (int) $counts['wins'], 'no win yet — the position is still open');
+
+    // the close resolves the entry with the right outcome and PnL
+    $md->setPrice('SOLUSDT', 131.50, 131.55);
+    $r2 = (new Bot($cfg, $db, $ex, $t0 + 120000))->tick();
+    T::strContains($r2['summary'], 'exited:take_profit', 'tick2 closed the position at take-profit');
+    $closed = $db->closedPositions(1);
+    $row = $entered === null ? null : $db->observation((int) $entered['id']);
+    T::ok($row !== null, 'the entry observation is still there');
+    if ($row !== null && $closed !== []) {
+        T::eq('win', (string) $row['outcome'], 'a profitable close resolves the observation to win');
+        T::near((float) $closed[0]['pnl_usdt'], (float) $row['pnl_usdt'], 1e-12, 'the resolved PnL is the position PnL');
+        T::near((float) $closed[0]['pnl_pct'], (float) $row['pnl_pct'], 1e-9, 'and the percentage');
+        T::eq('take_profit', (string) $row['exit_reason'], 'the exit reason is carried across');
+        T::near(2.0, (float) $row['held_minutes'], 1e-9, 'held_minutes measured from the injected clock');
+        T::ok((string) $row['resolved_at'] !== '', 'resolved_at is stamped');
+    }
+    T::eq(2, countRows($db, 'SELECT COUNT(*) FROM observations'), 'a close resolves a row, it never adds one');
+
+    // no observation is written twice, and no outcome is ever rewritten
+    $frozen = (string) json_encode($db->observations(['order' => 'asc', 'limit' => 50]));
+    $r3 = (new Bot($cfg, $db, $ex, $t0 + 180000))->tick();
+    T::eq('ok', $r3['status'], 'tick3 ok', $r3['summary']);
+    T::eq('no_new_candle', $db->getState('no_trade_reason'), 'tick3 evaluated nothing (same candle)');
+    T::eq(2, countRows($db, 'SELECT COUNT(*) FROM observations'), 'a tick that evaluates nothing writes no observation');
+    T::eq($frozen, (string) json_encode($db->observations(['order' => 'asc', 'limit' => 50])), 'a repeated sweep rewrites nothing');
+
+    // a losing round trip resolves to `loss` with a negative PnL
+    $t1 = $t0 + 15 * 60000;                       // the next 15m candle closes: a fresh evaluation
+    $md->setPrice('SOLUSDT', 129.75, 129.80);
+    $r4 = (new Bot($cfg, $db, $ex, $t1))->tick();
+    T::strContains($r4['summary'], 'entered:SOLUSDT', 'tick4 re-entered on the new candle');
+    T::eq(4, countRows($db, 'SELECT COUNT(*) FROM observations'), 'the new evaluation wrote two more rows');
+    $md->setPrice('SOLUSDT', 128.90, 128.95);
+    $r5 = (new Bot($cfg, $db, $ex, $t1 + 60000))->tick();
+    T::strContains($r5['summary'], 'exited:stop_loss', 'tick5 stopped out');
+    $enteredId = $entered === null ? 0 : (int) $entered['id'];
+    $lossRow = null;
+    foreach ($db->observations(['order' => 'asc', 'limit' => 50]) as $o) {
+        if ((string) $o['decision'] === 'entered' && (int) $o['id'] > $enteredId) {
+            $lossRow = $o;
+        }
+    }
+    T::ok($lossRow !== null, 'the second entry has its own observation');
+    if ($lossRow !== null) {
+        T::eq('loss', (string) $lossRow['outcome'], 'a losing close resolves to loss');
+        T::ok((float) $lossRow['pnl_usdt'] < 0.0, 'with a negative PnL', (string) $lossRow['pnl_usdt']);
+        T::eq('stop_loss', (string) $lossRow['exit_reason'], 'and the stop-loss exit reason');
+    }
+    $counts = $db->observationCounts('paper');
+    T::eq(4, (int) $counts['total'], 'four observations in total');
+    T::eq(2, (int) $counts['entered'], 'two entries');
+    T::eq(2, (int) $counts['skipped'], 'two skips');
+    T::eq(1, (int) $counts['wins'], 'one win');
+    T::eq(1, (int) $counts['losses'], 'one loss');
+    T::eq(4, (int) $counts['resolved'], 'every row is resolved');
+    T::eq(0, countRows($db, "SELECT COUNT(*) FROM observations WHERE decision = 'skipped' AND outcome <> 'not_taken'"),
+        'no skipped row is ever counted as a win or a loss');
+
+    // with learning_enabled false, capture does not happen at all
+    $db2 = freshDb('learn-capture-off');
+    $md2 = botMd();
+    $ex2 = new PaperExchange($md2, $db2, 0.1, 10.0);
+    $off = (new Bot(botCfg(learnBlock(['learning_enabled' => false])), $db2, $ex2, $t0))->tick();
+    T::strContains($off['summary'], 'entered:SOLUSDT', 'the same tick still trades with learning off');
+    T::eq(0, countRows($db2, 'SELECT COUNT(*) FROM observations'), 'learning_enabled = false captures nothing');
+});
+
+/* ------------------------------------------------------------------- learn-caps */
+
+T::group('learn-caps', ['Learn', 'FakeObservations', 'Db', 'Strategy'], static function (): void {
+    /*
+     * THE SAFETY TEST (DESIGN-LEARNING.md §1, §4 and §8).
+     *
+     * Evidence is engineered to demand an enormous adjustment: every score component's
+     * condition correlates with the outcome, the win rates are 95 % against 5 %, and the
+     * average PnL gap is 810 USDT on a 6.5 USDT position. Whatever the learner would like to
+     * do with that, it may do exactly one thing: move ONE score-component weight by at most
+     * ten points. This group snapshots the entire configuration and the whole database first
+     * and proves that is all that happened.
+     */
+    $db  = freshDb('learn-caps');
+    $now = '2026-09-03T12:00:00Z';
+    $cfg = learnFullCfg(['learning_apply' => true, 'learn_min_samples' => 60]);
+
+    $rows = FakeObservations::set([
+        'end'           => $now,
+        'n'             => 200,
+        'carriers'      => ['rsi', 'bb', 'vol', 'rsi_up', 'reversal', 'trend'],
+        'win_rate_good' => 0.95,
+        'win_rate_bad'  => 0.05,
+        'pnl_win'       => 500.0,
+        'pnl_loss'      => -400.0,
+    ]);
+    T::eq(400, FakeObservations::seed($db, $rows), 'seeded the adversarial evidence');
+    $good = FakeObservations::measure($rows, 'rsi', 'lte', 30.0);
+    $bad  = FakeObservations::measure($rows, 'rsi', 'gt', 30.0);
+    T::near(95.0, (float) $good['win_rate'], 1e-9, 'the evidence really is extreme (95 % on one side)');
+    T::near(5.0, (float) $bad['win_rate'], 1e-9, 'and 5 % on the other');
+    T::ok((float) $good['avg_pnl'] - (float) $bad['avg_pnl'] > 500.0, 'and demands a huge adjustment',
+        (string) ((float) $good['avg_pnl'] - (float) $bad['avg_pnl']));
+
+    // an adversarial weight map already in state: risk keys, absurd deltas, absurd threshold
+    $db->setState('learn_weights', [
+        'rsi' => 999, 'bb' => -999, 'vol' => 1e9, 'threshold' => 99999,
+        'trade_usdt' => 500, 'stop_loss_pct' => 99, 'take_profit_pct' => 99,
+        'equity_floor_usdt' => 0, 'daily_loss_cap_pct' => 99, 'sleeves' => 'anything',
+    ]);
+    $weights = Learn::weights($db, $cfg);
+    T::eq(array_merge(Learn::COMPONENTS, ['threshold']), array_keys($weights),
+        'the weight map is exactly the score components plus the threshold — nothing else survives');
+    foreach (['trade_usdt', 'stop_loss_pct', 'take_profit_pct', 'equity_floor_usdt', 'daily_loss_cap_pct', 'sleeves'] as $k) {
+        T::ok(!array_key_exists($k, $weights), 'a hand-planted "' . $k . '" is dropped from the weight map');
+    }
+    T::eq(10, (int) $weights['rsi'], 'a +999 delta clamps to +10');
+    T::eq(-10, (int) $weights['bb'], 'a −999 delta clamps to −10');
+    T::eq(10, (int) $weights['vol'], 'a 1e9 delta clamps to +10');
+    T::eq(100, (int) $weights['threshold'], 'a 99999 threshold clamps to 100');
+    T::eq(0, Learn::clampDelta('trend', 10.0), 'a component that carries no points can never be nudged');
+    T::eq(0, Learn::clampDelta('stop_loss_pct', 10.0), 'an unknown component clamps to 0');
+    T::eq(-10, Learn::clampDelta('rsi', -999.0), 'clampDelta floors at −10');
+    T::eq(10, Learn::clampDelta('rsi', 999.0), 'clampDelta ceils at +10');
+    T::eq(0, Learn::clampDelta('rsi', NAN), 'a non-finite delta is 0');
+    $lowThreshold = Learn::sanitizeWeights(['threshold' => -5000], $cfg);
+    T::eq((int) $cfg['entry_threshold'] - 10, (int) $lowThreshold['threshold'],
+        'the threshold can never fall below entry_threshold − 10');
+
+    // seed live risk / kill-switch state so "nothing else moved" is tested against real rows
+    foreach (learnRiskState() as $k => $v) {
+        $db->setState($k, $v);
+    }
+    closedPosition($db, -1.25);
+    $db->insertSignal('SOLUSDT', 90, true, 129.75, ['rsi<=30']);
+    $db->insertEquity(10.0, 3.5, 6.5, 0.001);
+
+    /*
+     * The three state keys a recompute may write. The log key is read from Learn's own
+     * declared surface when it declares one, so this group pins the SIZE and the SHAPE of
+     * that surface rather than one spelling of it — and then asserts, below, that the
+     * surface really is all that moved.
+     */
+    $logKey = 'learn_log';
+    if (method_exists('Learn', 'writableStateKeys')) {
+        $declared = Learn::writableStateKeys();
+        T::ok(count($declared) <= 3, 'Learn declares at most three writable state keys', T::dump($declared));
+        foreach ($declared as $k) {
+            T::ok(strpos((string) $k, 'learn_') === 0, 'declared writable key ' . $k . ' is a learning key');
+            if ((string) $k !== 'learn_weights' && (string) $k !== 'learn_at') {
+                $logKey = (string) $k;
+            }
+        }
+        T::contains($declared, 'learn_weights', 'the weight map is declared writable');
+        T::contains($declared, 'learn_at', 'and its timestamp');
+    }
+    $allowedState = ['learn_at', 'learn_weights', $logKey];
+    sort($allowedState);
+
+    $cfgBefore    = (string) json_encode($cfg);
+    $stateBefore  = stateSnapshot($db);
+    $tablesBefore = tablesSnapshot($db);
+
+    $res = Learn::recompute($db, $cfg, $now);
+
+    // ---- 1. the configuration is untouched, byte for byte -------------------------------
+    T::eq($cfgBefore, (string) json_encode($cfg), 'recompute() cannot modify the configuration it was given');
+    $cfgAfter = json_decode($cfgBefore, true);
+    foreach (learnForbiddenCfgKeys() as $key) {
+        T::ok(array_key_exists($key, $cfgAfter), 'the snapshot really contains ' . $key);
+        T::eq((string) json_encode($cfgAfter[$key]), (string) json_encode($cfg[$key]),
+            $key . ' is byte-identical after the recompute');
+    }
+    $sleeves = isset($cfg['sleeves']) && is_array($cfg['sleeves']) ? $cfg['sleeves'] : [];
+    T::ok($sleeves !== [], 'the config carries sleeve budgets to protect');
+    foreach ($sleeves as $engine => $sleeve) {
+        $wasBudget = isset($cfgAfter['sleeves'][$engine]['budget_usdt']) ? $cfgAfter['sleeves'][$engine]['budget_usdt'] : null;
+        $nowBudget = isset($sleeve['budget_usdt']) ? $sleeve['budget_usdt'] : null;
+        T::ok($nowBudget !== null, 'sleeve ' . $engine . ' has a budget to protect');
+        T::eq((string) json_encode($wasBudget), (string) json_encode($nowBudget),
+              'sleeve ' . $engine . ' budget is byte-identical');
+    }
+
+    // ---- 2. the ONLY state that moved is the weight map, its stamp and its log ----------
+    $stateAfter = stateSnapshot($db);
+    T::eq($allowedState, snapshotDiff($stateBefore, $stateAfter),
+        'the only state keys a recompute may write are learn_weights, learn_at and the learn log');
+    foreach (learnRiskState() as $k => $v) {
+        T::eq($v, isset($stateAfter[$k]) ? $stateAfter[$k] : null, 'kill-switch state ' . $k . ' is byte-identical');
+    }
+    T::eq($now, (string) $db->getState('learn_at', ''), 'learn_at is stamped with the recompute instant');
+    T::eq(1, count(Learn::recomputeLog($db)), 'the recompute is logged once');
+
+    // ---- 3. no other table moved -------------------------------------------------------
+    $tablesAfter = tablesSnapshot($db);
+    T::eq(['state'], snapshotDiff($tablesBefore, $tablesAfter), 'no table other than `state` was written');
+    foreach (['positions', 'orders', 'trades', 'signals', 'equity', 'observations', 'cycles', 'lots',
+              'engine_orders', 'sleeve_equity', 'scanner'] as $table) {
+        if (isset($tablesBefore[$table])) {
+            T::eq($tablesBefore[$table], $tablesAfter[$table], 'table ' . $table . ' is untouched');
+        }
+    }
+
+    // ---- 4. the §4 caps held under evidence that begged for more ------------------------
+    T::ok(count($res['candidates']) >= 4, 'the evidence produced several confident candidates',
+        (string) count($res['candidates']));
+    $maxSeparation = 0.0;
+    foreach ($res['candidates'] as $candidate) {
+        $maxSeparation = max($maxSeparation, abs((float) $candidate['separation']));
+        T::ok(abs((int) $candidate['delta']) <= 10, 'candidate ' . $candidate['component'] . ' delta within ±10',
+            (string) $candidate['delta']);
+    }
+    T::ok($maxSeparation > 500.0, 'and the evidence asked for an adjustment worth hundreds of USDT',
+        (string) $maxSeparation);
+    T::eq(true, (bool) $res['ok'], 'the recompute completed without tripping its own cap guard: ' . (string) $res['reason']);
+    T::eq(true, (bool) $res['applied'], 'and wrote its decision, because learning_apply is on');
+    T::ok($res['changed'] !== null, 'one component was adjusted', (string) $res['reason']);
+    $moved = [];
+    foreach (Learn::COMPONENTS as $component) {
+        if ((int) $res['weights'][$component] !== (int) $res['previous'][$component]) {
+            $moved[] = $component;
+        }
+    }
+    T::eq(1, count($moved), 'AT MOST ONE component may change per recompute', T::dump($moved));
+    T::eq($res['changed'], $moved[0] ?? null, 'and it is the component the result names');
+    T::ok(abs((int) $res['to'] - (int) $res['from']) <= 10, 'the change itself is at most ten points',
+        $res['from'] . ' -> ' . $res['to']);
+    T::eq((int) $res['previous']['threshold'], (int) $res['weights']['threshold'], 'the threshold did not move');
+    T::ok((int) $res['weights']['threshold'] >= (int) $cfg['entry_threshold'] - 10
+        && (int) $res['weights']['threshold'] <= 100, 'the threshold stays in [entry_threshold − 10, 100]',
+        (string) $res['weights']['threshold']);
+
+    // ---- 5. hammer it: eight more recomputes, each still bounded ------------------------
+    $ts = (int) Util::isoToTs($now);
+    $prev = $res['weights'];
+    for ($k = 1; $k <= 8; $k++) {
+        $at   = Util::nowIso($ts + $k * 169 * 3600);
+        $run  = Learn::recompute($db, $cfg, $at);
+        $diff = [];
+        foreach (Learn::COMPONENTS as $component) {
+            $delta = (int) $run['weights'][$component] - (int) $prev[$component];
+            if ($delta !== 0) {
+                $diff[] = $component;
+            }
+            T::ok(abs($delta) <= 10, 'run ' . $k . ': ' . $component . ' moved by at most ten points', (string) $delta);
+            T::ok(abs((int) $run['weights'][$component]) <= 10,
+                'run ' . $k . ': ' . $component . ' stays inside ±10', (string) $run['weights'][$component]);
+            $base = Strategy::LEARN_COMPONENTS[$component] ?? 0;
+            T::ok((int) $run['weights'][$component] >= -$base,
+                'run ' . $k . ': ' . $component . ' is never inverted past its base value');
+        }
+        T::ok(count($diff) <= 1, 'run ' . $k . ': at most one component changed', T::dump($diff));
+        T::ok((int) $run['weights']['threshold'] >= (int) $cfg['entry_threshold'] - 10
+            && (int) $run['weights']['threshold'] <= 100, 'run ' . $k . ': threshold still in range');
+        $prev = $run['weights'];
+    }
+    T::eq(0, (int) $prev['trend'], 'the `trend` component carries no score points and was never moved');
+    $stateEnd = stateSnapshot($db);
+    T::eq($allowedState, snapshotDiff($stateBefore, $stateEnd),
+        'after nine recomputes the state diff is still only the three learning keys');
+    foreach (learnForbiddenCfgKeys() as $key) {
+        T::ok(!array_key_exists($key, $stateEnd), 'no recompute ever created a state key called ' . $key);
+    }
+    T::eq(['state'], snapshotDiff($tablesBefore, tablesSnapshot($db)), 'and still no other table was written');
+
+    // ---- 5b. and the configuration FILE is not writable from here either ---------------
+    if (function_exists('trader_save_config') && function_exists('trader_config_path')) {
+        trader_save_config($cfg);
+        $cfgPath   = trader_config_path();
+        $fileBefore = (string) @file_get_contents($cfgPath);
+        T::ok($fileBefore !== '', 'there is a config.json on disk to protect');
+        Learn::recompute($db, $cfg, Util::nowIso($ts + 9 * 169 * 3600));
+        T::eq($fileBefore, (string) @file_get_contents($cfgPath), 'a recompute never rewrites config.json');
+    }
+
+    // ---- 6. the write surface is narrow BY CONSTRUCTION, not by convention -------------
+    $code = codeOf('lib/Learn.php');
+    T::ok($code !== '', 'lib/Learn.php source is readable');
+    if ($code !== '') {
+        // comments are stripped, so a doc block promising never to call something proves nothing
+        foreach (['trader_save_config', 'trader_config', 'file_put_contents', 'fwrite', 'rename('] as $writer) {
+            T::ok(strpos($code, $writer) === false, 'Learn never reaches the config writer ' . $writer);
+        }
+        foreach (['insertPosition', 'updatePosition', 'insertOrder', 'updateOrder', 'insertTrade',
+                  'insertLot', 'consumeLots', 'insertCycle', 'insertEngineOrder', 'updateEngineOrder',
+                  'insertSleeveEquity', 'replaceScanner', 'insertObservation', 'resolveObservation'] as $writer) {
+            T::ok(strpos($code, $writer) === false, 'Learn never calls the table writer ' . $writer);
+        }
+        $calls = [];
+        if (preg_match_all('/\$db\s*->\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/', $code, $m)) {
+            foreach ($m[1] as $name) {
+                $calls[(string) $name] = true;
+            }
+        }
+        $allowed = ['getState' => true, 'getStateJson' => true, 'observations' => true,
+                    'observation' => true, 'observationCounts' => true, 'openObservations' => true,
+                    'observationFor' => true, 'setState' => true];
+        foreach (array_keys($calls) as $name) {
+            T::ok(isset($allowed[$name]), 'Learn only calls read-only Db methods (plus setState): ' . $name);
+        }
+        T::ok(!isset($calls['pdo']), 'Learn never reaches raw SQL through Db::pdo()');
+        // any state write with a literal key must name one of the three allowed keys
+        if (preg_match_all('/setState\s*\(\s*(?:\$[A-Za-z_][A-Za-z0-9_]*\s*,\s*)?[\'"]([a-z_]+)[\'"]/', $code, $m2)) {
+            foreach ($m2[1] as $key) {
+                T::contains($allowedState, (string) $key, 'a literal state write names an allowed key');
+            }
+        }
+    }
+
+    // the scorer's own surface is just as narrow: no key there names a risk parameter either
+    $components = array_keys(Strategy::LEARN_COMPONENTS);
+    sort($components);
+    $expected = Learn::COMPONENTS;
+    sort($expected);
+    T::eq($expected, $components, 'Strategy and Learn agree on the components a weight may touch');
+    foreach (learnForbiddenCfgKeys() as $key) {
+        T::ok(!array_key_exists($key, Strategy::LEARN_COMPONENTS),
+            'Strategy::LEARN_COMPONENTS has no entry for ' . $key);
+    }
+    T::eq(10, (int) Strategy::LEARN_DELTA_CAP, 'the scorer caps a delta at ten points too');
+
+    // and the capture surface: every column the bot may write is a column of `observations`
+    if (defined('Bot::OBS_COLUMNS')) {
+        $cols = [];
+        foreach ($db->pdo()->query('PRAGMA table_info(observations)')->fetchAll(PDO::FETCH_ASSOC) as $c) {
+            $cols[(string) $c['name']] = true;
+        }
+        foreach (Bot::OBS_COLUMNS as $col) {
+            T::ok(isset($cols[(string) $col]), 'capture column ' . $col . ' is a column of `observations`');
+        }
+    }
+});
+
+/* ------------------------------------------------------------------- learn-caps-repeat */
+
+/*
+ * THE SAFETY PROOF, run ten times.
+ *
+ * `learn-caps` proves one recompute is bounded. This group proves REPETITION cannot
+ * launder a bounded step into an unbounded one: ten consecutive recomputes against
+ * evidence engineered to demand an adjustment worth hundreds of USDT on every single
+ * component, with the weight map pre-loaded at the cap so the only way forward is
+ * through it. After every one of the ten it re-checks the WHOLE config and the WHOLE
+ * state table, not just at the end - a run that moved a kill switch and moved it back
+ * would pass an end-to-end diff and must not pass this.
+ */
+T::group('learn-caps-repeat', ['Learn', 'FakeObservations', 'Db', 'Strategy'], static function (): void {
+    $db  = freshDb('learn-caps-repeat');
+    $now = '2026-09-03T12:00:00Z';
+    $ts  = (int) Util::isoToTs($now);
+    $cfg = learnFullCfg(['learning_apply' => true, 'learn_min_samples' => 60, 'learn_recompute_hours' => 168]);
+
+    // every component's condition correlates with the outcome, 98 % against 2 %, and the
+    // expectancy gap is three orders of magnitude larger than the position it was earned on
+    T::eq(600, FakeObservations::seed($db, FakeObservations::set([
+        'end'           => $now,
+        'n'             => 300,
+        'carriers'      => ['rsi', 'bb', 'vol', 'rsi_up', 'reversal', 'trend'],
+        'win_rate_good' => 0.98,
+        'win_rate_bad'  => 0.02,
+        'pnl_win'       => 5000.0,
+        'pnl_loss'      => -4000.0,
+    ])), 'seeded 600 adversarial trades');
+
+    // start from a clean map, so the ten runs have every point of headroom the caps allow
+    // and the walk toward them is the thing under test
+    $start = Learn::weights($db, $cfg);
+    foreach (Learn::COMPONENTS as $component) {
+        T::eq(0, (int) $start[$component], 'component ' . $component . ' starts at 0');
+    }
+
+    // live risk and kill-switch rows, so "nothing else moved" is tested against real state
+    foreach (learnRiskState() as $k => $v) {
+        $db->setState($k, $v);
+    }
+    closedPosition($db, -2.75);
+    $db->insertSignal('SOLUSDT', 95, true, 129.75, ['rsi<=30']);
+    $db->insertEquity(9.5, 3.0, 6.5, 0.002);
+
+    $logKey = 'learn_log';
+    if (method_exists('Learn', 'writableStateKeys')) {
+        foreach (Learn::writableStateKeys() as $k) {
+            if ((string) $k !== 'learn_weights' && (string) $k !== 'learn_at') {
+                $logKey = (string) $k;
+            }
+        }
+    }
+    $allowedState = ['learn_at', 'learn_weights', $logKey];
+    sort($allowedState);
+
+    $cfgBefore    = (string) json_encode($cfg);
+    $stateBefore  = stateSnapshot($db);
+    $tablesBefore = tablesSnapshot($db);
+    T::ok(isset($stateBefore['equity_hwm']) && isset($stateBefore['paused_until']),
+        'the state snapshot really holds kill-switch rows');
+
+    $fired = 0;
+    for ($k = 1; $k <= 10; $k++) {
+        // spaced past learn_recompute_hours so every one of the ten actually fires
+        $at  = Util::nowIso($ts + $k * 169 * 3600);
+        $run = Learn::recompute($db, $cfg, $at);
+        if ($run['changed'] !== null) {
+            $fired++;
+        }
+
+        // (a) the ONLY state that moved, after EVERY run, is the three learning keys
+        T::eq($allowedState, snapshotDiff($stateBefore, stateSnapshot($db)),
+            'run ' . $k . ': the state diff is still exactly learn_weights, learn_at and the log');
+        // and no other table at all
+        T::eq(['state'], snapshotDiff($tablesBefore, tablesSnapshot($db)),
+            'run ' . $k . ': no table other than `state` was written');
+
+        // (b) no weight escaped ±10, however many recomputes have run
+        $stored = Learn::weights($db, $cfg);
+        foreach (Learn::COMPONENTS as $component) {
+            $w    = (int) $run['weights'][$component];
+            $base = (int) Strategy::LEARN_COMPONENTS[$component];
+            T::ok(abs($w) <= 10, 'run ' . $k . ': ' . $component . ' is inside ±10', (string) $w);
+            T::ok($w >= -$base, 'run ' . $k . ': ' . $component . ' is never inverted past its base', (string) $w);
+            T::ok(abs($w) <= abs($base) || $base === 0,
+                'run ' . $k . ': ' . $component . ' never exceeds its own base value', (string) $w);
+            T::eq($w, (int) $stored[$component],
+                'run ' . $k . ': the stored ' . $component . ' weight is the one the run reports');
+            // and what the SCORER would apply is that same bounded number, not the raw map
+            T::eq($w, (int) Strategy::componentDelta($stored, $component),
+                'run ' . $k . ': the scorer applies exactly the stored ' . $component . ' delta, clamped');
+        }
+        T::ok((int) $run['weights']['threshold'] >= (int) $cfg['entry_threshold'] - 10
+            && (int) $run['weights']['threshold'] <= 100,
+            'run ' . $k . ': the threshold stays in [entry_threshold − 10, 100]',
+            (string) $run['weights']['threshold']);
+
+        // (c) every risk key is byte-identical, after every run
+        $after = stateSnapshot($db);
+        foreach (learnRiskState() as $key => $value) {
+            T::eq($value, isset($after[$key]) ? $after[$key] : null,
+                'run ' . $k . ': kill-switch state ' . $key . ' is byte-identical');
+        }
+        foreach (learnForbiddenCfgKeys() as $key) {
+            T::ok(!array_key_exists($key, $after), 'run ' . $k . ': no state key called ' . $key . ' was created');
+        }
+        // and the configuration array itself never moved
+        T::eq($cfgBefore, (string) json_encode($cfg), 'run ' . $k . ': the configuration is byte-identical');
+    }
+
+    T::ok($fired > 0, 'the evidence really did drive the learner: it changed something at least once',
+        (string) $fired . ' of 10 runs moved a component');
+    $end = Learn::weights($db, $cfg);
+    foreach (Learn::COMPONENTS as $component) {
+        T::ok(abs((int) $end[$component]) <= 10,
+            'after ten recomputes ' . $component . ' is STILL inside ±10', (string) $end[$component]);
+    }
+    T::eq(0, (int) $end['trend'], 'and `trend`, which carries no score points, never moved at all');
+
+    // ---- no headroom: every component pinned AT the cap, ten more recomputes -----------
+    // The evidence still screams for more. There is nowhere left to put it, so a single
+    // point added anywhere would be a cap breach with nothing to hide behind.
+    $atCap = [];
+    foreach (Learn::COMPONENTS as $component) {
+        $atCap[(string) $component] = (int) Strategy::LEARN_COMPONENTS[$component] > 0 ? 10 : 0;
+    }
+    $db->setState('learn_weights', $atCap);
+    foreach (Learn::COMPONENTS as $component) {
+        T::eq($atCap[$component], (int) Learn::weights($db, $cfg)[$component],
+            'component ' . $component . ' is pinned at its cap');
+    }
+    for ($k = 11; $k <= 20; $k++) {
+        $run = Learn::recompute($db, $cfg, Util::nowIso($ts + $k * 169 * 3600));
+        foreach (Learn::COMPONENTS as $component) {
+            T::eq($atCap[$component], (int) $run['weights'][$component],
+                'capped run ' . $k . ': ' . $component . ' cannot be walked past its cap');
+        }
+        T::eq($allowedState, snapshotDiff($stateBefore, stateSnapshot($db)),
+            'capped run ' . $k . ': still only the three learning keys moved');
+        foreach (learnRiskState() as $key => $value) {
+            T::eq($value, (string) $db->getState($key, ''),
+                'capped run ' . $k . ': kill-switch state ' . $key . ' is byte-identical');
+        }
+    }
+    T::eq(['state'], snapshotDiff($tablesBefore, tablesSnapshot($db)),
+        'twenty recomputes later, still no table other than `state` was written');
+
+    // ---- ten more IN A ROW at the same instant: the cadence gate makes them no-ops ------
+    $before = Learn::weights($db, $cfg);
+    $at     = Util::nowIso($ts + 21 * 169 * 3600);
+    $first  = Learn::recompute($db, $cfg, $at);
+    for ($k = 2; $k <= 10; $k++) {
+        $again = Learn::recompute($db, $cfg, $at);
+        T::eq(null, $again['changed'], 'immediate repeat ' . $k . ' inside learn_recompute_hours changes nothing');
+        T::eq((string) json_encode($first['weights']), (string) json_encode($again['weights']),
+            'immediate repeat ' . $k . ': the weight map is unchanged');
+    }
+    T::eq($allowedState, snapshotDiff($stateBefore, stateSnapshot($db)),
+        'ten immediate repeats still touch only the three learning keys');
+    foreach (Learn::COMPONENTS as $component) {
+        T::ok(abs((int) Learn::weights($db, $cfg)[$component]) <= 10,
+            'and ' . $component . ' is inside ±10 after thirty recomputes in total');
+    }
+    T::ok(count($before) === count(Learn::weights($db, $cfg)), 'the weight map never grew a key');
+});
+
+/* ------------------------------------------------------------------- learn-evidence */
+
+T::group('learn-evidence', ['Learn', 'FakeObservations', 'Db', 'Panel'], static function (): void {
+    $now = '2026-09-03T12:00:00Z';
+    $cfg = learnCfg(['learning_apply' => true, 'learn_min_samples' => 60]);
+
+    /* ---- the fixture really does embed the relationship it claims to ---------------- */
+    $rows = FakeObservations::set(['end' => $now, 'n' => 120, 'skipped' => 10]);
+    $low  = FakeObservations::measure($rows, 'rsi', 'lte', 30.0);
+    $high = FakeObservations::measure($rows, 'rsi', 'gt', 30.0);
+    T::eq(120, (int) $low['n'], 'the fixture has 120 low-RSI trades');
+    T::eq(120, (int) $high['n'], 'and 120 high-RSI trades');
+    T::near(80.0, (float) $low['win_rate'], 1e-9, 'low RSI genuinely wins more (80 %)');
+    T::near(20.0, (float) $high['win_rate'], 1e-9, 'high RSI genuinely wins less (20 %)');
+    $sLo = FakeObservations::measure($rows, 'spread_pct', 'lt', 0.01);
+    $sHi = FakeObservations::measure($rows, 'spread_pct', 'gt', 0.01);
+    T::eq((int) $sLo['n'], (int) $sHi['n'], 'the spread buckets are the same size');
+    T::near((float) $sLo['win_rate'], (float) $sHi['win_rate'], 1e-9, 'and spread carries NO relationship at all');
+    T::near((float) $sLo['avg_pnl'], (float) $sHi['avg_pnl'], 1e-9, 'nor any difference in expectancy');
+
+    /* ---- below learn_min_samples nothing is confident and nothing is adjusted -------- */
+    $thin = freshDb('learn-evidence-thin');
+    FakeObservations::seed($thin, FakeObservations::set(['end' => $now, 'n' => 25]));
+    $thinInsights = Learn::insights($thin, $cfg, 90);
+    $confident = 0;
+    foreach ($thinInsights as $i) {
+        if (!empty($i['confident'])) {
+            $confident++;
+        }
+    }
+    T::eq(0, $confident, 'with 25 trades a side, no feature is confident');
+    T::eq([], Learn::adjustments($thin, $cfg, $now), 'and no adjustment is produced');
+    $thinRun = Learn::recompute($thin, $cfg, $now);
+    T::eq(null, $thinRun['changed'], 'a recompute on thin evidence changes nothing');
+    T::eq(50, (int) $thinRun['samples'], 'it still reports how much evidence it saw');
+    T::strContains((string) $thinRun['note'], '60', 'the note names the sample floor it did not clear');
+    T::strContains((string) $thinRun['note'], 'sample', 'and says plainly that the evidence is too thin');
+
+    /* ---- a strong, well-sampled separation produces exactly ONE bounded adjustment --- */
+    $db = freshDb('learn-evidence');
+    T::eq(250, FakeObservations::seed($db, $rows), 'seeded 240 trades and 10 control rows');
+    $insights = Learn::insights($db, $cfg, 90);
+    T::ok($insights !== [], 'insights returns one card per feature');
+    T::eq(count(Learn::features()), count($insights), 'every captured feature gets a card');
+    $byFeature = [];
+    foreach ($insights as $i) {
+        $byFeature[(string) $i['feature']] = $i;
+    }
+    T::ok(isset($byFeature['rsi']), 'there is an RSI card');
+    T::eq('rsi', (string) $insights[0]['feature'], 'the confident feature is ranked first');
+    $rsi = $byFeature['rsi'];
+    T::eq(true, (bool) $rsi['confident'], 'insights() FINDS the relationship that was planted');
+    T::eq(240, (int) $rsi['samples'], 'on 240 resolved trades — the control rows are not evidence');
+    T::near(0.30, (float) $rsi['separation'], 1e-9, 'the separation is the expectancy gap');
+    T::eq(7, count($rsi['buckets']), 'the RSI card reports every bucket, empty ones included');
+    $named = [];
+    foreach ($rsi['buckets'] as $b) {
+        if ((int) $b['n'] > 0) {
+            $named[(string) $b['label']] = $b;
+        }
+    }
+    T::eq(['25-30', '50-70'], array_keys($named), 'the evidence sits in the two buckets it was put in');
+    T::near(80.0, (float) $named['25-30']['win_rate'], 1e-9, 'the low-RSI bucket wins 80 %');
+    T::near(20.0, (float) $named['50-70']['win_rate'], 1e-9, 'the high-RSI bucket wins 20 %');
+    T::ok((float) $named['25-30']['wilson_lo'] > (float) $named['50-70']['wilson_hi'],
+        'and their confidence intervals do not overlap');
+    T::ok((int) $rsi['min_samples'] === 60, 'the card states the sample size it needs');
+
+    // ... and REJECTS a feature with no relationship
+    foreach (['spread_pct', 'hour_utc', 'vol_ratio', 'atr_pct', 'trend_up'] as $flat) {
+        T::ok(isset($byFeature[$flat]), 'there is a card for ' . $flat);
+        if (isset($byFeature[$flat])) {
+            T::eq(false, (bool) $byFeature[$flat]['confident'], $flat . ' carries no relationship and is not confident');
+            T::near(0.0, (float) $byFeature[$flat]['confident_separation'], 1e-9, $flat . ' separates nothing');
+            T::ok((string) $byFeature[$flat]['note'] !== '', $flat . ' still explains itself in plain language');
+        }
+    }
+
+    $adj = Learn::adjustments($db, $cfg, $now);
+    T::eq(1, count($adj), 'exactly one adjustment is implied by the evidence');
+    if ($adj !== []) {
+        T::eq('rsi', (string) $adj[0]['component'], 'and it is the component whose condition was planted');
+        T::eq(10, (int) $adj[0]['delta'], 'the nudge is the full ten points, and no more');
+        T::ok(abs((int) $adj[0]['delta']) <= 10, 'which is inside the ±10 cap');
+        T::eq(240, (int) $adj[0]['n'], 'reported against its sample size');
+    }
+    $run = Learn::recompute($db, $cfg, $now);
+    T::eq('rsi', (string) $run['changed'], 'the recompute applies it');
+    T::eq(0, (int) $run['from'], 'from 0');
+    T::eq(10, (int) $run['to'], 'to +10');
+    T::eq(true, (bool) $run['applied'], 'and writes it, because learning_apply is on');
+    T::strContains((string) $run['note'], '240', 'the note states the sample size next to the claim');
+
+    /* ---- a lucky five-trade streak produces NOTHING ---------------------------------- */
+    $lucky = freshDb('learn-evidence-lucky');
+    $streak = FakeObservations::set([
+        'end' => $now, 'n_good' => 3, 'n_bad' => 2, 'win_rate_good' => 1.0, 'win_rate_bad' => 0.0,
+    ]);
+    T::eq(5, count($streak), 'the streak is five trades');
+    T::eq(5, FakeObservations::seed($lucky, $streak), 'seeded the streak');
+    T::near(100.0, (float) FakeObservations::measure($streak, 'rsi', 'lte', 30.0)['win_rate'], 1e-9,
+        'every low-RSI trade in the streak won');
+    T::near(0.0, (float) FakeObservations::measure($streak, 'rsi', 'gt', 30.0)['win_rate'], 1e-9,
+        'and every other one lost — a perfect-looking pattern');
+    T::eq([], Learn::adjustments($lucky, $cfg, $now), 'five trades produce NO adjustment');
+    $luckyRun = Learn::recompute($lucky, $cfg, $now);
+    T::eq(null, $luckyRun['changed'], 'and the recompute changes nothing');
+    T::eq(5, (int) $luckyRun['samples'], 'even though it saw all five');
+    foreach (Learn::COMPONENTS as $component) {
+        T::eq(0, (int) $luckyRun['weights'][$component], 'component ' . $component . ' is still 0 after the streak');
+    }
+    // and not merely because of the sample floor: the Wilson intervals overlap, so it is luck
+    $loose = learnCfg(['learning_apply' => true, 'learn_min_samples' => 2]);
+    T::eq([], Learn::adjustments($lucky, $loose, $now),
+        'even with learn_min_samples = 2 the streak proves nothing: the intervals overlap');
+    $luckyInsights = Learn::insights($lucky, $loose, 90);
+    $luckyConfident = 0;
+    foreach ($luckyInsights as $i) {
+        if (!empty($i['confident'])) {
+            $luckyConfident++;
+        }
+    }
+    T::eq(0, $luckyConfident, 'no feature is confident on five trades, whatever the sample floor says');
+
+    /* ---- the sample floor counts DECIDED outcomes, not rows -------------------------
+     * 55 `flat` rows plus 6 wins/losses per side is 61 rows a side: over
+     * learn_min_samples if the floor were counted on `n`, and nowhere near it on the
+     * win/loss outcomes the claim actually rests on. Flat rows ARE evidence rows
+     * (Learn::TRADED_OUTCOMES holds 'flat', so they carry into the window and into
+     * avg_pnl) - they are simply not a win and not a loss, and nothing may be adjusted
+     * from them. */
+    $flatDb   = freshDb('learn-evidence-flat');
+    $flatRows = FakeObservations::set(['end' => $now, 'n' => 6, 'flat' => 55]);
+    T::eq(122, FakeObservations::seed($flatDb, $flatRows), 'seeded 12 decided and 110 flat rows');
+    $flatIns = [];
+    foreach (Learn::insights($flatDb, $cfg, 90) as $i) {
+        $flatIns[(string) $i['feature']] = $i;
+    }
+    T::ok(isset($flatIns['rsi']), 'the flat fixture still produces an RSI card');
+    $flatBuckets = [];
+    foreach ($flatIns['rsi']['buckets'] as $b) {
+        if ((int) $b['n'] > 0) {
+            $flatBuckets[(string) $b['label']] = $b;
+        }
+    }
+    T::eq(['25-30', '50-70'], array_keys($flatBuckets), 'the flat rows land in the same two buckets');
+    foreach ($flatBuckets as $label => $b) {
+        T::eq(61, (int) $b['n'], 'bucket ' . $label . ' holds 61 rows - past the 60 floor if rows were what counted');
+        T::eq(55, (int) $b['flat'], 'bucket ' . $label . ' is 55 flat outcomes');
+        T::eq(6, (int) $b['decided'], 'and only 6 win/loss outcomes to reason from');
+    }
+    T::eq(false, (bool) $flatIns['rsi']['confident'], '61 rows of which 6 are decided is NOT confident');
+    T::eq([], Learn::adjustments($flatDb, $cfg, $now), 'and no adjustment is produced from them');
+    $flatRun = Learn::recompute($flatDb, $cfg, $now);
+    T::eq(null, $flatRun['changed'], 'a recompute over 110 flat rows changes nothing');
+    foreach (Learn::COMPONENTS as $component) {
+        T::eq(0, (int) $flatRun['weights'][$component], 'component ' . $component . ' is untouched by flat evidence');
+    }
+
+    /* ---- a marginal separation inside a WIDE scan is not confident ------------------
+     * The reported pair is the max-vs-min of a scan over every feature's buckets, so a
+     * gap that clears a nominal 95 % on its own need not clear the widened threshold the
+     * scan demands. Same fixture size, same scan width, only the strength of the planted
+     * relationship differs - so this is a test of the correction, not of the sample. */
+    $wide   = static function (float $good, float $bad, string $tag) use ($now, $cfg): array {
+        $db = freshDb($tag);
+        FakeObservations::seed($db, FakeObservations::set([
+            'end' => $now, 'n' => 800, 'win_rate_good' => $good, 'win_rate_bad' => $bad,
+        ]));
+        foreach (Learn::insights($db, $cfg, 90) as $i) {
+            if ((string) $i['feature'] === 'rsi') {
+                return $i;
+            }
+        }
+        return [];
+    };
+    $marginal = $wide(0.545, 0.455, 'learn-evidence-marginal');
+    $strong   = $wide(0.80, 0.20, 'learn-evidence-strong');
+    T::ok($marginal !== [] && $strong !== [], 'both wide scans produce an RSI card');
+    T::eq(38, (int) $marginal['family'], 'the scan really is wide: 38 bucket comparisons could have been reported');
+    T::eq((int) $marginal['family'], (int) $strong['family'], 'and both fixtures are scanned exactly as wide');
+    T::ok(Learn::familyZ((int) $marginal['family']) > 1.96,
+        'so the threshold is widened past the nominal 95 % z', (string) Learn::familyZ((int) $marginal['family']));
+    $mb = [];
+    foreach ($marginal['buckets'] as $b) {
+        if ((int) $b['n'] > 0) {
+            $mb[(string) $b['label']] = $b;
+        }
+    }
+    T::eq(['25-30', '50-70'], array_keys($mb), 'the marginal relationship sits in the same two buckets');
+    T::near(54.5, (float) $mb['25-30']['win_rate'], 1e-9, 'the good side wins 54.5 %');
+    T::near(45.5, (float) $mb['50-70']['win_rate'], 1e-9, 'the bad side wins 45.5 %');
+    T::ok((float) $mb['25-30']['wilson_lo'] > (float) $mb['50-70']['wilson_hi'],
+        'their PLAIN 95 % intervals do separate - which is exactly the trap');
+    T::eq(false, (bool) $marginal['confident'], 'and yet the card is NOT confident: it is the best of 38 comparisons');
+    T::strContains((string) $marginal['note'], '38', 'the note names the family it was picked from');
+    T::strContains((string) $marginal['note'], 'Inconclusive', 'and calls it inconclusive in plain language');
+    T::eq(true, (bool) $strong['confident'], 'the planted 80/20 relationship survives the same widening');
+    T::strContains((string) $strong['note'], '38', 'and its note names the same family');
+    T::strContains((string) $strong['note'], 'unlikely to be luck', 'while still stating the claim plainly');
+
+    /* ---- unresolved entries are reported, never quietly excluded --------------------
+     * An open trade has no outcome, so it cannot be evidence; but dropping it silently
+     * is one-sided censoring (a winner takes profit and closes while a loser rides), so
+     * every bucket carries the count and the note says what it means. */
+    $censDb = freshDb('learn-evidence-open');
+    T::eq(254, FakeObservations::seed($censDb, FakeObservations::set(['end' => $now, 'n' => 120, 'open' => 7])),
+        'seeded 240 resolved trades and 14 still open');
+    T::eq(14, countRows($censDb, 'SELECT COUNT(*) FROM observations WHERE outcome IS NULL'),
+        'the open rows really carry no outcome');
+    $cens = [];
+    foreach (Learn::insights($censDb, $cfg, 90) as $i) {
+        $cens[(string) $i['feature']] = $i;
+    }
+    T::ok(isset($cens['rsi']), 'the censored fixture still produces an RSI card');
+    T::eq(240, (int) $cens['rsi']['samples'], 'the open rows are NOT counted as evidence');
+    T::eq(14, (int) $cens['rsi']['open_now'], 'the card reports all 14 of them');
+    $cb = [];
+    foreach ($cens['rsi']['buckets'] as $b) {
+        if ((int) $b['n'] > 0) {
+            $cb[(string) $b['label']] = $b;
+        }
+    }
+    foreach ($cb as $label => $b) {
+        T::eq(120, (int) $b['decided'], 'bucket ' . $label . ' still reasons from its 120 resolved trades');
+        T::eq(7, (int) $b['open_now'], 'and reports its 7 unresolved entries separately');
+    }
+    T::strContains((string) $cens['rsi']['note'], '14', 'the note states how many are still open');
+    T::strContains((string) $cens['rsi']['note'], 'still open', 'in plain language');
+    T::strContains((string) $cens['rsi']['note'], 'read better than the buckets have earned',
+        'and says which way the censoring cuts');
+    // ... and the panel prints it: the bucket table gained a "Still open" column, so a
+    // reader never sees an n without the censoring that sits behind it
+    $page = Panel::insights($cfg, $censDb, (int) Util::isoToTs($now));
+    $card = null;
+    foreach ($page['features'] as $f) {
+        if ((string) $f['feature'] === 'rsi') {
+            $card = $f;
+        }
+    }
+    T::ok($card !== null, 'the Insights page renders an RSI card');
+    if ($card !== null) {
+        T::eq(8, (int) $card['table']['cols'], 'the bucket table declares eight columns');
+        $printed = 0;
+        foreach ($card['table']['rows'] as $row) {
+            T::eq(8, count($row), 'every rendered bucket row has eight cells');
+            if ((string) $row[0]['t'] === '25-30' || (string) $row[0]['t'] === '50-70') {
+                T::eq('120', (string) $row[1]['t'], 'the n cell is the resolved count');
+                T::eq('7', (string) $row[2]['t'], 'and the cell after it is the still-open count');
+                $printed++;
+            }
+        }
+        T::eq(2, $printed, 'both populated buckets printed their open count');
+    }
+    T::eq(14, (int) $page['header']['open'], 'and the page header counts the open rows too');
+});
+
+/* ------------------------------------------------------------------- learn-capture-engine */
+
+/*
+ * Engine capture is FILL-based, not placement-based (lib/Bot.php obsEngineAction).
+ *
+ * A grid ladder puts a rung on the book every tick and a pmm quote is cancelled and
+ * re-posted every refresh; counting placements would file an `entered` observation a
+ * minute for quotes that never traded - roughly 300 rows for every one a cycle could
+ * ever resolve - and every one of them would sit unresolved for good, poisoning both
+ * the win rates and the `open_now` censoring figure. These assertions freeze the
+ * distinction: the ladder writes NOTHING until a rung actually fills, the fill writes
+ * exactly one row, and the cycle that closes it resolves that row with a hold measured
+ * from the LOT's buy - not from when the observation was written.
+ */
+T::group('learn-capture-engine', ['Bot', 'EngineGrid', 'EnginePmm', 'FakePaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    $t0  = FakeMarketData::SERVER_TIME_MS;
+    $db  = freshDb('learn-capture-engine-grid');
+    $md  = engineMd($t0);
+    $ex  = new FakePaperExchange($md, 0.1, 200.0);
+    $cfg = engineCfg(learnBlock(['learning_apply' => false]));
+    T::ok(!empty($cfg['learning_enabled']), 'capture is on for this group');
+    T::eq('grid', (string) $cfg['engine'], 'and the engine under test is the grid');
+
+    /* ---- (a) three ticks that PLACE rungs and fill none write no observation at all -- */
+    for ($i = 0; $i < 3; $i++) {
+        $r = (new Bot($cfg, $db, $ex, $t0 + $i * 60000))->tick();
+        T::eq('ok', $r['status'], 'grid placing tick ' . ($i + 1) . ' ok', $r['summary']);
+    }
+    T::eq(3, count($db->openEngineOrders('SOLUSDT')), 'three ticks built three resting rungs');
+    T::eq(0, count($db->openLots('SOLUSDT', 'paper', 'grid')), 'and not one of them filled');
+    T::eq(0, countRows($db, 'SELECT COUNT(*) FROM observations'),
+        'so NOTHING was captured: a placement is not a decision with an outcome');
+
+    /* ---- (b) a rung that fills writes exactly one `entered` row -------------------- */
+    $md->setPrice('SOLUSDT', 129.15, 129.20);
+    $r = (new Bot($cfg, $db, $ex, $t0 + 3 * 60000))->tick();
+    T::eq('ok', $r['status'], 'the filling tick is ok', $r['summary']);
+    T::eq(1, count($db->openLots('SOLUSDT', 'paper', 'grid')), 'the rung filled and became a lot');
+    T::eq(1, countRows($db, 'SELECT COUNT(*) FROM observations'), 'the fill wrote exactly ONE observation');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM observations WHERE decision = 'entered'"), 'and it is an entry');
+    $obs = $db->observations(['decision' => 'entered', 'limit' => 10]);
+    T::eq(1, count($obs), 'one entry row, read back');
+    $row = $obs[0];
+    $entryId = (int) $row['id'];
+    T::eq('grid', (string) $row['engine'], 'the row is attributed to the grid engine');
+    T::eq('SOLUSDT', (string) $row['symbol'], 'and to the engine symbol');
+    T::eq(null, $row['outcome'], 'it carries no outcome yet - the lot is still held');
+    $feat = isset($row['features_map']) && is_array($row['features_map']) ? $row['features_map'] : [];
+    T::ok(isset($feat['dist_from_anchor_pct']), 'a grid row captures its distance from the anchor');
+    T::ok(isset($feat['spread_pct']), 'and the spread it saw');
+
+    /* ---- (c) the cycle that closes it resolves that row, held from the LOT's buy ---- */
+    $md->setPrice('SOLUSDT', 130.20, 130.25);
+    $r = (new Bot($cfg, $db, $ex, $t0 + 4 * 60000))->tick();
+    T::eq('ok', $r['status'], 'the closing tick is ok', $r['summary']);
+    $cycles = $db->cycles(5, 'paper', 'grid');
+    T::eq(1, count($cycles), 'the round trip wrote one cycle');
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM observations WHERE decision = 'entered'"),
+        'and still exactly one ENTRY observation - never a second');
+    $rows = $db->observations(['decision' => 'entered', 'limit' => 10]);
+    T::eq(1, count($rows), 'one entry row after the close too');
+    $row = $rows[0];
+    T::eq($entryId, (int) $row['id'], 'it is the very row the fill wrote, resolved in place');
+    T::eq('win', (string) $row['outcome'], 'the observation resolved as a win');
+    T::eq('cycle_closed', (string) $row['exit_reason'], 'with exit_reason cycle_closed');
+    T::eq((int) $cycles[0]['id'], (int) $row['cycle_id'], 'linked to the cycle that closed it');
+    T::near((float) $cycles[0]['pnl_usdt'], (float) $row['pnl_usdt'], 1e-9, 'carrying the cycle PnL');
+    T::ok((string) $row['resolved_at'] !== '', 'and stamped with when it resolved');
+    // the hold is measured from the LOT's buy (cycles.opened_at), not from the tick that
+    // wrote the observation: an engine buy can rest on the book for hours before it fills
+    $want = Util::isoDiffMinutes((string) $cycles[0]['opened_at'], (string) $cycles[0]['closed_at']);
+    T::near($want, (float) $row['held_minutes'], 1e-9, 'held_minutes is measured from the lot buy to the cycle close');
+    T::near(1.0, (float) $row['held_minutes'], 1e-9, 'which is the one minute between the two ticks');
+    T::eq((int) $cycles[0]['id'], (int) $db->getState('obs_cycle_cursor', '0'), 'the cycle bookmark advanced past it');
+
+    // a tick with nothing new to book resolves nothing twice
+    $r = (new Bot($cfg, $db, $ex, $t0 + 5 * 60000))->tick();
+    T::eq('ok', $r['status'], 'an idle follow-up tick is ok', $r['summary']);
+    T::eq(1, countRows($db, "SELECT COUNT(*) FROM observations WHERE decision = 'entered'"),
+        'and adds no entry row for the rungs it re-posted');
+
+    /* ---- (d) pmm re-quoting faster than the tick gap still writes nothing ---------- */
+    // pmm_refresh_sec 5 against a 60 s tick gap: every tick finds its own quotes stale,
+    // cancels them and posts fresh ones. That is a placement treadmill and no trade at all.
+    $pt0 = (time() - 10) * 1000;                       // EnginePmm ages quotes against time()
+    $pdb = freshDb('learn-capture-engine-pmm');
+    $pmd = engineMd($pt0);
+    $pex = new FakePaperExchange($pmd, 0.1, 130.0);
+    $pex->setBalance('SOL', 1.0);                      // at the inventory target: both sides quote
+    $pcfg = engineCfg(array_merge(learnBlock(), ['engine' => 'pmm', 'pmm_refresh_sec' => 5]));
+    for ($i = 0; $i < 3; $i++) {
+        $r = (new Bot($pcfg, $pdb, $pex, $pt0 + $i * 60000))->tick();
+        T::eq('ok', $r['status'], 'pmm tick ' . ($i + 1) . ' ok', $r['summary']);
+    }
+    $buys = countRows($pdb, "SELECT COUNT(*) FROM engine_orders WHERE side = 'BUY'");
+    T::ok($buys >= 2, 'pmm really did place and replace its bid', 'BUY rows: ' . $buys);
+    T::eq(0, count($pdb->openLots('SOLUSDT', 'paper', 'pmm')), 'and never filled one');
+    T::eq(0, countRows($pdb, "SELECT COUNT(*) FROM observations WHERE decision = 'entered'"),
+        'so pmm wrote no entry observation: re-quoting is not trading');
+    T::eq(0, countRows($pdb, 'SELECT COUNT(*) FROM cycles'), 'and no cycle to resolve one with');
+});
+
+/* ------------------------------------------------------------------- panel-bnb */
+
+/*
+ * The BNB fee-discount row (DESIGN-LEARNING.md §7), and the unit rule underneath it.
+ *
+ * `bnb_min_balance` is a **USDT** threshold. The free balance is a **BNB quantity**.
+ * Comparing the two directly is a unit mismatch that reads as a warning at any BNB price
+ * above 1 - and, worse, silently reads as "fine" whenever the BNBUSDT price could not be
+ * fetched and the raw quantity happens to be large. So: warn only when the balance could
+ * actually be valued, and say plainly when it could not.
+ */
+T::group('panel-bnb', ['Panel', 'Db', 'Util'], static function (): void {
+    $now  = time();
+    $cfg  = learnFullCfg(['mode' => 'live', 'api_key' => 'k', 'api_secret' => 's', 'bnb_min_balance' => 1.0]);
+    $seed = static function (Db $db, array $over) use ($now): void {
+        Panel::bnbWrite($db, array_merge([
+            'available' => true, 'spot' => true, 'free' => 0.0, 'price' => 0.0, 'value' => 0.0,
+            'note' => '', 'at' => Util::nowIso($now),
+        ], $over));
+    };
+
+    T::near(0.15, Panel::bnbRoundTrip(true), 1e-12, 'the discount makes a round trip 0.15 %');
+    T::near(0.20, Panel::bnbRoundTrip(false), 1e-12, 'without it, 0.2 %');
+    T::near(1.0, Panel::bnbMinBalance($cfg), 1e-12, 'bnb_min_balance defaults to 1.0 USDT');
+    T::near(1.0, Panel::bnbMinBalance(['bnb_min_balance' => -3]), 1e-12, 'a negative threshold falls back to the default');
+
+    // ---- burn ON, balance PRICED and below the threshold: warn
+    $low = freshDb('panel-bnb-low');
+    $seed($low, ['free' => 0.001, 'price' => 600.0, 'value' => 0.6]);
+    $s = Panel::status($cfg, $low);
+    T::strContains((string) $s['text']['bnb_burn'], 'ON', 'burn is reported as on');
+    T::strContains((string) $s['text']['bnb_burn'], 'low', 'and flagged low');
+    T::eq('warn', (string) $s['levels']['bnb_burn'], 'a priced balance under the threshold is a warning');
+    T::ok(!empty($s['show']['bnb_warning']), 'the warning row is shown');
+    T::strContains((string) $s['text']['bnb_warning'], 'bnb_min_balance', 'the warning names the setting');
+    T::strContains((string) $s['text']['bnb_warning'], 'received asset', 'and what Binance silently does instead');
+
+    // ---- burn ON, balance PRICED and above the threshold: no warning at all
+    $ok = freshDb('panel-bnb-ok');
+    $seed($ok, ['free' => 0.01, 'price' => 600.0, 'value' => 6.0]);
+    $s = Panel::status($cfg, $ok);
+    T::eq('ok', (string) $s['levels']['bnb_burn'], 'a priced balance over the threshold is fine');
+    T::eq('', (string) $s['text']['bnb_warning'], 'and raises no warning');
+    T::strContains((string) $s['text']['bnb_round_trip'], '0.150', 'the round trip is the discounted one');
+
+    // ---- burn ON but UNPRICED: the raw BNB quantity is NOT compared to a USDT threshold
+    // 0.5 BNB is worth ~300 USDT, far over the 1.0 threshold - but 0.5 < 1.0 as a bare
+    // number, so a mixed-unit comparison would report a low balance that does not exist.
+    $unpriced = freshDb('panel-bnb-unpriced');
+    $seed($unpriced, ['free' => 0.5, 'price' => 0.0, 'value' => 0.0]);
+    $s = Panel::status($cfg, $unpriced);
+    T::eq('ok', (string) $s['levels']['bnb_burn'], 'an unpriced balance is NOT reported as low');
+    T::ok(strpos((string) $s['text']['bnb_burn'], 'low') === false, 'the pill does not claim a low balance');
+    T::ok(!empty($s['show']['bnb_warning']), 'but the operator is still told something is missing');
+    T::strContains((string) $s['text']['bnb_warning'], 'could not be valued in USDT',
+        'the warning says the balance could not be valued');
+    T::strContains((string) $s['text']['bnb_warning'], 'NOT checked', 'and that the threshold test did not run');
+    T::strContains((string) $s['text']['bnb_balance'], 'USDT value unknown', 'the balance row says the price is missing');
+
+    // ---- /sapi unavailable: information, never an error
+    $none = freshDb('panel-bnb-none');
+    $seed($none, ['available' => false, 'spot' => false, 'note' => 'endpoint returned nothing']);
+    $s = Panel::status($cfg, $none);
+    T::eq('info', (string) $s['levels']['bnb_burn'], 'an unavailable endpoint is info, not danger');
+    T::strContains((string) $s['text']['bnb_burn'], 'unavailable', 'the pill says unavailable');
+    T::strContains((string) $s['text']['bnb_note'], 'Binance UI', 'and points at the Binance UI instead');
+    T::strContains((string) $s['text']['bnb_note'], 'not an error', 'in as many words');
+
+    // ---- paper mode: the discount is simulated away, and the panel says so
+    $paper = freshDb('panel-bnb-paper');
+    $seed($paper, ['free' => 0.5, 'price' => 600.0, 'value' => 300.0]);
+    $s = Panel::status(learnFullCfg(['mode' => 'paper']), $paper);
+    T::ok(empty($s['show']['bnb']), 'the discount does not apply in paper mode');
+    T::strContains((string) $s['text']['bnb_note'], 'fee_pct', 'and the note says paper fills use fee_pct');
+
+    // ---- the panel ACTION obeys the same rule: no bare quantity is compared to the threshold
+    $panelAction = codeOf('index.php');
+    T::ok($panelAction !== '', 'index.php source is readable');
+    T::ok(strpos($panelAction, "\$row['price'] > 0.0 ? \$row['value'] : \$row['free']") === false,
+        'the toggle_bnb_burn flash no longer picks a value in whichever unit is available');
+    T::ok(strpos($panelAction, "\$on && \$row['price'] > 0.0 && \$row['value'] < \$min") !== false,
+        'it warns only on a balance that could actually be valued in USDT');
+    T::ok(strpos($panelAction, "\$on && \$row['price'] <= 0.0") !== false,
+        'and says so explicitly when it could not be');
+});
+
+/* ------------------------------------------------------------------- panel-insights */
+
+/*
+ * What the Insights page actually says. Two things a reader can be misled by if the page
+ * stays quiet about them:
+ *
+ *   * the condition cards pool EVERY engine into one win rate, while the weight
+ *     suggestions read signal-engine rows only - so a grid-heavy window can produce a
+ *     confident-looking card about conditions the weights will never act on;
+ *   * the dashboard headline builds its own sentence rather than printing the Learn note,
+ *     so it has to carry the multiple-comparison correction itself or it silently states
+ *     a scan result as a bare 95 % finding.
+ */
+T::group('panel-insights', ['Panel', 'Learn', 'FakeObservations', 'Db'], static function (): void {
+    $now = '2026-09-03T12:00:00Z';
+    $ts  = (int) Util::isoToTs($now);
+    $cfg = learnFullCfg(['mode' => 'paper', 'learning_apply' => false, 'learn_min_samples' => 60]);
+
+    // ---- nothing captured: the page says so, and claims nothing about engines
+    $emptyDb = freshDb('panel-insights-empty');
+    $empty   = Panel::insights($cfg, $emptyDb, $ts);
+    T::eq([], $empty['header']['engines'], 'an empty database reports no engine mix');
+    T::strContains((string) $empty['header']['engines_text'], 'none yet', 'and says so');
+    T::strContains((string) $empty['header']['engines_text'], 'Nothing has been captured yet',
+        'without claiming one engine has been captured');
+    T::eq(0, (int) $empty['header']['engines_feed'], 'and nothing feeds the weight suggestions');
+    T::strContains((string) $empty['line']['text'], 'Not enough data yet', 'the dashboard line is honest too');
+
+    // ---- two engines in the window: the split is stated, and so is what it means
+    $db = freshDb('panel-insights');
+    FakeObservations::seed($db, FakeObservations::set(['end' => $now, 'n' => 120, 'open' => 3]));
+    FakeObservations::seed($db, FakeObservations::set([
+        'end' => $now, 'n' => 20, 'engine' => 'grid', 'symbol' => 'DOGEUSDT',
+    ]));
+    $page = Panel::insights($cfg, $db, $ts);
+
+    $mix = $page['header']['engines'];
+    T::eq(['grid', 'signal'], array_keys($mix), 'the header tallies the engine mix, sorted');
+    T::eq(40, (int) $mix['grid'], 'forty grid rows');
+    T::eq(246, (int) $mix['signal'], 'and 246 signal rows (240 trades, three open a side)');
+    T::eq(286, (int) $page['header']['total'], 'which is the whole window');
+    T::eq(246, (int) $page['header']['engines_feed'], 'only the signal rows can feed a weight suggestion');
+    $text = (string) $page['header']['engines_text'];
+    T::strContains($text, 'grid 40', 'the row names the grid count');
+    T::strContains($text, 'signal 246', 'and the signal count');
+    T::strContains($text, 'pool every engine', 'it says the condition cards pool every engine');
+    T::strContains($text, 'signal-engine rows only', 'and that the weight suggestions do not');
+    T::strContains($text, 'an engine the weights never touch', 'and spells out why that matters here');
+    T::eq($text, (string) $page['text']['ins_engines'], 'the same sentence is published for the panel');
+
+    // ---- the dashboard headline carries the correction, not just the Learn note
+    $line = (string) $page['line']['text'];
+    T::eq(true, (bool) $page['line']['confident'], 'the planted relationship is found');
+    T::strContains($line, 'The two intervals do not overlap', 'the headline states the disjointness');
+    T::strContains($line, 'even widened for the', 'AND that it survived the widening');
+    T::strContains($line, 'bucket comparisons this scan made', 'naming what it was widened for');
+    T::ok(substr($line, -1) === '.', 'and the sentence still ends in a full stop', $line);
+    $rsi = null;
+    foreach ($page['features'] as $f) {
+        if ((string) $f['feature'] === 'rsi') {
+            $rsi = $f;
+        }
+    }
+    T::ok($rsi !== null, 'the page renders an RSI card');
+    if ($rsi !== null) {
+        T::strContains($line, (string) $rsi['label'], 'the headline names the same feature the card does');
+        T::eq(8, (int) $rsi['table']['cols'], 'the bucket table declares its eight columns');
+        foreach ($rsi['table']['rows'] as $row) {
+            T::eq(8, count($row), 'and every rendered row has eight cells');
+        }
+    }
+
+    // a single-engine window says the two views rest on the same rows, and says nothing more
+    $solo = freshDb('panel-insights-solo');
+    FakeObservations::seed($solo, FakeObservations::set(['end' => $now, 'n' => 120]));
+    $soloText = (string) Panel::insights($cfg, $solo, $ts)['header']['engines_text'];
+    T::strContains($soloText, 'Only one engine has been captured', 'a single-engine window says so');
+    T::ok(strpos($soloText, 'never touch') === false, 'and does not warn about a split that does not exist');
+});
+
+/* ------------------------------------------------------------------- learn-walkforward */
+
+T::group('learn-walkforward', ['Learn', 'FakeObservations', 'Db'], static function (): void {
+    /*
+     * DESIGN-LEARNING.md §1 rule 3: never train on what it then trades. A recompute uses only
+     * trades CLOSED before its own instant, and does not fire again inside
+     * learn_recompute_hours.
+     */
+    $db  = freshDb('learn-walkforward');
+    $cfg = learnCfg(['learning_apply' => true, 'learn_min_samples' => 60, 'learn_recompute_hours' => 168]);
+    $t1  = '2026-09-03T12:00:00Z';
+    $ts1 = (int) Util::isoToTs($t1);
+
+    // evidence A: 400 trades closed BEFORE the recompute, with no relationship in them
+    $past = FakeObservations::set(['end' => $t1, 'n' => 200, 'carriers' => []]);
+    T::eq(400, FakeObservations::seed($db, $past), 'seeded 400 trades closed before the recompute');
+    // evidence B: opened before the recompute but CLOSED AFTER it, and screaming a relationship
+    $future = FakeObservations::set([
+        'end' => Util::nowIso($ts1 + 8 * 3600), 'n' => 200, 'carriers' => ['rsi'], 'ts_offset_sec' => -9 * 3600,
+    ]);
+    T::eq(400, FakeObservations::seed($db, $future), 'seeded 400 trades closed after it');
+    $openedBefore = 0;
+    foreach ($future as $row) {
+        if ((string) $row['ts'] < $t1 && (string) $row['resolved_at'] > $t1) {
+            $openedBefore++;
+        }
+    }
+    T::eq(400, $openedBefore, 'every one of them was OPENED before the recompute instant');
+
+    $first = Learn::recompute($db, $cfg, $t1);
+    T::eq(400, (int) $first['samples'], 'the recompute sees only the 400 trades already closed');
+    T::eq(null, $first['changed'], 'which say nothing, so nothing is adjusted');
+    T::eq(true, (bool) $first['applied'], 'the decision is still recorded');
+    T::eq($t1, (string) $db->getState('learn_at', ''), 'and stamped, so the panel knows what was evidence');
+
+    // inside learn_recompute_hours it must not fire again
+    $tooSoon = Learn::recompute($db, $cfg, Util::nowIso($ts1 + 3600));
+    T::eq('too_soon', (string) $tooSoon['reason'], 'a recompute one hour later refuses to run');
+    T::eq(false, (bool) $tooSoon['applied'], 'and writes nothing');
+    T::eq($t1, (string) $db->getState('learn_at', ''), 'the stamp is unchanged');
+    T::eq('2026-09-10T12:00:00Z', (string) $tooSoon['next_at'], 'it names when the next one is due (168 h later)');
+    $almost = Learn::recompute($db, $cfg, Util::nowIso($ts1 + 167 * 3600));
+    T::eq('too_soon', (string) $almost['reason'], 'one hour before the gap closes it still refuses');
+    $edge = Learn::recompute($db, $cfg, Util::nowIso($ts1 + 168 * 3600));
+    T::ok((string) $edge['reason'] !== 'too_soon', 'exactly 168 hours later it may run again', (string) $edge['reason']);
+    T::eq(800, (int) $edge['samples'], 'and now it can see the trades that closed in the meantime');
+    T::eq('rsi', (string) $edge['changed'], 'which do carry a relationship, so one component moves');
+    T::eq(10, (int) $edge['to'], 'by the full ten points, and no more');
+
+    // the same evidence a week earlier could not have produced that adjustment
+    T::eq([], Learn::adjustments($db, $cfg, $t1), 'nothing in the pre-recompute evidence implied it');
+    T::eq(1, count(Learn::adjustments($db, $cfg, Util::nowIso($ts1 + 168 * 3600))), 'the later evidence does');
+
+    // a dry run (learning_apply off) must not start the clock either
+    $dry = freshDb('learn-walkforward-dry');
+    FakeObservations::seed($dry, FakeObservations::set(['end' => $t1, 'n' => 120]));
+    $dryCfg = learnCfg(['learning_apply' => false, 'learn_min_samples' => 60]);
+    $dryRun = Learn::recompute($dry, $dryCfg, $t1);
+    T::eq('rsi', (string) $dryRun['changed'], 'a dry run still reports what it WOULD do');
+    T::eq(false, (bool) $dryRun['applied'], 'without applying it');
+    T::eq(null, $dry->getState('learn_at', null), 'a dry run does not stamp learn_at');
+    T::eq(null, $dry->getState('learn_weights', null), 'and writes no weights');
+    T::eq([], stateSnapshot($dry), 'with learning_apply off a recompute writes no state at all');
+    $again = Learn::recompute($dry, $dryCfg, Util::nowIso($ts1 + 60));
+    T::ok((string) $again['reason'] !== 'too_soon', 'so a dry run never blocks the next one');
+});
+
+/* ------------------------------------------------------------------- learn-apply-off */
+
+T::group('learn-apply-off', ['Strategy', 'Indicators', 'FakeMarketData', 'Bot', 'PaperExchange', 'Db'], static function (): void {
+    /*
+     * DESIGN-LEARNING.md §4: `learning_apply` defaults to false, and with it false the panel
+     * shows everything the learner WOULD do while scoring stays exactly what it was. That is
+     * what keeps the existing strategy tests valid, so it is asserted on the same fixtures.
+     */
+    $c15os = closedRows('klines_15m_oversold');
+    $c15ob = closedRows('klines_15m_overbought');
+    $c1hUp = closedRows('klines_1h_uptrend');
+    $c1hDn = closedRows('klines_1h_downtrend');
+
+    // a weight map that would change every component it is allowed to touch
+    $loud = ['rsi' => -10, 'bb' => -10, 'reversal' => -10, 'rsi_up' => -10, 'vol' => -10, 'trend' => -10, 'threshold' => 50];
+
+    $cases = [
+        'oversold+uptrend'    => [$c15os, $c1hUp, ['bid' => 128.90, 'ask' => 128.93]],
+        'overbought+uptrend'  => [$c15ob, $c1hUp, null],
+        'oversold+downtrend'  => [$c15os, $c1hDn, null],
+        'overbought+downtrend'=> [$c15ob, $c1hDn, ['bid' => 128.90, 'ask' => 128.93]],
+    ];
+    foreach ($cases as $name => $c) {
+        // (a) the pre-learning call: a config with no learning keys at all, and no weights
+        $base = Strategy::evaluate($c[0], $c[1], cfg(), $c[2]);
+        // (b) learning switched off entirely, weights offered anyway
+        $off = Strategy::evaluate($c[0], $c[1], learnCfg(['learning_enabled' => false, 'learning_apply' => false]), $c[2], $loud);
+        // (c) THE CASE: learning on, apply off, weights offered
+        $applyOff = Strategy::evaluate($c[0], $c[1], learnCfg(['learning_enabled' => true, 'learning_apply' => false]), $c[2], $loud);
+
+        T::eq((int) $base['score'], (int) $applyOff['score'], $name . ': apply-off scores identically to no learning');
+        T::eq((string) json_encode($base), (string) json_encode($applyOff), $name . ': every field is identical');
+        T::eq((string) json_encode($base), (string) json_encode($off), $name . ': learning_enabled off is identical too');
+        // and the four-argument call the rest of the suite makes is unchanged
+        T::eq((string) json_encode($base),
+              (string) json_encode(Strategy::evaluate($c[0], $c[1], learnCfg(), $c[2])),
+              $name . ': the four-argument call is unchanged by the learning keys');
+    }
+
+    // the comparison is not vacuous: with learning_apply ON the same weights really do bite
+    $applied = Strategy::evaluate($c15os, $c1hUp, learnCfg(['learning_apply' => true]), ['bid' => 128.90, 'ask' => 128.93], $loud);
+    $plain   = Strategy::evaluate($c15os, $c1hUp, cfg(), ['bid' => 128.90, 'ask' => 128.93]);
+    T::ok((int) $applied['score'] < (int) $plain['score'],
+        'with learning_apply on the weights do change the score (so the test above is not vacuous)',
+        $plain['score'] . ' -> ' . $applied['score']);
+    T::eq($plain['gates'], $applied['gates'], 'even then the gates are outside the reach of a weight');
+    T::near((float) $plain['tp_pct'], (float) $applied['tp_pct'], 1e-12, 'and so is the take-profit');
+    T::near((float) $plain['rsi'], (float) $applied['rsi'], 1e-12, 'and the indicators themselves');
+
+    // the clamp is enforced by the scorer as well as by Learn
+    T::eq(0, Strategy::componentDelta(null, 'rsi'), 'no weight map means no delta');
+    T::eq(10, Strategy::componentDelta(['rsi' => 999], 'rsi'), 'a delta clamps to +10 in the scorer');
+    T::eq(-10, Strategy::componentDelta(['rsi' => -999], 'rsi'), 'and to −10');
+    T::eq(0, Strategy::componentDelta(['trend' => 10], 'trend'), 'a component with no points cannot be nudged');
+    T::eq(0, Strategy::componentDelta(['trade_usdt' => 10], 'trade_usdt'), 'an unknown component is not a component');
+    T::eq(0, Strategy::componentDelta(['rsi' => 'lots'], 'rsi'), 'a non-numeric delta is ignored');
+
+    /* ---- and the same through the whole tick, with weights sitting in state ---------- */
+    $t0 = FakeMarketData::SERVER_TIME_MS;
+    $run = static function (array $over) use ($t0, $loud) {
+        $db = freshDb('learn-apply-off-' . substr(md5((string) json_encode($over)), 0, 6));
+        $db->setState('learn_weights', $loud);
+        $md = botMd();
+        $ex = new PaperExchange($md, $db, 0.1, 10.0);
+        $r  = (new Bot(botCfg(learnBlock($over)), $db, $ex, $t0))->tick();
+        $sig = $db->latestSignals();
+        return ['tick' => $r, 'score' => isset($sig['SOLUSDT']) ? (int) $sig['SOLUSDT']['score'] : -1];
+    };
+    $disabled = $run(['learning_enabled' => false, 'learning_apply' => false]);
+    $applyNo  = $run(['learning_enabled' => true,  'learning_apply' => false]);
+    $applyYes = $run(['learning_enabled' => true,  'learning_apply' => true]);
+    T::eq($disabled['score'], $applyNo['score'], 'the stored signal score is identical with apply off');
+    T::eq($disabled['tick']['summary'], $applyNo['tick']['summary'], 'and so is the whole tick summary');
+    T::strContains($applyNo['tick']['summary'], 'entered:SOLUSDT', 'both runs took the same trade');
+    T::ok($applyYes['score'] < $applyNo['score'],
+        'with learning_apply on the planted weights do reach the scorer',
+        $applyNo['score'] . ' -> ' . $applyYes['score']);
+});
+
+
+/* --------------------------------------------------------------- learn-neutral */
+
+T::group('learn-neutral', ['Bot', 'PaperExchange', 'FakeMarketData', 'Db', 'Strategy'], static function (): void {
+    /*
+     * `learning_enabled` ships as TRUE (DESIGN-LEARNING.md §5), so the default install
+     * captures observations on every tick. This group is the proof that the default is
+     * safe: the SAME four-tick paper run, once with capture on and once with capture off,
+     * must produce the same trades, the same positions, the same signals, the same equity
+     * curve and the same tick summaries - capture reads what the tick already fetched and
+     * writes only `observations`. The only difference allowed anywhere in the database is
+     * the observations table itself and the learning bookmark in `state`.
+     */
+    $run = static function (bool $capture): array {
+        $t0  = FakeMarketData::SERVER_TIME_MS;
+        $db  = freshDb('learn-neutral-' . ($capture ? 'on' : 'off'));
+        $md  = botMd();
+        $ex  = new PaperExchange($md, $db, 0.1, 10.0);
+        $cfg = botCfg(learnBlock(['learning_enabled' => $capture, 'learning_apply' => false]));
+
+        $summaries = [];
+        $summaries[] = (new Bot($cfg, $db, $ex, $t0))->tick()['summary'];            // enters SOLUSDT
+        $md->setPrice('SOLUSDT', 131.50, 131.55);
+        $summaries[] = (new Bot($cfg, $db, $ex, $t0 + 120000))->tick()['summary'];   // take-profit
+        $t1 = $t0 + 15 * 60000;                                                      // a new 15m candle
+        $md->setPrice('SOLUSDT', 129.75, 129.80);
+        $summaries[] = (new Bot($cfg, $db, $ex, $t1))->tick()['summary'];            // re-enters
+        $md->setPrice('SOLUSDT', 128.90, 128.95);
+        $summaries[] = (new Bot($cfg, $db, $ex, $t1 + 60000))->tick()['summary'];    // stop-loss
+
+        // projections that exclude only wall-clock stamps and the raw exchange payloads
+        $pick = static function (Db $db, string $sql): string {
+            $rows = $db->pdo()->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+            $json = json_encode($rows);
+            return $json === false ? 'unencodable' : $json;
+        };
+        $stateKeys = [];
+        foreach ($db->pdo()->query('SELECT key FROM state ORDER BY key')->fetchAll(PDO::FETCH_COLUMN) as $k) {
+            $stateKeys[] = (string) $k;
+        }
+        $stateVals = [];
+        foreach (['halted', 'halt_reason', 'no_trade_reason', 'consecutive_losses', 'cooldown_until',
+                  'effective_threshold', 'effective_max_trades', 'equity_hwm', 'day_start_equity',
+                  'paper_balances', 'last_eval_candle_SOLUSDT', 'last_eval_candle_DOGEUSDT'] as $k) {
+            $stateVals[$k] = $db->getState($k);
+        }
+        // every market-data call the four ticks made: capture must add none of these
+        $calls = [];
+        foreach (['klines', 'prices', 'bookTicker', 'symbolInfo', 'syncTime', 'serverTimeMs'] as $m) {
+            $calls[$m] = $md->callCount($m);
+        }
+        return [
+            'calls'        => $calls,
+            'summaries'    => $summaries,
+            'positions'    => $pick($db, 'SELECT symbol, status, qty, dust_qty, entry_price, entry_eff, entry_quote,'
+                                  . ' exit_price, exit_quote, pnl_usdt, pnl_pct, stop_price, take_profit_price,'
+                                  . ' score, entry_reason, exit_reason FROM positions ORDER BY id'),
+            'trades'       => $pick($db, 'SELECT symbol, side, qty, price, quote, fee_usdt, fee_asset FROM trades ORDER BY id'),
+            'orders'       => $pick($db, 'SELECT client_id, symbol, side, status FROM orders ORDER BY client_id'),
+            'signals'      => $pick($db, 'SELECT symbol, score, eligible, price, reasons FROM signals ORDER BY id'),
+            'equity'       => $pick($db, 'SELECT equity_usdt, quote_free, position_value, dust_value FROM equity ORDER BY id'),
+            'state_keys'   => $stateKeys,
+            'state_values' => $stateVals,
+            'observations' => countRows($db, 'SELECT COUNT(*) FROM observations'),
+        ];
+    };
+
+    $on  = $run(true);
+    $off = $run(false);
+
+    T::eq($off['calls'], $on['calls'],
+        'capture costs ZERO extra exchange calls: klines/prices/bookTicker/symbolInfo/syncTime all match',
+        T::dump($on['calls']) . ' vs ' . T::dump($off['calls']));
+    T::ok((int) $on['calls']['klines'] > 0 && (int) $on['calls']['bookTicker'] > 0,
+        'and the run really did call the market data (so that equality means something)');
+    T::eq($off['summaries'], $on['summaries'], 'capture on/off: the four tick summaries are identical');
+    T::strContains($on['summaries'][0], 'entered:SOLUSDT', 'the run really did trade (the comparison is not vacuous)');
+    T::strContains($on['summaries'][1], 'exited:take_profit', 'and closed at take-profit');
+    T::strContains($on['summaries'][3], 'exited:stop_loss', 'and stopped out on the second entry');
+    T::eq($off['positions'], $on['positions'], 'capture on/off: the positions are identical, PnL included');
+    T::eq($off['trades'], $on['trades'], 'capture on/off: the trades are identical, fees included');
+    T::eq($off['orders'], $on['orders'], 'capture on/off: the same orders with the same client ids');
+    T::eq($off['signals'], $on['signals'], 'capture on/off: the stored signals and scores are identical');
+    T::eq($off['equity'], $on['equity'], 'capture on/off: the equity curve is identical');
+    T::eq($off['state_values'], $on['state_values'],
+        'capture on/off: every risk-bearing state value is identical (halt, cooldown, threshold, balances)');
+
+    // the only state key capture may add is its own cycle bookmark
+    $extra = array_values(array_diff($on['state_keys'], $off['state_keys']));
+    T::eq([], array_values(array_diff($extra, ['obs_cycle_cursor'])),
+        'capture adds no state key of its own beyond obs_cycle_cursor', T::dump($extra));
+    T::eq([], array_values(array_diff($off['state_keys'], $on['state_keys'])),
+        'and removes none');
+
+    // ... and it did capture, otherwise the equality above would prove nothing
+    T::eq(4, (int) $on['observations'], 'capture on wrote the four observations of the two evaluations');
+    T::eq(0, (int) $off['observations'], 'capture off wrote none');
 });
 
 /* ============================================================ summary */

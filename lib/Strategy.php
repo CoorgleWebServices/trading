@@ -29,13 +29,29 @@ final class Strategy
     const EXIT_MIN_GAIN_PCT = 0.3;
 
     /**
+     * The ONLY things a learned weight may touch (DESIGN-LEARNING.md §4): the score
+     * components, with the base points each one contributes when it fires. The map is
+     * the whole write surface of learning inside this class - there is no key here for
+     * size, take-profit, stop-loss, a budget or a kill switch, so no `learn_weights`
+     * entry can reach one. `trend` is the 1h regime GATE and carries no points, so its
+     * base is 0 and a delta on it provably does nothing.
+     */
+    const LEARN_COMPONENTS = ['rsi' => 20, 'bb' => 20, 'reversal' => 20, 'rsi_up' => 20, 'vol' => 20, 'trend' => 0];
+    /** Hard cap on a single learned delta, in score points (DESIGN-LEARNING.md §4). */
+    const LEARN_DELTA_CAP = 10;
+
+    /**
      * @param array      $c15  closed 15m kline rows (≥ 250 expected; ≥ MIN_15M required)
      * @param array      $c1h  closed 1h kline rows (≥ 210 expected; ≥ MIN_1H required)
      * @param array      $cfg  config (§3 keys; missing keys fall back to the documented defaults)
      * @param array|null $book ['bid' => float, 'ask' => float] from bookTicker, optional
+     * @param array|null $weights learned score-component deltas (DESIGN-LEARNING.md §4),
+     *                   e.g. ['rsi' => 0, 'bb' => -10, 'vol' => +10]. Optional and ignored
+     *                   unless BOTH `learning_enabled` and `learning_apply` are true in $cfg,
+     *                   so the four-argument call scores exactly as it always has.
      * @return array{score:int, eligible:bool, reasons:string[], gates:string[], price:float, atr_pct:float, atr1h_pct:float, rsi:float, tp_pct:float}
      */
-    public static function evaluate(array $c15, array $c1h, array $cfg, ?array $book = null): array
+    public static function evaluate(array $c15, array $c1h, array $cfg, ?array $book = null, ?array $weights = null): array
     {
         $tpMin = self::f($cfg, 'take_profit_pct', 1.0);
         $tpMax = self::f($cfg, 'take_profit_max_pct', 2.0);
@@ -61,7 +77,7 @@ final class Strategy
                 $res['gates'][] = 'data_short';
                 return $res;
             }
-            return self::score($k15, $k1h, $cfg, $book, $res);
+            return self::score($k15, $k1h, $cfg, $book, $res, self::activeWeights($cfg, $weights));
         } catch (Throwable $e) {
             $res['eligible'] = false;
             $res['gates']    = ['data_short'];
@@ -70,8 +86,13 @@ final class Strategy
         }
     }
 
-    /** Full gate + score computation once the data is known to be long enough. */
-    private static function score(array $k15, array $k1h, array $cfg, ?array $book, array $res): array
+    /**
+     * Full gate + score computation once the data is known to be long enough.
+     * $weights is null unless learning is both enabled and applied, and then it can only
+     * shift the score components below; every gate, the tp_pct and the clamp are outside
+     * its reach.
+     */
+    private static function score(array $k15, array $k1h, array $cfg, ?array $book, array $res, ?array $weights = null): array
     {
         $gates   = [];
         $reasons = [];
@@ -169,8 +190,11 @@ final class Strategy
         $low   = $k15['low'][$t];
         $vol   = $k15['volume'][$t];
 
+        // Each component contributes its documented base points plus, ONLY when learning is
+        // enabled and applied, its clamped delta. With $weights null every call below returns
+        // the base value unchanged, so the score is bit-identical to the pre-learning one.
         if ($rsi <= self::RSI_OVERSOLD) {
-            $score += 20;
+            $score += self::points($weights, 'rsi');
             $reasons[] = 'rsi<=30';
             if ($rsi <= self::RSI_DEEP_OVERSOLD) {
                 $score += 10;
@@ -178,7 +202,7 @@ final class Strategy
             }
         }
         if ($price <= $lower) {
-            $score += 20;
+            $score += self::points($weights, 'bb');
             $reasons[] = 'bb_lower';
             $bandwidth = $upper - $lower;
             if ($bandwidth > 0 && $price <= $lower - 0.25 * $bandwidth) {
@@ -187,15 +211,15 @@ final class Strategy
             }
         }
         if ($low < $lower && $price > $open) {
-            $score += 20;
+            $score += self::points($weights, 'reversal');
             $reasons[] = 'reversal_candle';
         }
         if ($rsiPrev !== null && $rsi > $rsiPrev) {
-            $score += 20;
+            $score += self::points($weights, 'rsi_up');
             $reasons[] = 'rsi_up';
         }
         if ($vsma > 0 && $vol >= self::VOL_RATIO * $vsma) {
-            $score += 20;
+            $score += self::points($weights, 'vol');
             $reasons[] = 'vol_high';
         }
         if ($rsi >= self::RSI_OVERBOUGHT || $price >= $upper) {
@@ -249,6 +273,63 @@ final class Strategy
         return '';
     }
 
+    /* --------------------------------------------------- learned weights (§4) */
+
+    /**
+     * The weight map to apply, or null. Null unless the caller passed one AND both
+     * `learning_enabled` and `learning_apply` are true: with `learning_apply` false
+     * (the default) this returns null and scoring is exactly what it was before
+     * learning existed.
+     */
+    private static function activeWeights(array $cfg, ?array $weights): ?array
+    {
+        if ($weights === null || $weights === [] || !is_array($weights)) {
+            return null;
+        }
+        // learning_enabled defaults to true (DESIGN-LEARNING.md §5); learning_apply to false,
+        // and it is the one that actually lets a delta through.
+        if (!self::flag($cfg, 'learning_enabled', true) || !self::flag($cfg, 'learning_apply', false)) {
+            return null;
+        }
+        return $weights;
+    }
+
+    /**
+     * Points one score component contributes: its base value plus the clamped learned delta.
+     * A positive component can never be driven negative, so a weight may neutralise a
+     * component but never invert it into a bonus for the opposite condition.
+     */
+    private static function points(?array $weights, string $component): int
+    {
+        $base = array_key_exists($component, self::LEARN_COMPONENTS) ? (int) self::LEARN_COMPONENTS[$component] : 0;
+        if ($weights === null) {
+            return $base;
+        }
+        // the delta is already clamped to -base, so this max() is belt and braces: a component
+        // can be neutralised to zero, never turned into a negative (an inverted) contribution
+        return (int) max(0, $base + self::componentDelta($weights, $component));
+    }
+
+    /**
+     * The delta a weight map may apply to one score component, after the §4 caps:
+     * clamped to ±LEARN_DELTA_CAP and to the component's own base value (never an
+     * inversion), 0 for an unknown key, a non-numeric value or a component that carries
+     * no points. Public so the safety test can assert the clamp directly.
+     */
+    public static function componentDelta(?array $weights, string $component): int
+    {
+        if ($weights === null || !array_key_exists($component, self::LEARN_COMPONENTS)) {
+            return 0;
+        }
+        $base = (int) self::LEARN_COMPONENTS[$component];
+        if ($base <= 0 || !isset($weights[$component]) || !is_numeric($weights[$component])) {
+            return 0;
+        }
+        $cap = (int) self::LEARN_DELTA_CAP;
+        $lo  = -min($cap, $base);
+        return (int) Util::clamp((float) round((float) $weights[$component]), (float) $lo, (float) $cap);
+    }
+
     /* ------------------------------------------------------------- helpers */
 
     /** Split kline rows into float columns; null when a row is malformed. */
@@ -277,5 +358,25 @@ final class Strategy
     private static function f(array $cfg, string $key, float $default): float
     {
         return isset($cfg[$key]) && is_numeric($cfg[$key]) ? (float) $cfg[$key] : $default;
+    }
+
+    /** Config flag reader that accepts bool / 0-1 / '1' / 'true' / 'yes' / 'on'. */
+    private static function flag(array $cfg, string $key, bool $default): bool
+    {
+        if (!array_key_exists($key, $cfg)) {
+            return $default;
+        }
+        $v = $cfg[$key];
+        if (is_bool($v)) {
+            return $v;
+        }
+        if (is_numeric($v)) {
+            return (float) $v != 0.0;
+        }
+        if (is_string($v)) {
+            $v = strtolower(trim($v));
+            return $v === '1' || $v === 'true' || $v === 'yes' || $v === 'on';
+        }
+        return false;
     }
 }

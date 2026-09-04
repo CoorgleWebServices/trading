@@ -327,3 +327,30 @@ form.inline.assign .assign-select {
 .legend-swatch.swatch-grid { background: var(--ok); }
 .legend-swatch.swatch-pmm { background: var(--warn); }
 .legend-value { font-variant-numeric: tabular-nums; }
+
+/* ---- learning / Insights (docs/DESIGN-LEARNING.md §6, §7)
+   Everything here is a class: the CSP forbids inline styles, and the feature cards open and
+   close with plain <details>, so no script is involved either. */
+.learn-card .learn-line { margin: 2px 0 6px; }
+.learn-line { margin: 10px 0 2px; }
+.insight-card { padding: 0; }
+.insight-card > summary {
+  padding: 12px 16px;
+  cursor: pointer;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+  list-style: none;
+}
+.insight-card > summary::-webkit-details-marker { display: none; }
+.insight-card > summary::before { content: "▸"; color: var(--muted); margin-right: 2px; }
+.insight-card[open] > summary::before { content: "▾"; }
+.insight-card > summary:hover { background: var(--card2); border-radius: 10px; }
+.insight-card[open] > summary { border-bottom: 1px solid var(--line); border-radius: 10px 10px 0 0; }
+.insight-title { font-size: 1.05rem; font-weight: 600; }
+.insight-card > p, .insight-card > .table-wrap { margin-left: 16px; margin-right: 16px; }
+.insight-card > .table-wrap { max-width: calc(100% - 32px); }
+.insight-note { padding-bottom: 12px; }
+.bnb-warning { margin: 10px 0 6px; }
+.bnb-actions { margin-top: 8px; gap: 6px 8px; }

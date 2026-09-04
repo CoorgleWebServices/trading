@@ -158,6 +158,10 @@ if ($action !== '') {
 
 if ($page === 'settings') {
     echo panel_layout('Settings', page_settings($cfg, $db, $cfg, [], ''), ['page' => 'settings']);
+} elseif ($page === 'insights') {
+    // DESIGN-LEARNING.md §6: honest statistics over the bot's own history. Read-only:
+    // opening this page computes and writes nothing, it only reads observations.
+    echo panel_layout('Insights', page_insights($cfg, Panel::insights($cfg, $db)), ['page' => 'insights']);
 } elseif ($page === 'cron') {
     echo panel_layout('Cron', page_cron($cfg), ['page' => 'cron']);
 } else {
@@ -349,6 +353,16 @@ function handle_action(string $action, array $cfg, Db $db): void
         case 'pause_sleeve':
         case 'resume_sleeve':
             handle_sleeve_action($action, $cfg, $db);
+            return;
+
+        case 'recompute_learning':
+        case 'learn_recompute':
+            handle_learning_action($cfg, $db);
+            return;
+
+        case 'toggle_bnb_burn':
+        case 'check_bnb_burn':
+            handle_bnb_action($action, $cfg, $db);
             return;
 
         case 'save_settings':
@@ -766,6 +780,177 @@ function handle_sleeve_action(string $action, array $cfg, Db $db): void
     Panel::redirect('?page=dashboard');
 }
 
+/* ---------------------------------------------------------- learning actions */
+
+/**
+ * "Recompute now" (DESIGN-LEARNING.md §6): runs Learn::recompute() and reports its
+ * decision verbatim - including "it did nothing, and here is why", which is the
+ * usual and honest answer.
+ *
+ * Deliberately NOT wrapped in Bot::runLocked(): Learn's entire write surface is the
+ * two state keys learn_weights / learn_at (plus the learn_log it prints here). It
+ * places no order, touches no position and cannot reach size, take-profit,
+ * stop-loss, a sleeve budget or any kill switch, so it can never race a tick into
+ * anything dangerous - and holding the tick lock for a statistics pass would only
+ * cost the operator a minute of trading.
+ */
+function handle_learning_action(array $cfg, Db $db): void
+{
+    if (!class_exists('Learn')) {
+        Panel::flash('danger', 'lib/Learn.php is missing - there is nothing to recompute.');
+        Panel::redirect('?page=insights');
+    }
+    try {
+        $res = Learn::recompute($db, $cfg);
+    } catch (Throwable $e) {
+        Log::error('panel: learning recompute failed - ' . $e->getMessage());
+        Panel::flash('danger', 'Recompute failed: ' . $e->getMessage());
+        Panel::redirect('?page=insights');
+        return;
+    }
+    $reason  = (string) ($res['reason'] ?? '');
+    $note    = trim((string) ($res['note'] ?? ''));
+    $applied = !empty($res['applied']);
+    $ok      = !empty($res['ok']);
+    if (!$ok) {
+        $level = 'danger';
+    } elseif ($applied) {
+        $level = 'ok';
+    } elseif ($reason === 'too_soon' || $reason === 'learning_disabled') {
+        $level = 'warn';
+    } else {
+        $level = 'info';
+    }
+    $head = 'Recompute';
+    if ($applied && ($res['changed'] ?? null) !== null) {
+        $head .= ' applied: "' . (string) $res['changed'] . '" ' . (int) $res['from'] . ' → ' . (int) $res['to'] . ' points';
+    } elseif ($applied) {
+        $head .= ' ran and changed nothing';
+    } elseif ($reason === 'too_soon') {
+        $head .= ' skipped (too soon)';
+    } elseif ($reason === 'learning_disabled') {
+        $head .= ' skipped (learning is off)';
+    } elseif ($reason === 'learning_apply_off') {
+        $head .= ' was a dry run (learning_apply is off)';
+    } else {
+        $head .= ' finished';
+    }
+    Log::info('panel: learning recompute', [
+        'reason' => $reason, 'applied' => $applied ? 1 : 0,
+        'changed' => (string) ($res['changed'] ?? ''), 'samples' => (int) ($res['samples'] ?? 0),
+    ]);
+    Panel::flash($level, $head . '. ' . $note);
+    Panel::redirect('?page=insights');
+}
+
+/* --------------------------------------------------------------- BNB actions */
+
+/**
+ * `toggle_bnb_burn` and its read-only sibling `check_bnb_burn` (DESIGN-LEARNING.md §7).
+ *
+ * Both are POST + CSRF and both end in Panel::bnbWrite(), which is the ONLY thing
+ * that fills the display cache the API health card reads - no page render ever
+ * makes a signed call.
+ *
+ * When the endpoint answers `null` the host simply does not serve `/sapi` (demo and
+ * testnet do not). That is reported as INFORMATION with a pointer to the Binance UI,
+ * never as an error.
+ */
+function handle_bnb_action(string $action, array $cfg, Db $db): void
+{
+    $mode = strtolower(trim((string) ($cfg['mode'] ?? 'paper')));
+    if ($mode === 'paper') {
+        Panel::flash('info', 'Paper mode simulates fills with the configured fee_pct, so there is no BNB discount to change. '
+            . 'It becomes real in demo, testnet and live mode.');
+        Panel::redirect('?page=dashboard');
+    }
+    $key    = trim((string) ($cfg['api_key'] ?? ''));
+    $secret = trim((string) ($cfg['api_secret'] ?? ''));
+    if ($key === '' || $secret === '') {
+        Panel::flash('warn', 'Mode "' . $mode . '" has no API key stored, so the BNB fee discount cannot be read or changed.');
+        Panel::redirect('?page=dashboard');
+    }
+    $want = null;   // null = read only
+    if ($action === 'toggle_bnb_burn' && isset($_POST['burn']) && is_string($_POST['burn'])) {
+        $want = $_POST['burn'] === '1';
+    }
+
+    $row = ['available' => false, 'spot' => false, 'interest' => false, 'free' => 0.0,
+            'price' => 0.0, 'value' => 0.0, 'at' => Util::nowIso(), 'mode' => $mode, 'note' => ''];
+    try {
+        $api    = new Binance($key, $secret, Binance::normalizeNetwork($mode), (int) ($cfg['recv_window'] ?? 10000));
+        $status = null;
+        if ($want !== null) {
+            $status = $api->setBnbBurn($want);
+        }
+        if ($status === null) {
+            // either a read-only check, or the toggle was not served: ask for the status
+            $status = $api->bnbBurnStatus();
+        }
+        if (is_array($status)) {
+            $row['available'] = true;
+            $row['spot']      = !empty($status['spot']);
+            $row['interest']  = !empty($status['interest']);
+        } else {
+            $row['note'] = 'GET/POST /sapi/v1/bnbBurn returned nothing on ' . $api->tradeUrl() . '.';
+        }
+        // the free BNB balance and, best effort, what it is worth in USDT
+        try {
+            $acc = $api->account();
+            $bal = isset($acc['balances']) && is_array($acc['balances']) ? $acc['balances'] : [];
+            $row['free'] = isset($bal['BNB']['free']) ? (float) $bal['BNB']['free'] : 0.0;
+        } catch (Throwable $e) {
+            Log::warn('panel: BNB balance unavailable - ' . $e->getMessage());
+        }
+        try {
+            $px = $api->prices(['BNBUSDT']);
+            if (isset($px['BNBUSDT']) && is_numeric($px['BNBUSDT'])) {
+                $row['price'] = (float) $px['BNBUSDT'];
+                $row['value'] = $row['free'] * $row['price'];
+            }
+        } catch (Throwable $e) {
+            Log::warn('panel: BNBUSDT price unavailable - ' . $e->getMessage());
+        }
+        Panel::bnbWrite($db, $row);
+
+        $min = Panel::bnbMinBalance($cfg);
+        if (!$row['available']) {
+            Panel::flash('info', 'This host does not serve /sapi, so the bot cannot read or change the BNB fee discount. '
+                . 'The setting lives in the Binance UI instead (Profile → Fee settings → "Using BNB to pay for fees"). '
+                . 'Demo and testnet never serve it - this is information, not an error.');
+        } else {
+            $on   = !empty($row['spot']);
+            $text = 'BNB fee discount is ' . ($on ? 'ON' : 'OFF') . ' - an effective round trip costs '
+                  . Util::money(Panel::bnbRoundTrip($on), 3) . ' %. Free BNB ' . Util::toDecimalString($row['free'], 8)
+                  . ($row['price'] > 0.0 ? ' (≈ ' . Util::money($row['value'], 4) . ' USDT)' : '') . '.';
+            if ($on && $row['price'] > 0.0 && $row['value'] < $min) {
+                Panel::flash('warn', $text . ' That is below bnb_min_balance = ' . Util::money($min, 4)
+                    . ': Binance silently reverts to charging the fee in the received asset, which changes both the fee and '
+                    . 'the dust behaviour mid-run.');
+            } elseif ($on && $row['price'] <= 0.0) {
+                // bnb_min_balance is a USDT threshold: with no BNBUSDT price the raw BNB
+                // quantity is NOT comparable to it, so say the check did not happen.
+                Panel::flash('info', $text . ' The BNBUSDT price could not be read, so that balance could not be valued in '
+                    . 'USDT and was NOT checked against bnb_min_balance = ' . Util::money($min, 4)
+                    . '. Check it by hand, or press "Check BNB status" again.');
+            } else {
+                Panel::flash('ok', $text);
+            }
+        }
+        Log::info('panel: bnb burn ' . ($want === null ? 'checked' : ($want ? 'enabled' : 'disabled')), [
+            'available' => $row['available'] ? 1 : 0, 'spot' => $row['spot'] ? 1 : 0, 'free' => $row['free'],
+        ]);
+    } catch (BinanceException $e) {
+        Log::error('panel: bnb burn call failed - ' . $e->getMessage());
+        Panel::flash('danger', 'Binance refused the BNB call: ' . $e->getMessage() . ' (code ' . $e->binanceCode
+            . ', HTTP ' . $e->httpStatus . ').');
+    } catch (Throwable $e) {
+        Log::error('panel: bnb burn call failed - ' . $e->getMessage());
+        Panel::flash('danger', 'The BNB call failed: ' . $e->getMessage());
+    }
+    Panel::redirect('?page=dashboard');
+}
+
 /** Keys shown on the settings form (every §3 key except the hashes, cron_key and force_https). */
 function settings_keys(): array
 {
@@ -783,14 +968,17 @@ function settings_keys(): array
         // collected separately by settings_sleeve_input()
         'portfolio_enabled', 'sleeve_reserve_pct', 'sleeve_max_drawdown_pct',
         'scanner_enabled', 'scanner_refresh_min', 'scanner_min_quote_vol', 'scanner_max_spread_pct',
-        'scanner_min_atr_pct', 'scanner_max_atr_pct', 'scanner_top_n', 'scanner_exclude'];
+        'scanner_min_atr_pct', 'scanner_max_atr_pct', 'scanner_top_n', 'scanner_exclude',
+        // learning + the BNB fee discount (DESIGN-LEARNING.md §5, §7)
+        'learning_enabled', 'learning_apply', 'learn_min_samples', 'learn_recompute_hours', 'learn_window_days',
+        'bnb_min_balance'];
 }
 
 /** Settings keys rendered as checkboxes: absent from the POST means "off", never "unchanged". */
 function settings_checkbox_keys(): array
 {
     return ['enabled', 'adaptive', 'allow_live_engines', 'grid_exit_liquidates', 'post_only',
-        'portfolio_enabled', 'scanner_enabled'];
+        'portfolio_enabled', 'scanner_enabled', 'learning_enabled', 'learning_apply'];
 }
 
 /**
@@ -818,6 +1006,62 @@ function panel_portfolio_defaults(): array
             'pmm'    => ['enabled' => false, 'budget_usdt' => 1000.0, 'symbols' => ['XRPUSDT']],
         ],
     ];
+}
+
+/**
+ * DESIGN-LEARNING.md §5 defaults plus the §7 `bnb_min_balance`. Used only to render the form
+ * (and to sanitise a value the config validator does not know yet) on an install whose
+ * config.php predates learning - exactly like panel_engine_defaults() and
+ * panel_portfolio_defaults() do for their sections. Panel::learnDefaults() is the single
+ * source, so the form and the panel's own reading of the keys can never drift apart.
+ */
+function panel_learning_defaults(): array
+{
+    return Panel::learnDefaults();
+}
+
+/**
+ * Last-resort sanitiser for the §5 / §7 keys: applied ONLY to a key that
+ * Risk::validateConfig() did not return at all (an install whose lib/Risk.php predates
+ * learning), so a validator that does know the key always wins, clamps included.
+ *
+ * Note what is NOT here: nothing in this function can reach position size, take-profit,
+ * stop-loss, a sleeve budget or a kill switch. The learning settings are five numbers and
+ * two flags, and the bounds below are the ones DESIGN-LEARNING.md §5 documents.
+ */
+function settings_learning_fallback(array $in, array $cfg, array $newCfg): array
+{
+    foreach (panel_learning_defaults() as $key => $def) {
+        if (array_key_exists($key, $newCfg)) {
+            continue;
+        }
+        if (!array_key_exists($key, $in)) {
+            $newCfg[$key] = array_key_exists($key, $cfg) ? $cfg[$key] : $def;
+            continue;
+        }
+        $raw = $in[$key];
+        switch ($key) {
+            case 'learning_enabled':
+            case 'learning_apply':
+                $newCfg[$key] = (string) $raw === '1';
+                break;
+            case 'learn_min_samples':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 60.0), 1.0, 100000.0);
+                break;
+            case 'learn_recompute_hours':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 168.0), 1.0, 8760.0);
+                break;
+            case 'learn_window_days':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 90.0), 1.0, 3650.0);
+                break;
+            case 'bnb_min_balance':
+                $newCfg[$key] = Util::clamp(panel_num($raw, Panel::BNB_MIN_BALANCE_DEFAULT), 0.0, 100000.0);
+                break;
+            default:
+                break;
+        }
+    }
+    return $newCfg;
 }
 
 /**
@@ -1115,6 +1359,7 @@ function handle_settings(string $action, array $cfg, Db $db): void
     $warnings  = isset($validated[2]) && is_array($validated[2]) ? $validated[2] : [];
     // only for keys the validator does not know at all (older lib/Risk.php)
     $newCfg    = settings_portfolio_fallback($in, $cfg, $newCfg);
+    $newCfg    = settings_learning_fallback($in, $cfg, $newCfg);
     if ($sleeveIn !== null) {
         $sleeveBefore = isset($cfg['sleeves']) && is_array($cfg['sleeves']) ? $cfg['sleeves'] : [];
         $sleeveAfter  = isset($newCfg['sleeves']) && is_array($newCfg['sleeves']) ? $newCfg['sleeves'] : [];
@@ -1204,11 +1449,16 @@ function handle_settings(string $action, array $cfg, Db $db): void
             // The survival state belongs to the account we just left. Risk::survivalCheck()
             // re-seeds equity_hwm / day_start_equity from the new account on the next tick.
             // 'halted'/'halt_reason' are NOT cleared: a halt still needs a manual reset.
+            // learn_weights/learn_at go too: Learn::evidenceRows() draws evidence from one
+            // mode only, so a map learned on paper must not score a live account (and its
+            // stamp must not hold the first live recompute off for learn_recompute_hours).
+            // 'learn_log' is kept: it is the audit trail of what was decided and when.
             foreach ([
                 'equity_hwm', 'day_start_equity', 'day_start_date', 'consecutive_losses',
                 'last_loss_at', 'cooldown_until', 'paused_until', 'pause_reason',
                 'effective_threshold', 'effective_max_trades', 'last_adapt_date',
                 'adapt_max_since_closed', 'no_trade_reason',
+                'learn_weights', 'learn_at',
             ] as $k) {
                 $db->setState($k, null);
             }
@@ -1363,6 +1613,7 @@ function panel_layout(string $title, string $body, array $opts = []): string
     if ($nav) {
         $h .= '<nav class="nav">';
         $h .= '<a href="?page=dashboard"' . ($current === 'dashboard' ? ' class="active"' : '') . '>Dashboard</a>';
+        $h .= '<a href="?page=insights"' . ($current === 'insights' ? ' class="active"' : '') . '>Insights</a>';
         $h .= '<a href="?page=settings"' . ($current === 'settings' ? ' class="active"' : '') . '>Settings</a>';
         $h .= '<a href="?page=cron"' . ($current === 'cron' ? ' class="active"' : '') . '>Cron</a>';
         $h .= '<form method="post" action="index.php" class="inline">' . Panel::csrfField()
@@ -1535,6 +1786,17 @@ function page_dashboard(array $cfg, array $s): string
     $h .= Panel::kpi($s, 'equity_hwm', 'High-water mark');
     $h .= '</section>';
 
+    // ---- the one learning line (DESIGN-LEARNING.md §6): the strongest CONFIDENT insight with
+    //      its sample size, or "not enough data yet" - which is the honest answer for weeks.
+    $h .= '<section class="card learn-card"><h2>What the evidence says</h2>';
+    $h .= '<p class="learn-line">' . Panel::pill((string) ($s['text']['learn_line'] ?? 'not enough data yet'),
+        (string) ($s['levels']['learn_line'] ?? 'muted'), 'learn_line', 'pill-wide') . '</p>';
+    $h .= '<p class="muted small">Every entry evaluation is recorded with the conditions present at the time, whether or not it '
+        . 'traded, and resolved with the outcome that followed. A claim only counts when both sides clear the sample threshold and '
+        . 'their confidence intervals do not overlap. <a href="?page=insights">Open the Insights page</a> for the per-condition '
+        . 'tables, the current weights and what a recompute would do.</p>';
+    $h .= '</section>';
+
     // ---- engine block (DESIGN-ENGINES.md §10): rendered only when grid or pmm is selected.
     // The signal-engine cards below stay exactly as they are when engine === 'signal'.
     $engineOn = !empty($s['show']['engine']);
@@ -1559,7 +1821,32 @@ function page_dashboard(array $cfg, array $s): string
     $h .= panel_kv($s, 'Tick duration', 'tick_ms');
     $h .= panel_kv($s, 'Last no-trade reason', 'no_trade_reason');
     $h .= panel_kv($s, 'API key', 'api_key_fp');
-    $h .= '</dl></div>';
+    // BNB fee discount (DESIGN-LEARNING.md §7): it changes the fee arithmetic the learning
+    // statistics measure, so it belongs next to the rest of the API health.
+    $h .= panel_kv($s, 'BNB fee discount', 'bnb_burn', true);
+    $h .= panel_kv($s, 'BNB balance', 'bnb_balance');
+    $h .= panel_kv($s, 'Round-trip cost', 'bnb_round_trip');
+    $h .= panel_kv($s, 'BNB checked', 'bnb_checked');
+    $h .= '</dl>';
+    $h .= '<p class="flash flash-warn bnb-warning" data-show="bnb_warning" data-field="bnb_warning"'
+        . (empty($s['show']['bnb_warning']) ? ' hidden' : '') . '>' . $e((string) ($s['text']['bnb_warning'] ?? '')) . '</p>';
+    $h .= '<p class="muted small" data-show="bnb_note" data-field="bnb_note"'
+        . (empty($s['show']['bnb_note']) ? ' hidden' : '') . '>' . $e((string) ($s['text']['bnb_note'] ?? '')) . '</p>';
+    $h .= '<div class="actions-row bnb-actions" data-show="bnb_toggle"' . (empty($s['show']['bnb_toggle']) ? ' hidden' : '') . '>';
+    $h .= '<form method="post" action="index.php" class="inline">' . Panel::csrfField()
+        . '<input type="hidden" name="action" value="check_bnb_burn">'
+        . '<button type="submit" class="btn btn-mini">Check BNB status</button></form>';
+    $h .= '<form method="post" action="index.php" class="inline" data-confirm="Pay Binance fees with BNB from now on? A round trip then costs 0.15 % instead of 0.2 %.">'
+        . Panel::csrfField() . '<input type="hidden" name="action" value="toggle_bnb_burn">'
+        . '<input type="hidden" name="burn" value="1"><button type="submit" class="btn btn-mini">Discount ON</button></form>';
+    $h .= '<form method="post" action="index.php" class="inline" data-confirm="Stop paying Binance fees with BNB? A round trip then costs 0.2 % again.">'
+        . Panel::csrfField() . '<input type="hidden" name="action" value="toggle_bnb_burn">'
+        . '<input type="hidden" name="burn" value="0"><button type="submit" class="btn btn-mini">Discount OFF</button></form>';
+    $h .= '</div>';
+    $h .= '<p class="muted small">The configured <code>fee_pct</code> is informational only: in demo, testnet and live the taker '
+        . 'rate comes from the account. With the BNB discount on an effective round trip costs 0.15 %, without it 0.2 % - which is '
+        . 'the arithmetic every number on the Insights page is measured against.</p>';
+    $h .= '</div>';
 
     $h .= '<div class="card"><h2>Open position</h2>';
     $h .= '<div data-show="position"' . (empty($s['show']['position']) ? ' hidden' : '') . '><dl class="kv">';
@@ -1861,6 +2148,144 @@ function panel_scanner_dashboard(array $s, bool $on): string
 
 /* -------------------------------------------------------------- settings */
 
+/* ------------------------------------------------------------- insights page */
+
+/**
+ * The Insights page (DESIGN-LEARNING.md §6): what the bot's own history actually
+ * shows, with the sample size next to every claim and a plain sentence whenever the
+ * evidence is too thin to conclude anything - which, at a few trades a day, it will
+ * be for weeks.
+ *
+ * Every dynamic value goes through Panel::e(); there is no inline script, no inline
+ * handler and no style attribute anywhere in here (the CSP forbids all three, and
+ * the open/closed state of a feature card is plain <details>, not JavaScript).
+ */
+function page_insights(array $cfg, array $ins): string
+{
+    $e = 'Panel::e';
+    $head = isset($ins['header']) && is_array($ins['header']) ? $ins['header'] : [];
+    $w    = isset($ins['weights']) && is_array($ins['weights']) ? $ins['weights'] : [];
+    $sk   = isset($ins['skipped']) && is_array($ins['skipped']) ? $ins['skipped'] : [];
+    $line = isset($ins['line']) && is_array($ins['line']) ? $ins['line'] : [];
+    $num  = static function ($v): string {
+        return (string) (int) $v;
+    };
+
+    // ---- header: the counts, then the honest sentence
+    $h  = '<section class="card"><h1>Insights</h1>';
+    $h .= '<p class="muted small">The bot records the conditions present at every entry evaluation - the ones it took and the ones '
+        . 'it refused - and the outcome that followed. This page is honest, inspectable statistics over that history: it is not a '
+        . 'model, it will not discover alpha, and it says so plainly whenever the evidence is too thin. Skipped evaluations are the '
+        . 'control group; they carry no PnL and are never counted as wins or losses.</p>';
+    $h .= '<p>' . Panel::pill((string) ($head['sentence'] ?? ''), (string) ($head['level'] ?? 'muted'), 'ins_sentence', 'pill-wide') . '</p>';
+    $h .= '<dl class="kv">';
+    $h .= '<dt>Window</dt><dd>' . $e('last ' . $num($head['window_days'] ?? 0) . ' days · mode '
+        . strtoupper((string) ($head['mode'] ?? '')) . ' (plus rows captured without a mode)') . '</dd>';
+    $h .= '<dt>Observations in the window</dt><dd>' . $e($num($head['total'] ?? 0) . ' ('
+        . $num($head['entered'] ?? 0) . ' entered, ' . $num($head['skipped'] ?? 0) . ' skipped)') . '</dd>';
+    $h .= '<dt>Captured all time (this mode)</dt><dd>' . $e($num($head['all_time'] ?? 0)) . '</dd>';
+    $h .= '<dt>Resolved outcomes</dt><dd>' . $e($num($head['resolved'] ?? 0) . ' resolved · '
+        . $num($head['wins'] ?? 0) . ' win, ' . $num($head['losses'] ?? 0) . ' loss, '
+        . $num($head['flat'] ?? 0) . ' flat, ' . $num($head['not_taken'] ?? 0) . ' not taken (skipped) · '
+        . $num($head['open'] ?? 0) . ' still open') . '</dd>';
+    $h .= '<dt>Win/loss outcomes to reason from</dt><dd>' . $e($num($head['decided'] ?? 0)) . '</dd>';
+    $h .= '<dt>Samples a claim needs</dt><dd>' . $e($num($head['min_samples'] ?? 0) . ' per bucket, in each of two buckets ('
+        . 'learn_min_samples)') . '</dd>';
+    $h .= '<dt>Still needed</dt><dd>' . $e(((int) ($head['needed'] ?? 0)) > 0
+        ? 'roughly ' . $num($head['needed'] ?? 0) . ' more resolved trades'
+        : 'nothing - the sample is large enough for a claim to be possible') . '</dd>';
+    $h .= '<dt>Evidence by engine</dt><dd>' . $e((string) ($head['engines_text'] ?? 'none yet')) . '</dd>';
+    $h .= '<dt>Learning</dt><dd>' . $e(!empty($head['learning_enabled']) ? 'capture on (learning_enabled)' : 'off (learning_enabled = false)')
+        . ' · ' . $e(!empty($head['learning_apply']) ? 'adjustments APPLIED (learning_apply)' : 'dry run only (learning_apply = false)') . '</dd>';
+    $h .= '</dl>';
+    $h .= '<p class="learn-line">' . Panel::pill((string) ($line['text'] ?? 'not enough data yet'),
+        (string) ($line['level'] ?? 'muted'), 'learn_line', 'pill-wide') . '</p>';
+    $h .= '</section>';
+
+    // ---- current weights, last recompute, what changed and on what evidence
+    $h .= '<section class="card"><h2>Current weights ' . Panel::pill(!empty($head['learning_apply']) ? 'APPLY ON' : 'APPLY OFF',
+        (string) ($w['apply_level'] ?? 'muted')) . '</h2>';
+    $h .= '<p class="muted small">Learning may adjust <strong>only</strong> the score-component weights and the effective entry '
+        . 'threshold, inside the caps below. It has no access to position size, take-profit, stop-loss, sleeve budgets or any kill '
+        . 'switch: its whole write surface is two state keys, and the test suite asserts that the rest of the configuration comes '
+        . 'back unchanged from a recompute.</p>';
+    $h .= '<dl class="kv">';
+    $h .= '<dt>learning_apply</dt><dd>' . $e((string) ($w['apply_text'] ?? '')) . '</dd>';
+    $h .= '<dt>Last recompute</dt><dd>' . $e((string) ($w['last_text'] ?? 'never')) . '</dd>';
+    $h .= '<dt>What it changed</dt><dd>' . $e((string) ($w['changed_text'] ?? '')) . '</dd>';
+    $h .= '<dt>Next recompute</dt><dd>' . $e((string) ($w['next_text'] ?? '') . ' · at most one per '
+        . $num($w['hours'] ?? 0) . ' h (learn_recompute_hours)') . '</dd>';
+    $h .= '<dt>Effective threshold</dt><dd>' . $e((string) ($w['threshold_text'] ?? '')) . '</dd>';
+    $h .= '</dl>';
+    $h .= '<div class="table-wrap"><table class="tbl compact"><thead><tr><th>Score component</th><th>Base points</th>'
+        . '<th>Learned delta</th><th>Effective</th><th>Cap</th></tr></thead><tbody data-table="learn_weights" data-cols="5">'
+        . Panel::tableRows(isset($w['table']) && is_array($w['table']) ? $w['table'] : []) . '</tbody></table></div>';
+    $h .= '<p class="muted small">A delta is clamped to ±10 points and to the component\'s own base value, so a component can be '
+        . 'neutralised but never inverted into a bonus for the opposite condition. At most one component moves per recompute.</p>';
+
+    $h .= '<h3>What a recompute would do next</h3>';
+    $h .= '<div class="table-wrap"><table class="tbl compact"><thead><tr><th>Component</th><th>Fires when</th><th>Delta</th>'
+        . '<th>Win rate when it fires</th><th>Win rate otherwise</th><th>Avg PnL difference</th></tr></thead>'
+        . '<tbody data-table="learn_candidates" data-cols="6">'
+        . Panel::tableRows(isset($w['candidates']) && is_array($w['candidates']) ? $w['candidates'] : []) . '</tbody></table></div>';
+    $h .= '<p class="muted small">A candidate appears only when both sides hold at least the sample threshold, their win-rate '
+        . 'confidence intervals do not overlap, and the average-PnL difference agrees in sign with the win-rate difference. '
+        . 'The strongest one is the single change a recompute would apply.</p>';
+
+    $h .= '<h3>Recompute history</h3>';
+    $h .= '<div class="table-wrap"><table class="tbl compact"><thead><tr><th>When</th><th>Changed</th><th>From → to</th>'
+        . '<th>Evidence (resolved trades)</th><th>Note</th></tr></thead><tbody data-table="learn_log" data-cols="5">'
+        . Panel::tableRows(isset($w['log']) && is_array($w['log']) ? $w['log'] : []) . '</tbody></table></div>';
+
+    $h .= '<div class="actions"><form method="post" action="index.php" class="inline" '
+        . 'data-confirm="Run a recompute now? It reads only trades already closed, and with learning_apply off it writes nothing.">'
+        . Panel::csrfField() . '<input type="hidden" name="action" value="recompute_learning">'
+        . '<button type="submit" class="btn btn-primary">Recompute now</button></form> '
+        . '<span class="muted small">Runs Learn::recompute() and reports its decision - including "it changed nothing, and here is '
+        . 'why", which is the usual answer. A recompute uses only trades closed before it, and refuses to re-run inside '
+        . $e($num($w['hours'] ?? 0)) . ' h.</span></div>';
+    $h .= '</section>';
+
+    // ---- skipped vs entered
+    $h .= '<section class="card"><h2>Skipped vs entered</h2>';
+    $h .= '<p>' . $e((string) ($sk['summary'] ?? '')) . '</p>';
+    $h .= '<div class="table-wrap"><table class="tbl"><thead><tr><th>Refused because</th><th>n</th><th>Share of skips</th>'
+        . '<th>Avg RSI</th><th>Avg ATR %</th><th>Avg spread %</th><th>Avg score</th></tr></thead>'
+        . '<tbody data-table="learn_skipped" data-cols="7">'
+        . Panel::tableRows(isset($sk['table']) && is_array($sk['table']) ? $sk['table'] : []) . '</tbody></table></div>';
+    $h .= '<p class="muted small">These are the conditions the bot most often refused, so you can see whether the gates are too '
+        . 'tight. The averages describe what was refused; they are not evidence that entering those setups would have paid - '
+        . 'a skipped evaluation has no outcome at all.</p>';
+    $h .= '</section>';
+
+    // ---- one card per feature
+    $features = isset($ins['features']) && is_array($ins['features']) ? $ins['features'] : [];
+    if ($features === []) {
+        $h .= '<section class="card"><h2>Conditions</h2><p class="muted">No feature statistics are available yet.</p></section>';
+        return $h;
+    }
+    $h .= '<section class="card"><h2>Conditions</h2><p class="muted small">One card per captured condition. Buckets are fixed in '
+        . 'advance (DESIGN-LEARNING.md §3) so they cannot be drawn around whatever happens to look good, and an empty bucket is '
+        . 'shown rather than dropped - "no evidence here" is information too. A win rate is never printed without the sample it '
+        . 'rests on. Confident cards are open; the rest start collapsed.</p></section>';
+    foreach ($features as $f) {
+        $confident = !empty($f['confident']);
+        $h .= '<details class="card insight-card"' . ($confident ? ' open' : '') . '>';
+        $h .= '<summary><span class="insight-title">' . $e((string) ($f['label'] ?? '')) . '</span> '
+            . Panel::pill((string) ($f['state'] ?? ''), (string) ($f['level'] ?? 'muted')) . ' '
+            . '<span class="muted small">' . $e('n=' . (int) ($f['samples'] ?? 0) . ' resolved trades · '
+            . (string) ($f['feature'] ?? '')) . '</span></summary>';
+        $h .= '<p class="muted small">' . $e((string) ($f['separation_text'] ?? '')) . '</p>';
+        $h .= '<div class="table-wrap"><table class="tbl"><thead><tr><th>Bucket</th><th>n</th><th>Still open</th><th>Win rate</th>'
+            . '<th>95 % confidence interval</th><th>Avg PnL</th><th>Total PnL</th><th>Enough samples?</th></tr></thead>'
+            . '<tbody data-table="learn_' . $e((string) ($f['slug'] ?? 'x')) . '" data-cols="8">'
+            . Panel::tableRows(isset($f['table']) && is_array($f['table']) ? $f['table'] : []) . '</tbody></table></div>';
+        $h .= '<p class="insight-note">' . $e((string) ($f['note'] ?? '')) . '</p>';
+        $h .= '</details>';
+    }
+    return $h;
+}
+
 function page_settings(array $cfg, Db $db, array $v, array $errors, string $testResult, array $warnings = []): string
 {
     $e = 'Panel::e';
@@ -1872,6 +2297,11 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     foreach (panel_portfolio_defaults() as $k => $d) {
         if (!isset($v[$k])) {
             $v[$k] = $d;   // ditto for the portfolio and scanner keys (DESIGN-PORTFOLIO.md §2)
+        }
+    }
+    foreach (panel_learning_defaults() as $k => $d) {
+        if (!array_key_exists($k, $v)) {
+            $v[$k] = $d;   // ditto for the learning keys (DESIGN-LEARNING.md §5, §7)
         }
     }
     $h  = '<section class="card"><h1>Settings</h1>';
@@ -2009,13 +2439,44 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     $h .= panel_input('max_spread_pct', $v, 'Max spread %', 'number', '(ask − bid) / mid from bookTicker');
     $h .= '</div></fieldset>';
 
+    // -- learning (DESIGN-LEARNING.md §5)
+    $h .= '<fieldset><legend>Learning</legend>';
+    $h .= '<p class="muted small">The bot records the <strong>conditions</strong> present at every entry evaluation - the ones it took '
+        . 'and the ones it refused - and the outcome that followed, then reports which conditions actually preceded profit. That is '
+        . 'statistics over its own history, not a model that discovers alpha. What it may change is deliberately tiny: the '
+        . '<strong>score-component weights and the effective entry threshold, nothing else</strong>. It cannot reach position size, '
+        . 'take-profit, stop-loss, a sleeve budget or any kill switch - those are hard invariants asserted by the test suite. '
+        . 'See <a href="?page=insights">Insights</a> for what it currently believes and on how many trades.</p>';
+    $h .= panel_check('learning_enabled', $v, 'Capture observations and compute insights.',
+        '<span class="muted">Off writes no observation row and makes no claim; the Insights page then only shows what is already stored.</span>');
+    $h .= panel_check('learning_apply', $v, 'Feed the adjustments back into scoring (learning_apply).',
+        '<span class="muted">Off (the default) is a dry run: the panel shows exactly what a recompute <em>would</em> do and nothing is '
+        . 'written or scored, which is how the operator builds trust before enabling it. On, a recompute may move <strong>one</strong> '
+        . 'score component by at most ±10 points, never below zero for that component, and the effective threshold stays inside '
+        . '[entry_threshold − 10, 100].</span>');
+    $h .= '<div class="grid3">';
+    $h .= panel_input('learn_min_samples', $v, 'Min samples per bucket', 'number',
+        'outcomes a bucket needs before any claim is called confident (default 60); a lucky streak can never move anything', '1');
+    $h .= panel_input('learn_recompute_hours', $v, 'Min hours between recomputes', 'number',
+        'default 168 (one week); a recompute only uses trades closed before it, so the bot never trains on what it then trades', '1');
+    $h .= panel_input('learn_window_days', $v, 'Evidence window (days)', 'number',
+        'how far back the evidence is drawn (default 90)', '1');
+    $h .= '</div></fieldset>';
+
     // -- misc
     $h .= '<fieldset><legend>Fees, paper &amp; misc</legend><div class="grid3">';
     $h .= panel_input('fee_pct', $v, 'Taker fee % per side', 'number', 'paper mode uses it; live reads the real rate');
     $h .= panel_input('paper_start_usdt', $v, 'Paper start balance', 'number');
     $h .= panel_input('recv_window', $v, 'recvWindow (ms)', 'number', '', '1');
     $h .= panel_input('timezone', $v, 'Display timezone', 'text', 'e.g. UTC, Europe/Berlin, America/New_York');
-    $h .= '</div></fieldset>';
+    $h .= panel_input('bnb_min_balance', $v, 'BNB warning threshold (USDT)', 'number',
+        'warn when the BNB fee discount is on but the free BNB is worth less than this (default 1.0): Binance then silently '
+        . 'reverts to charging the received asset, which changes the fee and the dust behaviour mid-run');
+    $h .= '</div>';
+    $h .= '<p class="muted small">The taker fee above is informational only - the live rate comes from the account. With the BNB '
+        . 'discount on a round trip costs 0.15 %, without it 0.2 %; the discount itself is read and toggled from the API health '
+        . 'card on the dashboard.</p>';
+    $h .= '</fieldset>';
 
     $h .= '<p class="actions"><button type="submit" name="action" value="save_settings" class="btn btn-primary">Save settings</button> <a class="btn" href="?page=dashboard">Cancel</a></p>';
     $h .= '</form></section>';

@@ -63,6 +63,29 @@ final class Bot
     /** Portfolio mode: a tick stops starting new sleeves after this many ms (DESIGN-PORTFOLIO.md §6). */
     const TICK_TIME_BUDGET_MS = 40000;
 
+    /**
+     * THE WHOLE WRITE SURFACE OF LEARNING INSIDE THE BOT (DESIGN-LEARNING.md §2).
+     * Capture may write these columns of `observations` and nothing else: every insert and
+     * every resolve below is filtered through these two lists before it reaches
+     * `Db::insertObservation()` / `Db::resolveObservation()` (which filter again), so no code
+     * path here can reach position size, take-profit, stop-loss, a sleeve budget or a
+     * kill-switch state key. Capture reads the tick's own data and writes one table plus the
+     * `obs_cycle_cursor` bookmark; it never writes config.
+     */
+    const OBS_COLUMNS = [
+        'ts', 'mode', 'engine', 'symbol', 'decision', 'skip_reason', 'score', 'threshold',
+        'features', 'position_id', 'cycle_id', 'outcome', 'pnl_usdt', 'pnl_pct',
+        'exit_reason', 'held_minutes', 'resolved_at',
+    ];
+    /** The `symbol` of an account-wide refusal, which belongs to no single symbol. */
+    const OBS_ALL_SYMBOLS = '*';
+    /** How long an unchanged engine refusal is recorded only once, in minutes. */
+    const OBS_ENGINE_SKIP_REPEAT_MIN = 60;
+    /** Columns resolution may set. A resolve NEVER rewrites the captured conditions. */
+    const OBS_RESOLVE_COLUMNS = ['outcome', 'pnl_usdt', 'pnl_pct', 'exit_reason', 'held_minutes', 'resolved_at', 'cycle_id'];
+    /** Minutes of slack when matching a cycle to the observation of the buy it closed. */
+    const OBS_CYCLE_MATCH_MIN = 2.0;
+
     /** @var array */
     private $cfg;
     /** @var Db */
@@ -111,6 +134,14 @@ final class Bot
     private $books = [];
     /** @var float microtime(true) at the start of the current tick */
     private $tickStart = 0.0;
+    /** @var array symbol => captured observation of the entry evaluation running now */
+    private $obsPending = [];
+    /** @var array "engine|symbol" => lot count sampled before this tick's sync (capture only) */
+    private $obsLotsBefore = [];
+    /** @var array|null learned score-component deltas for this tick (null = none applied) */
+    private $learnWeights = null;
+    /** @var bool whether learnWeights() has already run this tick */
+    private $learnWeightsLoaded = false;
 
     public function __construct(array $cfg, Db $db, ExchangeInterface $ex, ?int $nowMs = null)
     {
@@ -148,6 +179,9 @@ final class Bot
             'allow_live_engines'  => false,
             'engine_symbol'       => 'DOGEUSDT',
             'engine_max_orders'   => 12,
+            // DESIGN-LEARNING.md §5: capture on by default, feedback off by default
+            'learning_enabled'    => true,
+            'learning_apply'      => false,
         ];
     }
 
@@ -172,6 +206,10 @@ final class Bot
         $this->engineBid        = 0.0;
         $this->engineAsk        = 0.0;
         $this->books            = [];
+        $this->obsPending       = [];
+        $this->obsLotsBefore    = [];
+        $this->learnWeights     = null;
+        $this->learnWeightsLoaded = false;
 
         try {
             $this->db->setState('last_tick_at', $this->nowIso());
@@ -204,6 +242,28 @@ final class Bot
             } catch (Throwable $inner) {
                 // logging must never break the tick
             }
+        }
+
+        // ---- learning (DESIGN-LEARNING.md §2). Entirely gated on `learning_enabled`, never
+        //      throws, and writes only the `observations` table: with learning off this block
+        //      is three cheap boolean tests and the tick is exactly what it was before.
+        try {
+            if ($this->learningOn()) {
+                // an aborted tick can leave a captured evaluation unwritten; it is still evidence -
+                // unless an order already went to the exchange this tick, in which case the entry
+                // may well have filled (reconcile books it next tick) and flushing would file a
+                // live entry in the control group as `not_taken`, permanently: skipped rows are
+                // resolved at insert and Db::resolveObservation() is never forced here. One tick
+                // of control rows is the cheaper loss.
+                if ($status !== 'ok' && $this->ordersThisTick > 0) {
+                    $this->obsPending = [];
+                }
+                $this->obsFlush('', null, $status === 'ok' ? '' : 'tick_' . $status);
+                $this->obsResolvePositions();
+                $this->obsResolveCycles();
+            }
+        } catch (Throwable $e) {
+            // observation capture is never allowed to affect the trading result
         }
 
         if ($status === 'ok' && $this->apiErrorThisTick) {
@@ -900,8 +960,12 @@ final class Bot
      */
     private function evaluateEntries(float $quoteFree, float $equity, ?array $symbols = null, ?float $available = null): void
     {
+        $this->obsPending = [];
         $block = (string) Risk::entryBlockReason($this->cfg, $this->db, $quoteFree, $equity);
         if ($block !== '') {
+            // nothing is evaluated behind a block, so there are no candle features to record;
+            // the refusal itself is still evidence, kept once an hour per reason (§2)
+            $this->obsBlocked($block);
             $this->noTradeReason = $block;
             return;
         }
@@ -957,7 +1021,9 @@ final class Bot
                 $book = null;
             }
 
-            $sig = Strategy::evaluate($c15, $c1h, $this->cfg, $book);
+            // the fifth argument is null unless learning_enabled AND learning_apply are both
+            // true, and Strategy re-checks both, so this call is the old four-argument one
+            $sig = Strategy::evaluate($c15, $c1h, $this->cfg, $book, $this->learnWeights());
             $evaluated++;
             $score    = (int) ($sig['score'] ?? 0);
             $eligible = (bool) ($sig['eligible'] ?? false);
@@ -1003,6 +1069,18 @@ final class Bot
                 }
             }
 
+            // one observation per evaluated symbol, entered or skipped (DESIGN-LEARNING.md §2);
+            // the features come from the candles and the book this tick already fetched
+            if ($this->learningOn()) {
+                $this->obsPending[$sym] = [
+                    'score'     => $score,
+                    'threshold' => $threshold,
+                    'eligible'  => $eligible,
+                    'gates'     => $gates,
+                    'features'  => $this->obsSignalFeatures($c15, $sig, $gates, $book, $info, $price, $size),
+                ];
+            }
+
             if ($bestSeen === null || $score > $bestSeen) {
                 $bestSeen = $score;
             }
@@ -1026,10 +1104,12 @@ final class Bot
         $this->mergeSymbolMetrics($metrics);
 
         if ($evaluated === 0) {
+            $this->obsFlush('', null, '');
             $this->noTradeReason = 'no_new_candle';
             return;
         }
         if ($best === null) {
+            $this->obsFlush('', null, '');
             if ($eligibleCount > 0) {
                 $this->noTradeReason = 'score_below_threshold(best=' . (int) $bestSeen . '<' . $threshold . ')';
             } elseif ($unaffordable === $evaluated) {
@@ -1047,6 +1127,13 @@ final class Bot
             $r = $this->placeOrder('BUY', $sym, $best['info'], $best['size'], null);
         } catch (BinanceException $e) {
             $action = $this->handleApiError($e, 'buy:' . $sym);
+            if ($e->binanceCode === -1007) {
+                // the send may have filled (the order row is UNKNOWN and reconcile decides next
+                // tick): recording this evaluation as `skipped` / `not_taken` would book a real
+                // entry into the control group and could never be corrected. Drop the capture.
+                $this->obsPending = [];
+            }
+            $this->obsFlush('', null, 'entry_failed');
             $this->noTradeReason = 'entry_failed:' . $e->binanceCode;
             if ($action === 'abort') {
                 throw new BotAbort('error', 'buy ' . $sym . ' failed: ' . $e->getMessage());
@@ -1057,10 +1144,12 @@ final class Bot
         if ($pid === null) {
             $this->db->updateOrder((string) $r['client_id'], ['status' => 'FAILED', 'updated_at' => $this->nowIso()]);
             Log::warn('buy: order returned no executed quantity, marked FAILED', ['symbol' => $sym, 'client_id' => $r['client_id'], 'result' => $this->resultForLog($r)]);
+            $this->obsFlush('', null, 'entry_unfilled');
             $this->noTradeReason = 'entry_unfilled';
             return;
         }
         $this->markDone((string) $r['client_id'], $r, $pid);
+        $this->obsFlush($sym, $pid, '');
         $this->noTradeReason = 'entered:' . $sym;
         // report the stored entry_eff (dust excluded), not quote/qty: they differ by up to a
         // whole stepSize and the operator uses this line to sanity-check the stop
@@ -1296,6 +1385,7 @@ final class Bot
         if ($this->engineLiveBlocked()) {
             $this->noTradeReason = 'engine_live_blocked';
             $this->notes[]       = 'engine ' . $this->engine . ' blocked in live mode';
+            $this->obsEngine($this->engine, $this->engineSymbol, 'skipped', 'engine_live_blocked', 0.0, 0.0);
             // cancelling is not placing: a ladder left resting by an earlier allow_live_engines
             // run has to come off the book here, because nothing else takes it off and no sync
             // runs to book its fills. Without a live row this is one indexed SELECT and no call.
@@ -1317,6 +1407,7 @@ final class Bot
         }
 
         // ---- 2. reconcile the resting orders and book every new fill
+        $this->obsLotBaseline($sym, $this->engine);
         $sum = $this->step('engine_sync:' . $sym, function () use ($orders, $sym): array {
             return $orders->sync($sym);
         }, false);
@@ -1331,6 +1422,7 @@ final class Bot
         $block = (string) Risk::entryBlockReason($this->cfg, $this->db, $bal['quote_free'], $bal['equity'], $this->engine);
         if ($block !== '' && self::isCapitalBlock($block)) {
             $this->noTradeReason = $block;
+            $this->obsEngine($this->engine, $sym, 'skipped', $block, $this->engineBid, $this->engineAsk);
             $n = $this->cancelAllEngineOrders($block);
             if ($n > 0) {
                 $this->notes[] = 'engine paused (' . $block . '): ' . $n . ' order(s) cancelled';
@@ -1348,11 +1440,13 @@ final class Bot
         $ask = $this->engineAsk;
         if ($bid <= 0.0 || $ask <= 0.0) {
             $this->noTradeReason = 'engine_no_book';
+            $this->obsEngine($this->engine, $sym, 'skipped', 'engine_no_book', 0.0, 0.0);
             Log::warn('engine: no book price, tick skipped', ['symbol' => $sym]);
             return;
         }
         $baseFree = isset($bal['bases'][$sym]['free']) ? (float) $bal['bases'][$sym]['free'] : 0.0;
         $engine   = $this->engine;
+        $lotsBefore = $this->obsLotsSampled($sym, $engine);
         $r = $this->step('engine_tick:' . $sym, function () use ($engine, $sym, $orders, $bid, $ask, $baseFree, $bal) {
             if ($engine === 'grid') {
                 $g = $this->makeGrid($sym, $orders);
@@ -1369,6 +1463,7 @@ final class Bot
         }
         $action = (string) ($r['action'] ?? '');
         $detail = (string) ($r['detail'] ?? '');
+        $this->obsEngineAction($engine, $sym, $action, $lotsBefore, $bid, $ask);
         $this->noTradeReason = $engine . ':' . ($action !== '' ? $action : 'idle');
         if ($detail !== '') {
             $this->notes[] = $engine . ' ' . ($action !== '' ? $action : 'idle') . ' ' . $detail;
@@ -1663,6 +1758,7 @@ final class Bot
         if ($orders === null) {
             return;     // runEngineSleeve() reports engine_no_symbol_info
         }
+        $this->obsLotBaseline($symbol, $engine);
         $sum = $this->step('engine_sync:' . $symbol, function () use ($orders, $symbol): array {
             return $orders->sync($symbol);
         }, false);
@@ -1691,6 +1787,7 @@ final class Bot
         $block = (string) Risk::entryBlockReason($this->cfg, $this->db, $bal['quote_free'], $bal['equity'], $engine);
         if ($block !== '' && self::isCapitalBlock($block)) {
             $this->noTradeReason = $block;
+            $this->obsEngine($engine, $symbol, 'skipped', $block, 0.0, 0.0);
             try {
                 $n = (int) $orders->cancelAll($symbol, $block);
             } catch (BinanceException $e) {
@@ -1711,6 +1808,7 @@ final class Bot
         $ask  = (float) $book['ask'];
         if ($bid <= 0.0 || $ask <= 0.0) {
             $this->noTradeReason = 'engine_no_book';
+            $this->obsEngine($engine, $symbol, 'skipped', 'engine_no_book', 0.0, 0.0);
             Log::warn('sleeve ' . $engine . ': no book price, skipped', ['symbol' => $symbol]);
             return;
         }
@@ -1721,7 +1819,8 @@ final class Bot
         // so a mis-sized quote can never spend another sleeve's capital.
         $quote    = min((float) $bal['quote_free'], max(0.0, $available));
         $orders->setAvailableQuote($quote);
-        $baseFree = isset($bal['bases'][$symbol]['free']) ? (float) $bal['bases'][$symbol]['free'] : 0.0;
+        $baseFree   = isset($bal['bases'][$symbol]['free']) ? (float) $bal['bases'][$symbol]['free'] : 0.0;
+        $lotsBefore = $this->obsLotsSampled($symbol, $engine);
         $r = $this->step('engine_tick:' . $symbol, function () use ($engine, $symbol, $orders, $bid, $ask, $baseFree, $quote) {
             if ($engine === 'grid') {
                 $g = $this->makeGrid($symbol, $orders, $engine);
@@ -1738,6 +1837,7 @@ final class Bot
         }
         $action = (string) ($r['action'] ?? '');
         $detail = (string) ($r['detail'] ?? '');
+        $this->obsEngineAction($engine, $symbol, $action, $lotsBefore, $bid, $ask);
         $this->noTradeReason = $action !== '' ? $action : 'idle';
         if ($detail !== '') {
             $this->notes[] = $engine . ' ' . ($action !== '' ? $action : 'idle') . ' ' . $detail;
@@ -2233,6 +2333,611 @@ final class Bot
             return $v === '1' || $v === 'true' || $v === 'yes' || $v === 'on';
         }
         return false;
+    }
+
+    /* ============================================ learning capture (DESIGN-LEARNING.md §2)
+
+       Everything in this section is observation capture: it reads what the tick already has
+       and writes rows in `observations`. It cannot change a single trading parameter --
+       every insert goes through OBS_COLUMNS and every update through OBS_RESOLVE_COLUMNS,
+       both of which name observation columns only. The one thing learning feeds back into
+       trading is the score-component weight map, and this file only ever READS it
+       (learnWeights()) and hands it to Strategy, which clamps it again.
+    */
+
+    /** Capture and feedback are both off when `learning_enabled` is false. */
+    private function learningOn(): bool
+    {
+        return self::truthy($this->cfg, 'learning_enabled');
+    }
+
+    /**
+     * The learned score-component deltas to hand to Strategy::evaluate(), or null.
+     *
+     * Null unless BOTH `learning_enabled` and `learning_apply` are true. The map is read
+     * from the `learn_weights` state key and filtered down to the components Strategy
+     * actually knows, so a key that named anything else - a size, a stop, a budget - is
+     * dropped here and could not reach the scorer even if something wrote it.
+     */
+    private function learnWeights(): ?array
+    {
+        if ($this->learnWeightsLoaded) {
+            return $this->learnWeights;
+        }
+        $this->learnWeightsLoaded = true;
+        $this->learnWeights       = null;
+        if (!$this->learningOn() || !self::truthy($this->cfg, 'learning_apply')) {
+            return null;
+        }
+        try {
+            $raw = $this->db->getStateJson('learn_weights', []);
+        } catch (Throwable $e) {
+            return null;
+        }
+        if (!is_array($raw)) {
+            return null;
+        }
+        $out = [];
+        foreach (Strategy::LEARN_COMPONENTS as $component => $base) {
+            if (isset($raw[$component]) && is_numeric($raw[$component])) {
+                $out[(string) $component] = (float) $raw[$component];
+            }
+        }
+        $this->learnWeights = $out === [] ? null : $out;
+        return $this->learnWeights;
+    }
+
+    /**
+     * Inserts one observation through `Db::insertObservation()`. Only OBS_COLUMNS are ever
+     * handed over, and the list is a constant, not the caller's keys.
+     * @return int|null the new row id
+     */
+    private function obsInsert(array $row): ?int
+    {
+        if (!$this->learningOn()) {
+            return null;
+        }
+        $clean = [];
+        foreach (self::OBS_COLUMNS as $col) {
+            if (array_key_exists($col, $row)) {
+                $clean[$col] = $row[$col];
+            }
+        }
+        if ($clean === []) {
+            return null;
+        }
+        try {
+            $id = (int) $this->db->insertObservation($clean);
+            return $id > 0 ? $id : null;
+        } catch (Throwable $e) {
+            Log::warn('observation insert failed: ' . $e->getMessage(), ['symbol' => isset($row['symbol']) ? $row['symbol'] : '']);
+            return null;
+        }
+    }
+
+    /**
+     * Resolves one observation. `Db::resolveObservation()` is never forced here, so a row
+     * that already carries an outcome is left exactly as it is: a repeated close (a second
+     * sweep, a re-run reconcile, a re-booked cycle) writes nothing and can neither
+     * double-count a trade nor flip an outcome. Only OBS_RESOLVE_COLUMNS are settable, so a
+     * resolve can never rewrite the conditions captured at decision time.
+     */
+    private function obsResolveRow(int $id, array $fields): void
+    {
+        if (!$this->learningOn() || $id <= 0) {
+            return;
+        }
+        $clean = [];
+        foreach (self::OBS_RESOLVE_COLUMNS as $col) {
+            if (array_key_exists($col, $fields)) {
+                $clean[$col] = $fields[$col];
+            }
+        }
+        if ($clean === []) {
+            return;
+        }
+        try {
+            $this->db->resolveObservation($id, $clean);
+        } catch (Throwable $e) {
+            Log::warn('observation resolve failed: ' . $e->getMessage(), ['observation_id' => $id]);
+        }
+    }
+
+    /** win / loss / flat from a realised PnL. */
+    private static function obsOutcome(float $pnl): string
+    {
+        if ($pnl > 0.0) {
+            return 'win';
+        }
+        return $pnl < 0.0 ? 'loss' : 'flat';
+    }
+
+    /**
+     * The feature vector of one signal-engine evaluation. Everything comes from the candles,
+     * the book and the symbol info this tick already fetched: capture costs no API call.
+     */
+    private function obsSignalFeatures(array $c15, array $sig, array $gates, ?array $book, array $info, float $price, float $size): array
+    {
+        $sec     = $this->nowSec();
+        $reasons = isset($sig['reasons']) && is_array($sig['reasons']) ? $sig['reasons'] : [];
+        $f = [
+            'rsi'       => isset($sig['rsi']) ? (float) $sig['rsi'] : 0.0,
+            'atr_pct'   => isset($sig['atr_pct']) ? (float) $sig['atr_pct'] : 0.0,
+            'atr1h_pct' => isset($sig['atr1h_pct']) ? (float) $sig['atr1h_pct'] : 0.0,
+            'trend_up'  => in_array('trend_down', $gates, true) ? 0 : 1,
+            'hour_utc'  => (int) gmdate('G', $sec),
+            'dow'       => (int) gmdate('w', $sec),
+            // the two score components that no continuous feature stands for, as 1/0 so they
+            // bucket like everything else
+            'rsi_up'    => in_array('rsi_up', $reasons, true) ? 1 : 0,
+            'reversal'  => in_array('reversal_candle', $reasons, true) ? 1 : 0,
+        ];
+        $closes = [];
+        $vols   = [];
+        foreach ($c15 as $row) {
+            if (!is_array($row) || count($row) < 6) {
+                continue;
+            }
+            $r = array_values($row);
+            if (!is_numeric($r[4]) || !is_numeric($r[5])) {
+                continue;
+            }
+            $closes[] = (float) $r[4];
+            $vols[]   = (float) $r[5];
+        }
+        $n = count($closes);
+        if ($n >= 20) {
+            $bb    = Indicators::bollinger($closes, 20, 2.0);
+            $upper = isset($bb['upper'][$n - 1]) ? $bb['upper'][$n - 1] : null;
+            $lower = isset($bb['lower'][$n - 1]) ? $bb['lower'][$n - 1] : null;
+            if ($upper !== null && $lower !== null && (float) $upper > (float) $lower) {
+                // 0 at the lower band, 1 at the upper; a deeper pierce than the band clamps to
+                // the edge so every row still lands in a bucket
+                $f['bb_pos'] = Util::clamp(($closes[$n - 1] - (float) $lower) / ((float) $upper - (float) $lower), 0.0, 1.0);
+            }
+            $vsma = Indicators::sma($vols, 20);
+            $v20  = isset($vsma[$n - 1]) ? $vsma[$n - 1] : null;
+            if ($v20 !== null && (float) $v20 > 0.0) {
+                $f['vol_ratio'] = $vols[$n - 1] / (float) $v20;
+            }
+        }
+        $spread = $this->obsSpreadPct($book);
+        if ($spread !== null) {
+            $f['spread_pct'] = $spread;
+        }
+        $step = $this->obsStepValuePct($info, $price, $size > 0.0 ? $size : (float) $this->cfg['trade_usdt']);
+        if ($step !== null) {
+            $f['step_value_pct'] = $step;
+        }
+        return $f;
+    }
+
+    /** (ask − bid) / mid × 100, or null when the book is unusable. */
+    private function obsSpreadPct(?array $book): ?float
+    {
+        if (!is_array($book)) {
+            return null;
+        }
+        $bid = isset($book['bid']) && is_numeric($book['bid']) ? (float) $book['bid'] : 0.0;
+        $ask = isset($book['ask']) && is_numeric($book['ask']) ? (float) $book['ask'] : 0.0;
+        if ($bid <= 0.0 || $ask <= 0.0) {
+            return null;
+        }
+        $mid = ($bid + $ask) / 2.0;
+        return $mid > 0.0 ? ($ask - $bid) / $mid * 100.0 : null;
+    }
+
+    /** Dust coarseness: one step of base, valued at price, as a percent of the order size. */
+    private function obsStepValuePct(array $info, float $price, float $orderUsdt): ?float
+    {
+        $step = isset($info['stepSize']) && is_numeric($info['stepSize']) ? (float) $info['stepSize'] : 0.0;
+        if ($step <= 0.0 || $price <= 0.0 || $orderUsdt <= 0.0) {
+            return null;
+        }
+        return $step * $price / $orderUsdt * 100.0;
+    }
+
+    /**
+     * Writes the observations captured by the entry evaluation that just ran: one row per
+     * evaluated symbol, `entered` for the one that actually traded and `skipped` for every
+     * other one. The skipped rows are the control group of DESIGN-LEARNING.md §2 and resolve
+     * to `not_taken` here and now - they never carry PnL.
+     */
+    private function obsFlush(string $entered, ?int $positionId, string $failReason): void
+    {
+        $pending          = $this->obsPending;
+        $this->obsPending = [];
+        if ($pending === [] || !$this->learningOn()) {
+            return;
+        }
+        $now = $this->nowIso();
+        foreach ($pending as $sym => $o) {
+            $isEntry = ($entered !== '' && (string) $sym === $entered && $positionId !== null);
+            $row = [
+                'ts'          => $now,
+                'mode'        => $this->mode,
+                'engine'      => 'signal',
+                'symbol'      => (string) $sym,
+                'decision'    => $isEntry ? 'entered' : 'skipped',
+                'skip_reason' => $isEntry ? null : $this->obsSkipReason($o, $failReason),
+                'score'       => (int) $o['score'],
+                'threshold'   => (int) $o['threshold'],
+                'features'    => is_array($o['features']) ? $o['features'] : [],
+                'position_id' => $isEntry ? $positionId : null,
+            ];
+            if (!$isEntry) {
+                $row['outcome']     = 'not_taken';
+                $row['resolved_at'] = $now;
+            }
+            $this->obsInsert($row);
+        }
+    }
+
+    /** Why this evaluation did not trade: the gate that blocked it, or how it lost the pick. */
+    private function obsSkipReason(array $o, string $failReason): string
+    {
+        $gates = isset($o['gates']) && is_array($o['gates']) ? array_values($o['gates']) : [];
+        if (empty($o['eligible'])) {
+            return $gates !== [] ? (string) $gates[0] : 'not_eligible';
+        }
+        if ((int) $o['score'] < (int) $o['threshold']) {
+            return 'below_threshold';
+        }
+        // eligible and over the threshold: either the order never happened, or another
+        // symbol scored higher and only one entry per tick is allowed
+        return $failReason !== '' ? $failReason : 'not_best';
+    }
+
+    /**
+     * The whole entry step was refused before any symbol could be evaluated (a cooldown, a
+     * loss cap, `enabled` off, ...). There are no candle features to record - fetching them
+     * would cost API calls the tick deliberately does not make - so the row carries the block
+     * reason and the clock, under the symbol `*` because the block is account-wide, not
+     * per symbol. Recorded once an hour per reason, not once a minute.
+     */
+    private function obsBlocked(string $reason): void
+    {
+        if (!$this->learningOn() || $reason === '') {
+            return;
+        }
+        if ($this->obsSkipRepeats('signal', self::OBS_ALL_SYMBOLS, $reason)) {
+            return;
+        }
+        $now = $this->nowIso();
+        $sec = $this->nowSec();
+        $this->obsInsert([
+            'ts'          => $now,
+            'mode'        => $this->mode,
+            'engine'      => 'signal',
+            'symbol'      => self::OBS_ALL_SYMBOLS,
+            'decision'    => 'skipped',
+            'skip_reason' => $reason,
+            'features'    => ['hour_utc' => (int) gmdate('G', $sec), 'dow' => (int) gmdate('w', $sec)],
+            'outcome'     => 'not_taken',
+            'resolved_at' => $now,
+        ]);
+    }
+
+    /**
+     * One observation for a continuous engine's entry decision (DESIGN-LEARNING.md §2).
+     * Written when the engine placed a buy, and when something refused to let it - never on
+     * an idle tick, which is not a decision. `entered` rows are resolved by the cycle their
+     * inventory eventually closes; `skipped` rows resolve to `not_taken` immediately.
+     */
+    private function obsEngine(string $engine, string $symbol, string $decision, string $skipReason, float $bid, float $ask): void
+    {
+        if (!$this->learningOn() || $symbol === '') {
+            return;
+        }
+        $reason = $skipReason !== '' ? $skipReason : 'skipped';
+        if ($decision !== 'entered' && $this->obsSkipRepeats($engine, $symbol, $reason)) {
+            // an engine that is blocked, paused or out of range reports the same refusal every
+            // minute; recording it once an hour keeps the control group honest without burying
+            // every real decision under a thousand copies of one
+            return;
+        }
+        $now = $this->nowIso();
+        $row = [
+            'ts'          => $now,
+            'mode'        => $this->mode,
+            'engine'      => $engine,
+            'symbol'      => $symbol,
+            'decision'    => $decision === 'entered' ? 'entered' : 'skipped',
+            'skip_reason' => $decision === 'entered' ? null : $reason,
+            'features'    => $this->obsEngineFeatures($engine, $symbol, $bid, $ask),
+        ];
+        if ($row['decision'] === 'skipped') {
+            $row['outcome']     = 'not_taken';
+            $row['resolved_at'] = $now;
+        }
+        $this->obsInsert($row);
+    }
+
+    /**
+     * True when the same refusal was already recorded for this engine and symbol less than
+     * OBS_ENGINE_SKIP_REPEAT_MIN ago. A block is re-reported every single tick for as long as
+     * it lasts; without this the control group would be almost entirely duplicates.
+     */
+    private function obsSkipRepeats(string $engine, string $symbol, string $reason): bool
+    {
+        try {
+            $filter = ['mode' => $this->mode, 'engine' => $engine, 'limit' => 1];
+            if ($symbol !== '') {
+                $filter['symbol'] = $symbol;
+            }
+            $last = $this->db->observations($filter);
+        } catch (Throwable $e) {
+            return false;
+        }
+        if ($last === []) {
+            return false;
+        }
+        $row = $last[0];
+        if ((string) $row['decision'] !== 'skipped' || (string) $row['skip_reason'] !== $reason) {
+            return false;
+        }
+        return Util::isoDiffMinutes((string) $row['ts'], $this->nowIso()) < self::OBS_ENGINE_SKIP_REPEAT_MIN;
+    }
+
+    /**
+     * Turns an engine tick's reported action into an observation: `entered` when a BUY the
+     * engine had working actually FILLED this tick, `skipped` when it was refused, nothing at
+     * all when it merely had nothing to do.
+     *
+     * A fill, not a placement: `EngineOrders::place()` writes its row before the exchange has
+     * answered, a post-only reject leaves it there, and pmm cancels and re-posts its bid every
+     * refresh - counting placements would file one `entered` row a minute for quotes that never
+     * traded, none of which any cycle could ever resolve. `$lotsBefore` is sampled before the
+     * tick's `sync()` (see obsLotBaseline()) so a fill booked by the sync itself still counts.
+     */
+    private function obsEngineAction(string $engine, string $symbol, string $action, int $lotsBefore, float $bid, float $ask): void
+    {
+        if (!$this->learningOn()) {
+            return;
+        }
+        if ($this->engineLotCount($symbol, $engine) > $lotsBefore) {
+            $this->obsEngine($engine, $symbol, 'entered', '', $bid, $ask);
+            return;
+        }
+        if (in_array($action, ['paused', 'range_exit', 'skipped', 'grid_dust'], true)) {
+            // an action that already names its engine ('grid_dust') is not prefixed twice
+            $reason = strpos($action, $engine) === 0 ? $action : $engine . '_' . $action;
+            $this->obsEngine($engine, $symbol, 'skipped', $reason, $bid, $ask);
+        }
+    }
+
+    /** Features an engine tick can supply without a single extra API call. */
+    private function obsEngineFeatures(string $engine, string $symbol, float $bid, float $ask): array
+    {
+        $sec = $this->nowSec();
+        $f = [
+            'hour_utc' => (int) gmdate('G', $sec),
+            'dow'      => (int) gmdate('w', $sec),
+        ];
+        $spread = $this->obsSpreadPct(['bid' => $bid, 'ask' => $ask]);
+        if ($spread !== null) {
+            $f['spread_pct'] = $spread;
+        }
+        $mid = ($bid > 0.0 && $ask > 0.0) ? ($bid + $ask) / 2.0 : 0.0;
+        if ($engine === 'grid' && $mid > 0.0) {
+            $anchor = 0.0;
+            try {
+                if ((string) $this->db->getState('grid_symbol', '') === $symbol) {
+                    $raw    = $this->db->getState('grid_anchor', null);
+                    $anchor = is_numeric($raw) ? (float) $raw : 0.0;
+                }
+            } catch (Throwable $e) {
+                $anchor = 0.0;
+            }
+            if ($anchor > 0.0) {
+                $f['dist_from_anchor_pct'] = ($mid - $anchor) / $anchor * 100.0;
+            }
+        }
+        if ($mid > 0.0) {
+            $info  = isset($this->info[$symbol]) ? $this->info[$symbol] : [];
+            $order = $engine === 'grid' ? 'grid_order_usdt' : 'pmm_order_usdt';
+            $usdt  = isset($this->cfg[$order]) && is_numeric($this->cfg[$order]) ? (float) $this->cfg[$order] : 0.0;
+            $step  = $info !== [] ? $this->obsStepValuePct($info, $mid, $usdt) : null;
+            if ($step !== null) {
+                $f['step_value_pct'] = $step;
+            }
+        }
+        return $f;
+    }
+
+    /**
+     * How many FIFO lots this mode has ever booked for a symbol. A READ, used only to tell
+     * "the engine's buy actually FILLED" from "the engine merely put a quote on the book".
+     * One lot row is written per booked engine BUY fill, which is exactly the unit a cycle
+     * later consumes - a quote that is rejected, cancelled or left resting writes none.
+     */
+    private function engineLotCount(string $symbol, string $engine): int
+    {
+        if ($symbol === '') {
+            return 0;
+        }
+        try {
+            $st = $this->db->pdo()->prepare(
+                'SELECT COUNT(*) FROM lots WHERE mode = ? AND symbol = ? AND engine = ?'
+            );
+            $st->execute([$this->mode, $symbol, $engine]);
+            return (int) $st->fetchColumn();
+        } catch (Throwable $e) {
+            return 0;
+        }
+    }
+
+    /** Samples the lot baseline for this tick, before `sync()` books anything. Capture only. */
+    private function obsLotBaseline(string $symbol, string $engine): void
+    {
+        if (!$this->learningOn() || $symbol === '') {
+            return;
+        }
+        $this->obsLotsBefore[$engine . '|' . $symbol] = $this->engineLotCount($symbol, $engine);
+    }
+
+    /** The baseline sampled by obsLotBaseline() this tick, or 0 when learning is off. */
+    private function obsLotsSampled(string $symbol, string $engine): int
+    {
+        $key = $engine . '|' . $symbol;
+        return isset($this->obsLotsBefore[$key]) ? (int) $this->obsLotsBefore[$key] : 0;
+    }
+
+    /**
+     * Resolves every observation whose position has since closed - whatever closed it: an
+     * exit signal, the kill switch, a panic sell or reconciliation. Idempotent: it only ever
+     * looks at rows that still have no outcome, and the resolve is unforced.
+     */
+    private function obsResolvePositions(): void
+    {
+        try {
+            $open = $this->db->openObservations($this->mode, 500, true);
+        } catch (Throwable $e) {
+            return;
+        }
+        $now = $this->nowIso();
+        foreach ($open as $o) {
+            $pid = isset($o['position_id']) && $o['position_id'] !== null ? (int) $o['position_id'] : 0;
+            if ($pid <= 0) {
+                continue;
+            }
+            try {
+                $pos = $this->db->position($pid);
+            } catch (Throwable $e) {
+                continue;
+            }
+            if ($pos === null || (string) $pos['status'] !== 'CLOSED') {
+                continue;   // still open, or STUCK and not sold yet
+            }
+            $pnl    = isset($pos['pnl_usdt']) && is_numeric($pos['pnl_usdt']) ? (float) $pos['pnl_usdt'] : 0.0;
+            $opened = isset($pos['opened_at']) && (string) $pos['opened_at'] !== '' ? (string) $pos['opened_at'] : (string) $o['ts'];
+            $closed = isset($pos['closed_at']) && (string) $pos['closed_at'] !== '' ? (string) $pos['closed_at'] : $now;
+            $this->obsResolveRow((int) $o['id'], [
+                'outcome'      => self::obsOutcome($pnl),
+                'pnl_usdt'     => $pnl,
+                'pnl_pct'      => isset($pos['pnl_pct']) && is_numeric($pos['pnl_pct']) ? (float) $pos['pnl_pct'] : 0.0,
+                'exit_reason'  => isset($pos['exit_reason']) ? (string) $pos['exit_reason'] : '',
+                'held_minutes' => Util::isoDiffMinutes($opened, $closed),
+                'resolved_at'  => $now,
+            ]);
+        }
+    }
+
+    /**
+     * Resolves engine observations against the cycles booked since the last tick, oldest
+     * first - the order the FIFO lots are consumed in, so the cycle that closes a buy
+     * resolves the observation that recorded it. The `obs_cycle_cursor` bookmark makes the
+     * sweep idempotent: a cycle is considered exactly once, and a row that already carries an
+     * outcome is left alone by the unforced resolve.
+     */
+    private function obsResolveCycles(): void
+    {
+        $raw = $this->db->getState('obs_cycle_cursor', null);
+        if ($raw === null || $raw === '') {
+            // First sweep: every cycle already on the books closes a lot bought before capture
+            // began, so it can resolve nothing. Bookmark them instead of walking that history
+            // and pairing an ancient PnL with an observation written this minute.
+            try {
+                $newest = $this->db->cycles(1, $this->mode);
+            } catch (Throwable $e) {
+                return;
+            }
+            $this->db->setState('obs_cycle_cursor', $newest === [] ? 0 : (int) $newest[0]['id']);
+            return;
+        }
+        $cursor = (int) $raw;
+        try {
+            // forward from the bookmark, oldest first - the FIFO order of the lots. A page
+            // read backwards from the newest would jump the cursor past a burst larger than
+            // the page and lose those outcomes for good.
+            $fresh = $this->db->cyclesSince($cursor, $this->mode, 200);
+        } catch (Throwable $e) {
+            return;
+        }
+        if ($fresh === []) {
+            return;
+        }
+        $now  = $this->nowIso();
+        $seen = $cursor;
+        foreach ($fresh as $c) {
+            $id   = (int) $c['id'];
+            $seen = max($seen, $id);
+            $obs  = $this->obsEntryForCycle($c);
+            if ($obs === null) {
+                continue;   // no identifiable observation for this buy: resolve nothing
+            }
+            $pnl    = isset($c['pnl_usdt']) && is_numeric($c['pnl_usdt']) ? (float) $c['pnl_usdt'] : 0.0;
+            $cost   = (isset($c['qty']) ? (float) $c['qty'] : 0.0) * (isset($c['buy_price']) ? (float) $c['buy_price'] : 0.0);
+            $closed = isset($c['closed_at']) && (string) $c['closed_at'] !== '' ? (string) $c['closed_at'] : $now;
+            // the hold starts when the lot was bought (cycles.opened_at, the lot's created_at),
+            // not when the observation was written - an engine buy can rest on the book for hours
+            $opened = isset($c['opened_at']) && (string) $c['opened_at'] !== ''
+                ? (string) $c['opened_at'] : (string) $obs['ts'];
+            $this->obsResolveRow((int) $obs['id'], [
+                'outcome'      => self::obsOutcome($pnl),
+                'pnl_usdt'     => $pnl,
+                'pnl_pct'      => $cost > 0.0 ? $pnl / $cost * 100.0 : 0.0,
+                'exit_reason'  => 'cycle_closed',
+                'held_minutes' => max(0.0, Util::isoDiffMinutes($opened, $closed)),
+                'resolved_at'  => $now,
+                'cycle_id'     => (int) $id,
+            ]);
+        }
+        if ($seen > $cursor) {
+            $this->db->setState('obs_cycle_cursor', $seen);
+        }
+    }
+
+    /**
+     * The open `entered` observation that recorded the buy this cycle closed, or null.
+     *
+     * The link is the lot: `cycles.opened_at` is the consumed lot's `created_at`, and the
+     * observation is written by the very tick that booked that fill, so the two stamps agree to
+     * within a tick. Blind FIFO cannot be used - one lot sold in two slices writes two cycles,
+     * and a buy filling in two deltas writes two lots, so the queues drift apart permanently and
+     * every later cycle would staple its PnL to a different buy's conditions. A cycle with no
+     * match (its buy predates capture, or its observation is already resolved) resolves nothing.
+     *
+     * The candidate query is filtered in SQL, so rows that no cycle can ever resolve (inventory
+     * still held) cannot crowd the newest decisions out of a fixed window.
+     */
+    private function obsEntryForCycle(array $c): ?array
+    {
+        $engine = isset($c['engine']) ? (string) $c['engine'] : '';
+        $symbol = isset($c['symbol']) ? (string) $c['symbol'] : '';
+        $opened = isset($c['opened_at']) ? (string) $c['opened_at'] : '';
+        if ($engine === '' || $symbol === '' || $opened === '') {
+            return null;
+        }
+        try {
+            $open = $this->db->observations([
+                'mode'     => $this->mode,
+                'engine'   => $engine,
+                'symbol'   => $symbol,
+                'decision' => 'entered',
+                'resolved' => false,
+                'order'    => 'asc',
+                'limit'    => 200,
+            ]);
+        } catch (Throwable $e) {
+            return null;
+        }
+        $best    = null;
+        $gapBest = null;
+        foreach ($open as $o) {
+            if (($o['position_id'] ?? null) !== null || ($o['cycle_id'] ?? null) !== null) {
+                continue;   // already attached to a position or another cycle
+            }
+            $gap = abs(Util::isoDiffMinutes((string) $o['ts'], $opened));
+            if ($gap > self::OBS_CYCLE_MATCH_MIN) {
+                continue;   // a different buy: never borrow another decision's conditions
+            }
+            if ($gapBest === null || $gap < $gapBest) {
+                $best    = $o;
+                $gapBest = $gap;
+            }
+        }
+        return $best;
     }
 
     /* ================================================================ orders */

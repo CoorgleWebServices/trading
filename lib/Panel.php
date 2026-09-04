@@ -9,6 +9,12 @@ require_once __DIR__ . '/Risk.php';
 if (file_exists(__DIR__ . '/Sleeve.php')) {
     require_once __DIR__ . '/Sleeve.php';
 }
+// Learning (docs/DESIGN-LEARNING.md) is optional in exactly the same way: without
+// lib/Learn.php the panel renders every card it always did and the Insights page
+// says so instead of computing anything.
+if (file_exists(__DIR__ . '/Learn.php')) {
+    require_once __DIR__ . '/Learn.php';
+}
 
 /**
  * Panel helpers (DESIGN.md §12): security headers, sessions, CSRF, escaping,
@@ -30,6 +36,14 @@ final class Panel
     const PORTFOLIO_MIN_SAMPLE = 30;
     /** DESIGN-PORTFOLIO.md §6.4 default, used only when the config key is absent. */
     const SLEEVE_DRAWDOWN_DEFAULT = 25.0;
+
+    /** Effective round-trip taker cost with and without the BNB discount (DESIGN-LEARNING.md §7). */
+    const BNB_ROUND_TRIP_ON  = 0.15;
+    const BNB_ROUND_TRIP_OFF = 0.20;
+    /** DESIGN-LEARNING.md §7 default for `bnb_min_balance`, in USDT equivalent. */
+    const BNB_MIN_BALANCE_DEFAULT = 1.0;
+    /** State key holding the panel's read-only BNB display cache (never read by trading code). */
+    const BNB_STATE = 'bnb_status';
 
     /** @var bool guards against sending headers twice */
     private static $headersSent = false;
@@ -1053,6 +1067,15 @@ final class Panel
         $tables = array_merge($tables, $pf['tables']);
         $show   = array_merge($show, $pf['show']);
 
+        // ---- the learning line and the BNB fee-discount rows (DESIGN-LEARNING.md §6, §7).
+        // Additive and database-only: no network call is ever made while rendering.
+        $learn  = self::learnBlock($cfg, $db, $now);
+        $bnb    = self::bnbBlock($cfg, $db, $now, $tz);
+        $text   = array_merge($text, $learn['text'], $bnb['text']);
+        $levels = array_merge($levels, $learn['levels'], $bnb['levels']);
+        $show   = array_merge($show, $learn['show'], $bnb['show']);
+        $raw    = array_merge($raw, $learn['raw'], $bnb['raw']);
+
         $text['now']         = self::fmtTime($nowIso, $tz) . ' ' . $tz;
         $text['api_key_fp']  = self::keyFingerprint((string) ($cfg['api_key'] ?? ''));
 
@@ -1070,6 +1093,8 @@ final class Panel
             'portfolio' => $pf['portfolio'],
             'scanner'   => $pf['scanner'],
             'sleeve_sparkline' => $pf['sparkline'],
+            'learn'     => $learn['payload'],
+            'bnb'       => $bnb['payload'],
             'raw'       => $raw,
             'refresh_s' => 20,
         ];
@@ -2141,6 +2166,960 @@ final class Panel
             return Util::money($v / 1000.0, 2) . ' k';
         }
         return Util::money($v, 2);
+    }
+
+
+    /* ==================================================================== */
+    /*  Learning: Insights page, dashboard line (DESIGN-LEARNING.md §6)      */
+    /* ==================================================================== */
+
+    /**
+     * The five §5 keys plus the §7 BNB threshold, with their documented defaults.
+     * Used to render the settings form (and to sanitise a posted value) on an
+     * install whose config.php predates learning - exactly like the engine and
+     * portfolio defaults in index.php do for their sections.
+     */
+    public static function learnDefaults(): array
+    {
+        return [
+            'learning_enabled'      => true,
+            'learning_apply'        => false,
+            'learn_min_samples'     => 60,
+            'learn_recompute_hours' => 168,
+            'learn_window_days'     => 90,
+            'bnb_min_balance'       => self::BNB_MIN_BALANCE_DEFAULT,
+        ];
+    }
+
+    /** A config flag that may arrive as a bool, a number or a string. */
+    public static function learnFlag(array $cfg, string $key, bool $default): bool
+    {
+        if (!array_key_exists($key, $cfg) || $cfg[$key] === null) {
+            return $default;
+        }
+        $v = $cfg[$key];
+        if (is_bool($v)) {
+            return $v;
+        }
+        if (is_numeric($v)) {
+            return ((float) $v) != 0.0;
+        }
+        $s = strtolower(trim((string) $v));
+        if ($s === '') {
+            return $default;
+        }
+        return $s === '1' || $s === 'true' || $s === 'yes' || $s === 'on';
+    }
+
+    /** A clamped integer config value. */
+    public static function learnInt(array $cfg, string $key, int $default, int $lo, int $hi): int
+    {
+        $v = (isset($cfg[$key]) && is_numeric($cfg[$key])) ? (int) $cfg[$key] : $default;
+        return (int) Util::clamp((float) $v, (float) $lo, (float) $hi);
+    }
+
+    /**
+     * A win rate is NEVER rendered without the sample it rests on: this is the only
+     * helper the panel formats one with, so the rule cannot be forgotten in one place.
+     */
+    public static function winRate(array $b): string
+    {
+        $n       = (int) (isset($b['n']) ? $b['n'] : 0);
+        $decided = (int) (isset($b['decided']) ? $b['decided'] : 0);
+        if ($decided <= 0) {
+            return '– (no win/loss outcome yet, n=' . $n . ')';
+        }
+        $wins   = (int) (isset($b['wins']) ? $b['wins'] : 0);
+        $losses = (int) (isset($b['losses']) ? $b['losses'] : 0);
+        return Util::money(self::f($b['win_rate'] ?? 0), 1) . ' % of ' . $decided
+             . ' (' . $wins . 'W/' . $losses . 'L)';
+    }
+
+    /** The 95 % Wilson interval of a bucket's win rate, with its sample size. */
+    public static function ci(array $b): string
+    {
+        $decided = (int) (isset($b['decided']) ? $b['decided'] : 0);
+        if ($decided <= 0) {
+            return '–';
+        }
+        return Util::money(self::f($b['wilson_lo_pct'] ?? 0), 1) . ' – '
+             . Util::money(self::f($b['wilson_hi_pct'] ?? 0), 1) . ' % (n=' . $decided . ')';
+    }
+
+    /** Rows Learn draws its evidence from: the configured mode plus rows captured without one. */
+    private static function learnModeFilter(array $cfg)
+    {
+        $mode = trim((string) (isset($cfg['mode']) ? $cfg['mode'] : ''));
+        return $mode === '' ? '' : [$mode, ''];
+    }
+
+    /**
+     * Is there even arithmetically enough evidence for a confident claim?
+     *
+     * A claim needs `learn_min_samples` in EACH of two buckets, so fewer than
+     * 2 x min decided outcomes can never be confident. The probe is bounded to
+     * that many rows, which is what keeps the 20 s dashboard refresh cheap: the
+     * expensive Learn::insights() pass only runs once the arithmetic allows a
+     * conclusion at all.
+     *
+     * @return array{decided:int,needed:int,enough:bool,min:int}
+     */
+    private static function learnProbe(Db $db, array $cfg, int $now): array
+    {
+        $min  = self::learnInt($cfg, 'learn_min_samples', 60, 1, 100000);
+        $days = self::learnInt($cfg, 'learn_window_days', 90, 1, 3650);
+        $want = $min * 2;
+        $rows = [];
+        try {
+            $rows = $db->observations([
+                'decision' => 'entered',
+                'outcome'  => ['win', 'loss'],
+                'mode'     => self::learnModeFilter($cfg),
+                'since'    => Util::nowIso($now - $days * 86400),
+                'limit'    => $want,
+            ]);
+        } catch (Throwable $e) {
+            $rows = [];
+        }
+        $decided = count($rows);
+        return [
+            'decided' => $decided,
+            'needed'  => max(0, $want - $decided),
+            'enough'  => $decided >= $want,
+            'min'     => $min,
+        ];
+    }
+
+    /**
+     * The dashboard's one line (DESIGN-LEARNING.md §6): the strongest confident
+     * insight WITH its sample size, or "not enough data yet" - and, when it is the
+     * latter, roughly how many more resolved trades that would take.
+     *
+     * @return array{text:string,level:string,confident:bool,feature:string,samples:int,needed:int}
+     */
+    public static function learnLine(array $cfg, Db $db, ?int $now = null): array
+    {
+        $now = $now === null ? time() : $now;
+        $out = ['text' => 'not enough data yet', 'level' => 'muted', 'confident' => false,
+                'feature' => '', 'samples' => 0, 'needed' => 0];
+        if (!class_exists('Learn')) {
+            $out['text'] = 'Learning is not installed on this deployment (lib/Learn.php is missing).';
+            return $out;
+        }
+        if (!self::learnFlag($cfg, 'learning_enabled', true)) {
+            $out['text'] = 'Learning is off (learning_enabled = false): no observations are captured and nothing is concluded.';
+            return $out;
+        }
+        $probe = self::learnProbe($db, $cfg, $now);
+        $out['samples'] = $probe['decided'];
+        $out['needed']  = $probe['needed'];
+        if (!$probe['enough']) {
+            $out['text'] = 'Not enough data yet: ' . $probe['decided'] . ' resolved trade'
+                . ($probe['decided'] === 1 ? '' : 's') . ' with a win/loss outcome, and a claim needs '
+                . $probe['min'] . ' in each of two buckets - roughly ' . $probe['needed'] . ' more.';
+            return $out;
+        }
+        $insights = [];
+        try {
+            $insights = Learn::insights($db, $cfg, self::learnInt($cfg, 'learn_window_days', 90, 1, 3650));
+        } catch (Throwable $e) {
+            $insights = [];
+        }
+        foreach ($insights as $ins) {
+            if (empty($ins['confident'])) {
+                continue;
+            }
+            $best  = isset($ins['confident_best']) && is_array($ins['confident_best']) ? $ins['confident_best'] : null;
+            $worst = isset($ins['confident_worst']) && is_array($ins['confident_worst']) ? $ins['confident_worst'] : null;
+            if ($best === null || $worst === null) {
+                continue;
+            }
+            $out['confident'] = true;
+            $out['feature']   = (string) $ins['feature'];
+            $out['level']     = 'ok';
+            $out['text']      = (string) $ins['label'] . ' ' . (string) $best['label'] . ': win rate '
+                . self::winRate($best) . ', 95 % CI ' . self::ci($best) . ', avg PnL ' . self::signed(self::f($best['avg_pnl'] ?? 0))
+                . ' - against ' . (string) $worst['label'] . ': win rate ' . self::winRate($worst)
+                . '. The two intervals do not overlap'
+                . (isset($ins['family']) && (int) $ins['family'] > 1
+                    ? ', even widened for the ' . (int) $ins['family'] . ' bucket comparisons this scan made'
+                    : '') . '.';
+            return $out;
+        }
+        $out['text'] = 'No condition separates winners from losers yet on ' . $probe['decided']
+            . ' resolved trades: not enough data yet to conclude anything.';
+        return $out;
+    }
+
+    /**
+     * Everything `?page=insights` renders (DESIGN-LEARNING.md §6), as one array.
+     *
+     * Reads the database only - no network, no clock beyond "now" - and never
+     * throws: every query is wrapped, so an install whose database predates the
+     * observations table simply reports that nothing has been captured yet.
+     *
+     * @return array{header:array,features:array,weights:array,skipped:array,line:array,text:array,levels:array}
+     */
+    public static function insights(array $cfg, Db $db, ?int $now = null): array
+    {
+        $now   = $now === null ? time() : $now;
+        $tz    = (string) (isset($cfg['timezone']) ? $cfg['timezone'] : 'UTC');
+        $mode  = strtolower(trim((string) (isset($cfg['mode']) ? $cfg['mode'] : 'paper')));
+        $min   = self::learnInt($cfg, 'learn_min_samples', 60, 1, 100000);
+        $days  = self::learnInt($cfg, 'learn_window_days', 90, 1, 3650);
+        $hours = self::learnInt($cfg, 'learn_recompute_hours', 168, 1, 100000);
+        $on    = self::learnFlag($cfg, 'learning_enabled', true);
+        $apply = self::learnFlag($cfg, 'learning_apply', false);
+        $since = Util::nowIso($now - $days * 86400);
+        $have  = class_exists('Learn');
+
+        // ---- the window's raw rows, fetched once and reused by every card below
+        $rows = [];
+        try {
+            $rows = $db->observations([
+                'since' => $since,
+                'mode'  => self::learnModeFilter($cfg),
+                'limit' => 20000,
+            ]);
+        } catch (Throwable $e) {
+            $rows = [];
+        }
+        $total = count($rows);
+        $entered = 0;
+        $skipped = 0;
+        $resolved = 0;
+        $wins = 0;
+        $losses = 0;
+        $flat = 0;
+        $notTaken = 0;
+        $open = 0;
+        $engineMix = [];
+        foreach ($rows as $row) {
+            $eng = strtolower(trim((string) (isset($row['engine']) ? $row['engine'] : '')));
+            if ($eng === '') {
+                $eng = 'signal';   // rows captured before the engine column carried a value
+            }
+            if (!isset($engineMix[$eng])) {
+                $engineMix[$eng] = 0;
+            }
+            $engineMix[$eng]++;
+            $decision = strtolower(trim((string) (isset($row['decision']) ? $row['decision'] : '')));
+            $outcome  = (isset($row['outcome']) && $row['outcome'] !== null)
+                ? strtolower(trim((string) $row['outcome'])) : '';
+            if ($decision === 'entered') {
+                $entered++;
+            } else {
+                $skipped++;
+            }
+            if ($outcome !== '') {
+                $resolved++;
+            }
+            if ($outcome === 'win') {
+                $wins++;
+            } elseif ($outcome === 'loss') {
+                $losses++;
+            } elseif ($outcome === 'flat') {
+                $flat++;
+            } elseif ($outcome === 'not_taken') {
+                $notTaken++;
+            } elseif ($outcome === '') {
+                $open++;
+            }
+        }
+        $decided = $wins + $losses;
+        $needed  = max(0, $min * 2 - $decided);
+        $allTime = 0;
+        try {
+            $counts  = $db->observationCounts($mode);
+            $allTime = (int) (isset($counts['total']) ? $counts['total'] : 0);
+        } catch (Throwable $e) {
+            $allTime = 0;
+        }
+
+        // ---- how the evidence is spread across engines (DESIGN-LEARNING.md §3):
+        // the condition cards pool EVERY engine into one win rate, while the weight
+        // suggestions read signal-engine rows only. Say so rather than let a grid-heavy
+        // window read as evidence about the signal scorer.
+        ksort($engineMix);
+        $learnEngines = ($have && defined('Learn::LEARN_ENGINES')) ? constant('Learn::LEARN_ENGINES') : ['signal', ''];
+        $engineParts  = [];
+        $engineFeed   = 0;
+        foreach ($engineMix as $eng => $cnt) {
+            $engineParts[] = $eng . ' ' . $cnt;
+            if (in_array($eng, $learnEngines, true)) {   // '' was normalised to 'signal' above
+                $engineFeed += $cnt;
+            }
+        }
+        $engineList = $engineParts === [] ? 'none yet' : implode(', ', $engineParts);
+        $enginesText = $engineList . '. The condition cards below pool every engine into one win rate; '
+            . 'the weight suggestions use signal-engine rows only (' . $engineFeed . ' of ' . $total . ' here). '
+            . ($engineMix === []
+                ? 'Nothing has been captured yet, so neither view rests on anything.'
+                : (count($engineMix) > 1
+                    ? 'With more than one engine captured, a card can be carried by an engine the weights never touch.'
+                    : 'Only one engine has been captured, so the two views currently rest on the same rows.'));
+
+        // ---- the honest header sentence
+        if (!$have) {
+            $sentence = 'lib/Learn.php is not installed on this deployment, so nothing is computed here.';
+            $level    = 'warn';
+        } elseif (!$on) {
+            $sentence = 'Learning is switched off (learning_enabled = false): no observation is captured and no claim is made. '
+                      . 'Everything below is what the database already holds.';
+            $level    = 'muted';
+        } elseif ($total === 0) {
+            $sentence = 'Nothing has been captured yet. Every entry evaluation writes one row - the ones it took and the ones it '
+                      . 'refused - so this page fills in as the bot ticks.';
+            $level    = 'muted';
+        } elseif ($decided < $min * 2) {
+            $sentence = 'Not enough data yet. ' . $decided . ' of the ' . ($min * 2) . ' resolved trades needed are in, so roughly '
+                      . $needed . ' more are required before anything here can be called a result: a claim needs at least '
+                      . $min . ' outcomes in EACH of two buckets (learn_min_samples), and their confidence intervals must not '
+                      . 'overlap. At a few trades a day that is weeks away, and saying so is the honest answer.';
+            $level    = 'warn';
+        } else {
+            $sentence = $decided . ' resolved trades are in - enough for a claim to be possible. A bucket is only called confident '
+                      . 'when it holds at least ' . $min . ' outcomes and its confidence interval does not overlap the one it is '
+                      . 'compared with; anything else below is explicitly marked inconclusive.';
+            $level    = 'ok';
+        }
+
+        $header = [
+            'total'            => $total,
+            'all_time'         => $allTime,
+            'entered'          => $entered,
+            'skipped'          => $skipped,
+            'resolved'         => $resolved,
+            'open'             => $open,
+            'wins'             => $wins,
+            'losses'           => $losses,
+            'flat'             => $flat,
+            'not_taken'        => $notTaken,
+            'decided'          => $decided,
+            'min_samples'      => $min,
+            'needed'           => $needed,
+            'enough'           => $decided >= $min * 2,
+            'window_days'      => $days,
+            'mode'             => $mode,
+            'learning_enabled' => $on,
+            'learning_apply'   => $apply,
+            'engines'          => $engineMix,
+            'engines_text'     => $enginesText,
+            'engines_feed'     => $engineFeed,
+            'sentence'         => $sentence,
+            'level'            => $level,
+        ];
+
+        // ---- one card per feature (DESIGN-LEARNING.md §6)
+        $features = [];
+        if ($have) {
+            $list = [];
+            try {
+                $list = Learn::insights($db, $cfg, $days);
+            } catch (Throwable $e) {
+                $list = [];
+            }
+            foreach ($list as $ins) {
+                $features[] = self::insightCard($ins, $min);
+            }
+        }
+
+        // ---- current weights, last recompute, what changed and on what evidence
+        $weights = self::weightsCard($cfg, $db, $now, $tz, $hours, $apply, $have);
+
+        // ---- skipped vs entered
+        $skippedCard = self::skippedCard($rows, $entered, $skipped, $days);
+
+        $line = self::learnLine($cfg, $db, $now);
+
+        $text = [
+            'ins_total'     => (string) $total,
+            'ins_all_time'  => (string) $allTime,
+            'ins_entered'   => (string) $entered,
+            'ins_skipped'   => (string) $skipped,
+            'ins_resolved'  => $resolved . ' resolved (' . $wins . 'W/' . $losses . 'L/' . $flat . ' flat/' . $notTaken
+                               . ' not taken, ' . $open . ' still open)',
+            'ins_decided'   => $decided . ' win/loss outcomes',
+            'ins_window'    => 'last ' . $days . ' days, mode ' . strtoupper($mode === '' ? 'all' : $mode),
+            'ins_min'       => (string) $min,
+            'ins_needed'    => $needed > 0 ? 'roughly ' . $needed . ' more resolved trades' : 'the sample is large enough',
+            'ins_sentence'  => $sentence,
+            'ins_engines'   => $enginesText,
+            'learn_line'    => $line['text'],
+        ];
+        $levels = ['ins_sentence' => $level, 'learn_line' => $line['level']];
+
+        return [
+            'header'   => $header,
+            'features' => $features,
+            'weights'  => $weights,
+            'skipped'  => $skippedCard,
+            'line'     => $line,
+            'text'     => $text,
+            'levels'   => $levels,
+        ];
+    }
+
+    /**
+     * One feature card: the bucket table (range, n, win rate WITH its confidence
+     * interval, average PnL), the separation figure and the plain-language note.
+     */
+    private static function insightCard(array $ins, int $min): array
+    {
+        $rows = [];
+        foreach ((isset($ins['buckets']) && is_array($ins['buckets']) ? $ins['buckets'] : []) as $b) {
+            if (!is_array($b)) {
+                continue;
+            }
+            $n       = (int) (isset($b['n']) ? $b['n'] : 0);
+            $avg     = self::f(isset($b['avg_pnl']) ? $b['avg_pnl'] : 0);
+            $enough  = $n >= $min;
+            $rows[] = [
+                ['t' => (string) (isset($b['label']) ? $b['label'] : ''), 'c' => 'mono'],
+                ['t' => (string) $n, 'c' => 'num' . ($enough ? '' : ' lvl-muted')],
+                ['t' => (string) (int) (isset($b['open_now']) ? $b['open_now'] : 0), 'c' => 'num lvl-muted'],
+                ['t' => self::winRate($b), 'c' => $n > 0 ? '' : 'lvl-muted'],
+                ['t' => self::ci($b), 'c' => 'mono'],
+                ['t' => $n > 0 ? self::signed($avg, 4) : '–', 'c' => 'num ' . ($n > 0 ? 'lvl-' . self::pnlLevel($avg) : 'lvl-muted')],
+                ['t' => $n > 0 ? self::signed(self::f(isset($b['total_pnl']) ? $b['total_pnl'] : 0), 4) : '–', 'c' => 'num'],
+                ['t' => $enough ? 'yes' : 'no (needs ' . $min . ')', 'c' => $enough ? '' : 'lvl-muted'],
+            ];
+        }
+        $confident = !empty($ins['confident']);
+        $sep       = self::f(isset($ins['separation']) ? $ins['separation'] : 0);
+        $csep      = self::f(isset($ins['confident_separation']) ? $ins['confident_separation'] : 0);
+        return [
+            'feature'    => (string) (isset($ins['feature']) ? $ins['feature'] : ''),
+            'label'      => (string) (isset($ins['label']) ? $ins['label'] : ''),
+            'slug'       => self::slug((string) (isset($ins['feature']) ? $ins['feature'] : 'x')),
+            'confident'  => $confident,
+            'samples'    => (int) (isset($ins['samples']) ? $ins['samples'] : 0),
+            'state'      => $confident ? 'CONFIDENT' : ((int) (isset($ins['samples']) ? $ins['samples'] : 0) === 0 ? 'NO DATA' : 'INCONCLUSIVE'),
+            'level'      => $confident ? 'ok' : 'muted',
+            'separation' => $sep,
+            'separation_text' => 'separation ' . self::signed($sep, 4) . ' USDT (best bucket average PnL − worst)'
+                . ($confident ? ', ' . self::signed($csep, 4) . ' between the two well-sampled buckets' : ''),
+            'note'       => (string) (isset($ins['note']) ? $ins['note'] : ''),
+            'table'      => ['rows' => $rows, 'cols' => 8, 'empty' => 'No observation carries this condition yet'],
+        ];
+    }
+
+    /**
+     * The current-weights card: `learn_weights`, when it was last recomputed, what
+     * changed and on what evidence, whether `learning_apply` is on, and - because
+     * that is the whole point of the dry run - what a recompute WOULD do next.
+     */
+    private static function weightsCard(array $cfg, Db $db, int $now, string $tz, int $hours, bool $apply, bool $have): array
+    {
+        $entry   = self::learnInt($cfg, 'entry_threshold', 60, 0, 100);
+        $map     = [];
+        $log     = [];
+        $cands   = [];
+        if ($have) {
+            try {
+                $map = Learn::weights($db, $cfg);
+            } catch (Throwable $e) {
+                $map = [];
+            }
+            try {
+                $log = Learn::recomputeLog($db);
+            } catch (Throwable $e) {
+                $log = [];
+            }
+            try {
+                $cands = Learn::adjustments($db, $cfg);
+            } catch (Throwable $e) {
+                $cands = [];
+            }
+        }
+        $components = ($have && defined('Learn::COMPONENTS')) ? constant('Learn::COMPONENTS')
+            : ['rsi', 'bb', 'reversal', 'rsi_up', 'vol', 'trend'];
+        $base = ($have && defined('Learn::BASE_POINTS')) ? constant('Learn::BASE_POINTS')
+            : ['rsi' => 20, 'bb' => 20, 'reversal' => 20, 'rsi_up' => 20, 'vol' => 20, 'trend' => 0];
+        $maxDelta = ($have && defined('Learn::MAX_DELTA')) ? (int) constant('Learn::MAX_DELTA') : 10;
+
+        $rows = [];
+        foreach ($components as $component) {
+            $c     = (string) $component;
+            $b     = (int) (isset($base[$c]) && is_numeric($base[$c]) ? $base[$c] : 0);
+            $delta = (int) (isset($map[$c]) && is_numeric($map[$c]) ? $map[$c] : 0);
+            $cap   = min($maxDelta, abs($b));
+            $rows[] = [
+                ['t' => $c, 'c' => 'mono'],
+                ['t' => (string) $b, 'c' => 'num'],
+                ['t' => $delta === 0 ? '0' : self::signed((float) $delta, 0), 'c' => 'num ' . ($delta === 0 ? 'lvl-muted' : 'lvl-info')],
+                ['t' => (string) ($b + $delta), 'c' => 'num'],
+                ['t' => $cap > 0 ? '±' . $cap : 'not adjustable (no score points)', 'c' => $cap > 0 ? 'num' : 'lvl-muted'],
+            ];
+        }
+        $threshold = (int) (isset($map['threshold']) && is_numeric($map['threshold']) ? $map['threshold'] : $entry);
+        // The bar the bot actually applies (Bot::signalTick -> Risk::effectiveThreshold):
+        // the adaptive controller may have raised it above entry_threshold, and the
+        // learned `threshold` above is inert - no recompute may move it.
+        try {
+            $eff = (int) Risk::effectiveThreshold($cfg, $db);
+        } catch (Throwable $e) {
+            $eff = $entry;
+        }
+
+        $logRows = [];
+        foreach ($log as $entryRow) {
+            if (!is_array($entryRow)) {
+                continue;
+            }
+            $changed = isset($entryRow['changed']) && $entryRow['changed'] !== null ? (string) $entryRow['changed'] : '';
+            $logRows[] = [
+                ['t' => self::fmtTime((string) (isset($entryRow['at']) ? $entryRow['at'] : ''), $tz), 'c' => 'mono nowrap'],
+                ['t' => $changed !== '' ? $changed : 'nothing', 'c' => 'mono'],
+                ['t' => $changed !== '' ? self::signed(self::f($entryRow['from'] ?? 0), 0) . ' → ' . self::signed(self::f($entryRow['to'] ?? 0), 0) : '–', 'c' => 'num'],
+                ['t' => (string) (int) (isset($entryRow['samples']) ? $entryRow['samples'] : 0), 'c' => 'num'],
+                ['t' => (string) (isset($entryRow['note']) ? $entryRow['note'] : ''), 'c' => 'logmsg'],
+            ];
+        }
+
+        $candRows = [];
+        foreach ($cands as $c) {
+            if (!is_array($c)) {
+                continue;
+            }
+            $fires  = isset($c['fires']) && is_array($c['fires']) ? $c['fires'] : [];
+            $others = isset($c['others']) && is_array($c['others']) ? $c['others'] : [];
+            $candRows[] = [
+                ['t' => (string) (isset($c['component']) ? $c['component'] : ''), 'c' => 'mono'],
+                ['t' => (string) (isset($c['when']) ? $c['when'] : ''), 'c' => ''],
+                ['t' => self::signed(self::f($c['delta'] ?? 0), 0) . ' points', 'c' => 'num'],
+                ['t' => self::winRate($fires), 'c' => ''],
+                ['t' => self::winRate($others), 'c' => ''],
+                ['t' => self::signed(self::f($c['separation'] ?? 0), 4), 'c' => 'num'],
+            ];
+        }
+
+        $lastAt = '';
+        try {
+            $lastAt = (string) $db->getState('learn_at', '');
+        } catch (Throwable $e) {
+            $lastAt = '';
+        }
+        $lastTs = $lastAt !== '' ? Util::isoToTs($lastAt) : null;
+        $nextTs = $lastTs === null ? null : $lastTs + $hours * 3600;
+        $due    = $nextTs === null || $nextTs <= $now;
+
+        $lastEntry = isset($log[0]) && is_array($log[0]) ? $log[0] : null;
+        $changedText = 'Nothing has been applied yet.';
+        if ($lastEntry !== null) {
+            $ch = isset($lastEntry['changed']) && $lastEntry['changed'] !== null ? (string) $lastEntry['changed'] : '';
+            $changedText = $ch !== ''
+                ? 'Last recompute moved "' . $ch . '" from ' . self::signed(self::f($lastEntry['from'] ?? 0), 0)
+                  . ' to ' . self::signed(self::f($lastEntry['to'] ?? 0), 0) . ' points on '
+                  . (int) (isset($lastEntry['samples']) ? $lastEntry['samples'] : 0) . ' resolved trades.'
+                : 'The last recompute changed nothing: the evidence did not clear the confidence test on '
+                  . (int) (isset($lastEntry['samples']) ? $lastEntry['samples'] : 0) . ' resolved trades.';
+        }
+
+        return [
+            'map'          => $map,
+            'threshold'    => $threshold,
+            'entry_threshold' => $entry,
+            'effective_threshold' => $eff,
+            'threshold_text'  => $eff . ' / 100 in force now (entry_threshold ' . $entry
+                                 . ($eff > $entry ? ', raised by the adaptive controller' : '')
+                                 . '; learned threshold ' . $threshold . ', which no recompute has ever moved'
+                                 . ' - learning may never take it below ' . max(0, $entry - 10) . ')',
+            'apply'        => $apply,
+            'apply_text'   => $apply
+                ? 'ON - a recompute writes the weight map and Strategy adds the deltas to its score.'
+                : 'OFF - this is a dry run: the panel shows exactly what it would do and nothing is written or scored.',
+            'apply_level'  => $apply ? 'warn' : 'muted',
+            'last_at'      => $lastAt,
+            'last_text'    => $lastAt === '' ? 'never' : self::fmtTime($lastAt, $tz) . ' (' . self::ago($lastAt, $now) . ')',
+            'next_text'    => $nextTs === null
+                ? 'now - no recompute has ever run'
+                : self::fmtTime(Util::nowIso($nextTs), $tz) . ($due ? ' (due)' : ' (not before then)'),
+            'due'          => $due,
+            'hours'        => $hours,
+            'changed_text' => $changedText,
+            'table'        => ['rows' => $rows, 'cols' => 5, 'empty' => 'No score components'],
+            'log'          => ['rows' => $logRows, 'cols' => 5, 'empty' => 'No recompute has run yet'],
+            'candidates'   => ['rows' => $candRows, 'cols' => 6, 'empty' => 'No component clears the evidence test right now'],
+            'candidate_count' => count($candRows),
+        ];
+    }
+
+    /**
+     * Skipped vs entered (DESIGN-LEARNING.md §6): the conditions the bot most often
+     * refused, so the operator can see whether the gates are too tight. Skipped rows
+     * carry no PnL and are never counted as wins or losses - this card reports
+     * frequency and the conditions present, nothing else.
+     */
+    private static function skippedCard(array $rows, int $entered, int $skipped, int $days): array
+    {
+        $byReason = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $decision = strtolower(trim((string) (isset($row['decision']) ? $row['decision'] : '')));
+            if ($decision !== 'skipped') {
+                continue;
+            }
+            $reason = trim((string) (isset($row['skip_reason']) && $row['skip_reason'] !== null ? $row['skip_reason'] : ''));
+            if ($reason === '') {
+                $reason = '(no reason recorded)';
+            }
+            if (!isset($byReason[$reason])) {
+                $byReason[$reason] = ['n' => 0, 'rsi' => [], 'atr' => [], 'spread' => [], 'score' => [], 'last' => ''];
+            }
+            $byReason[$reason]['n']++;
+            $features = isset($row['features_map']) && is_array($row['features_map'])
+                ? $row['features_map']
+                : (isset($row['features']) && is_array($row['features']) ? $row['features'] : []);
+            foreach (['rsi' => 'rsi', 'atr' => 'atr_pct', 'spread' => 'spread_pct'] as $slot => $key) {
+                if (isset($features[$key]) && is_numeric($features[$key]) && is_finite((float) $features[$key])) {
+                    $byReason[$reason][$slot][] = (float) $features[$key];
+                }
+            }
+            if (isset($row['score']) && is_numeric($row['score'])) {
+                $byReason[$reason]['score'][] = (float) $row['score'];
+            }
+            $ts = (string) (isset($row['ts']) ? $row['ts'] : '');
+            if ($ts > $byReason[$reason]['last']) {
+                $byReason[$reason]['last'] = $ts;
+            }
+        }
+        uasort($byReason, static function (array $a, array $b): int {
+            if ($a['n'] === $b['n']) {
+                return 0;
+            }
+            return $a['n'] < $b['n'] ? 1 : -1;
+        });
+        $max = 0;
+        foreach ($byReason as $r) {
+            $max = max($max, (int) $r['n']);
+        }
+        $avg = static function (array $v): string {
+            if ($v === []) {
+                return '–';
+            }
+            return Util::money(array_sum($v) / count($v), 2);
+        };
+        $out = [];
+        foreach ($byReason as $reason => $r) {
+            $n = (int) $r['n'];
+            $out[] = [
+                ['t' => (string) $reason, 'c' => 'mono'],
+                ['t' => (string) $n, 'c' => 'num'],
+                ['t' => $skipped > 0 ? Util::money($n / $skipped * 100.0, 1) . ' %' : '–',
+                 'bar' => $max > 0 ? (int) round($n / $max * 100) : 0],
+                ['t' => $avg($r['rsi']), 'c' => 'num'],
+                ['t' => $avg($r['atr']), 'c' => 'num'],
+                ['t' => $avg($r['spread']), 'c' => 'num'],
+                ['t' => $avg($r['score']), 'c' => 'num'],
+            ];
+        }
+        $evaluations = $entered + $skipped;
+        $summary = $evaluations === 0
+            ? 'No entry evaluation has been captured in the last ' . $days . ' days.'
+            : 'The bot entered ' . $entered . ' of ' . $evaluations . ' evaluations in the last ' . $days . ' days ('
+              . Util::money($evaluations > 0 ? $entered / $evaluations * 100.0 : 0.0, 1) . ' %) and refused ' . $skipped
+              . '. Skipped rows are the control group: they carry no PnL and are never counted as wins or losses. '
+              . 'A reason that dominates this table is the gate to question - not proof that loosening it would pay.';
+        return [
+            'entered'     => $entered,
+            'skipped'     => $skipped,
+            'evaluations' => $evaluations,
+            'summary'     => $summary,
+            'table'       => ['rows' => $out, 'cols' => 7, 'empty' => 'No refused evaluation in the window'],
+        ];
+    }
+
+    /** State key of the memoised dashboard learning line (display cache only). */
+    const LEARN_LINE_STATE = 'learn_line';
+
+    /**
+     * learnLine() behind a signature cache. The signature is the observation table's
+     * own counts plus the settings the line depends on, so it can never serve a line
+     * that the current data would not produce.
+     */
+    private static function learnLineCached(array $cfg, Db $db, int $now): array
+    {
+        $sig = '';
+        try {
+            $c   = $db->observationCounts(null);
+            $sig = implode('/', [
+                (int) $c['total'], (int) $c['resolved'], (int) $c['wins'], (int) $c['losses'],
+                self::learnInt($cfg, 'learn_min_samples', 60, 1, 100000),
+                self::learnInt($cfg, 'learn_window_days', 90, 1, 3650),
+                trim((string) (isset($cfg['mode']) ? $cfg['mode'] : '')),
+                self::learnFlag($cfg, 'learning_enabled', true) ? '1' : '0',
+            ]);
+        } catch (Throwable $e) {
+            $sig = '';
+        }
+        if ($sig !== '') {
+            try {
+                $hit = $db->getStateJson(self::LEARN_LINE_STATE, null);
+            } catch (Throwable $e) {
+                $hit = null;
+            }
+            if (is_array($hit) && isset($hit['sig']) && (string) $hit['sig'] === $sig && isset($hit['text'])) {
+                return [
+                    'text'      => (string) $hit['text'],
+                    'level'     => (string) (isset($hit['level']) ? $hit['level'] : 'muted'),
+                    'confident' => !empty($hit['confident']),
+                    'feature'   => (string) (isset($hit['feature']) ? $hit['feature'] : ''),
+                    'samples'   => (int) (isset($hit['samples']) ? $hit['samples'] : 0),
+                    'needed'    => (int) (isset($hit['needed']) ? $hit['needed'] : 0),
+                ];
+            }
+        }
+        $line = self::learnLine($cfg, $db, $now);
+        if ($sig !== '') {
+            try {
+                $db->setState(self::LEARN_LINE_STATE, array_merge($line, ['sig' => $sig, 'at' => Util::nowIso($now)]));
+            } catch (Throwable $e) {
+                // the cache is best effort: a read-only database still renders the line
+            }
+        }
+        return $line;
+    }
+
+    /**
+     * The learning line for the dashboard status payload.
+     *
+     * The dashboard refreshes every 20 s, so the line is memoised in the state key
+     * `learn_line` against a signature of the observation table (total / resolved /
+     * wins / losses) and the settings the line depends on. Any new or newly resolved
+     * observation changes the signature and the line is recomputed immediately; an
+     * unchanged table costs one COUNT instead of a full bucketing pass over up to
+     * 50 000 rows. The cache is display state only - nothing reads it back into a
+     * trading decision.
+     *
+     * @return array{text:array,levels:array,show:array,raw:array,payload:array}
+     */
+    private static function learnBlock(array $cfg, Db $db, int $now): array
+    {
+        $line = self::learnLineCached($cfg, $db, $now);
+        $on   = self::learnFlag($cfg, 'learning_enabled', true);
+        return [
+            'text'   => ['learn_line' => $line['text']],
+            'levels' => ['learn_line' => $line['level']],
+            'show'   => ['learning' => $on && class_exists('Learn')],
+            'raw'    => ['learn_samples' => (int) $line['samples'], 'learn_confident' => (bool) $line['confident']],
+            'payload' => [
+                'enabled'   => $on,
+                'apply'     => self::learnFlag($cfg, 'learning_apply', false),
+                'confident' => (bool) $line['confident'],
+                'feature'   => (string) $line['feature'],
+                'samples'   => (int) $line['samples'],
+                'needed'    => (int) $line['needed'],
+                'line'      => (string) $line['text'],
+            ],
+        ];
+    }
+
+    /* ==================================================================== */
+    /*  BNB fee discount (DESIGN-LEARNING.md §7)                            */
+    /* ==================================================================== */
+
+    /** `bnb_min_balance` in USDT equivalent, with the §7 default. */
+    public static function bnbMinBalance(array $cfg): float
+    {
+        $v = (isset($cfg['bnb_min_balance']) && is_numeric($cfg['bnb_min_balance']))
+            ? (float) $cfg['bnb_min_balance'] : self::BNB_MIN_BALANCE_DEFAULT;
+        return (is_finite($v) && $v >= 0.0) ? $v : self::BNB_MIN_BALANCE_DEFAULT;
+    }
+
+    /**
+     * The panel's read-only display cache for the BNB fee discount.
+     *
+     * `/sapi/v1/bnbBurn` is a signed account call, so it is NEVER made while
+     * rendering a page (the dashboard refreshes every 20 s). The panel action
+     * writes this cache; every render only reads it.
+     *
+     * @return array{checked:bool,available:bool,spot:bool,interest:bool,free:float,
+     *   price:float,value:float,at:string,mode:string,note:string}
+     */
+    public static function bnbCache(Db $db): array
+    {
+        $raw = null;
+        try {
+            $raw = $db->getStateJson(self::BNB_STATE, null);
+        } catch (Throwable $e) {
+            $raw = null;
+        }
+        $in = is_array($raw) ? $raw : [];
+        return [
+            'checked'   => $in !== [],
+            'available' => !empty($in['available']),
+            'spot'      => !empty($in['spot']),
+            'interest'  => !empty($in['interest']),
+            'free'      => self::f(isset($in['free']) ? $in['free'] : 0),
+            'price'     => self::f(isset($in['price']) ? $in['price'] : 0),
+            'value'     => self::f(isset($in['value']) ? $in['value'] : 0),
+            'at'        => (string) (isset($in['at']) ? $in['at'] : ''),
+            'mode'      => (string) (isset($in['mode']) ? $in['mode'] : ''),
+            'note'      => (string) (isset($in['note']) ? $in['note'] : ''),
+        ];
+    }
+
+    /** Store one BNB reading. The only writer is the panel's toggle / check action. */
+    public static function bnbWrite(Db $db, array $row): void
+    {
+        try {
+            $db->setState(self::BNB_STATE, [
+                'available' => !empty($row['available']),
+                'spot'      => !empty($row['spot']),
+                'interest'  => !empty($row['interest']),
+                'free'      => self::f(isset($row['free']) ? $row['free'] : 0),
+                'price'     => self::f(isset($row['price']) ? $row['price'] : 0),
+                'value'     => self::f(isset($row['value']) ? $row['value'] : 0),
+                'at'        => (string) (isset($row['at']) && (string) $row['at'] !== '' ? $row['at'] : Util::nowIso()),
+                'mode'      => (string) (isset($row['mode']) ? $row['mode'] : ''),
+                'note'      => (string) (isset($row['note']) ? $row['note'] : ''),
+            ]);
+        } catch (Throwable $e) {
+            if (class_exists('Log')) {
+                Log::warn('panel: could not store the BNB status - ' . $e->getMessage());
+            }
+        }
+    }
+
+    /** Round-trip taker cost in percent, with and without the discount (§7). */
+    public static function bnbRoundTrip(bool $on): float
+    {
+        return $on ? self::BNB_ROUND_TRIP_ON : self::BNB_ROUND_TRIP_OFF;
+    }
+
+    /**
+     * The API health card's BNB rows (DESIGN-LEARNING.md §7): on / off / unavailable,
+     * the account's BNB free balance and the effective round-trip cost, plus the
+     * low-balance warning.
+     *
+     * A null answer from the endpoint is INFORMATION, never an error: hosts that do
+     * not serve `/sapi` (demo, testnet) simply have the toggle in the Binance UI.
+     *
+     * @return array{text:array,levels:array,show:array,raw:array,payload:array}
+     */
+    private static function bnbBlock(array $cfg, Db $db, int $now, string $tz): array
+    {
+        $mode  = strtolower(trim((string) (isset($cfg['mode']) ? $cfg['mode'] : 'paper')));
+        $keyed = trim((string) (isset($cfg['api_key']) ? $cfg['api_key'] : '')) !== ''
+              && trim((string) (isset($cfg['api_secret']) ? $cfg['api_secret'] : '')) !== '';
+        $c     = self::bnbCache($db);
+        $min   = self::bnbMinBalance($cfg);
+        $paper = $mode === 'paper';
+
+        $on        = $c['checked'] && $c['available'] && $c['spot'];
+        // `bnb_min_balance` is a USDT threshold (§7), so the test only means anything
+        // when the balance could actually be valued in USDT. With no BNBUSDT price the
+        // raw BNB quantity is NOT compared against it - that is a unit mismatch.
+        $priced    = $c['price'] > 0.0;
+        $low       = $on && $priced && $c['value'] < $min;
+        $roundTrip = self::bnbRoundTrip($on);
+
+        if ($paper) {
+            $state = 'not applicable (paper)';
+            $level = 'muted';
+        } elseif (!$c['checked']) {
+            $state = 'not checked yet';
+            $level = 'muted';
+        } elseif (!$c['available']) {
+            $state = 'unavailable on this host';
+            $level = 'info';
+        } elseif ($c['spot']) {
+            $state = $low ? 'ON (BNB balance low)' : 'ON';
+            $level = $low ? 'warn' : 'ok';
+        } else {
+            $state = 'OFF';
+            $level = 'muted';
+        }
+
+        $balance = '–';
+        if ($c['checked'] && $c['available']) {
+            $balance = Util::toDecimalString($c['free'], 8) . ' BNB';
+            if ($c['price'] > 0.0) {
+                $balance .= ' (≈ ' . Util::money($c['value'], 4) . ' USDT at ' . Util::money($c['price'], 2) . ')';
+            } else {
+                $balance .= ' (USDT value unknown: the BNBUSDT price could not be read)';
+            }
+        } elseif ($paper) {
+            $balance = 'paper mode fills use fee_pct, not the account fee';
+        }
+
+        $note = '';
+        if ($paper) {
+            $note = 'Paper mode simulates fills with the configured fee_pct, so the BNB discount changes nothing here. '
+                  . 'It is real in demo, testnet and live.';
+        } elseif (!$keyed) {
+            $note = 'No API key is stored, so the discount cannot be read from the account.';
+        } elseif (!$c['checked']) {
+            $note = 'Press "Check BNB status" to read it from the account (one signed call, weight 1).';
+        } elseif (!$c['available']) {
+            $note = 'This host does not serve /sapi, so the bot cannot read or change the discount: the toggle lives in the '
+                  . 'Binance UI (Profile → Fee settings → "Using BNB to pay for fees"). That is information, not an error.'
+                  . ($c['note'] !== '' ? ' ' . $c['note'] : '');
+        }
+
+        $warning = '';
+        if ($on && !$priced) {
+            $warning = 'BNB burn is ON but the BNBUSDT price could not be read, so the free balance of '
+                     . Util::toDecimalString($c['free'], 8) . ' BNB could not be valued in USDT and was NOT checked '
+                     . 'against bnb_min_balance = ' . Util::money($min, 4) . '. Check the balance by hand, or press '
+                     . '"Check BNB status" again.';
+        }
+        if ($low) {
+            $warning = 'BNB burn is ON but the free BNB balance is worth ' . Util::money($c['value'], 4)
+                     . ' USDT, below bnb_min_balance = ' . Util::money($min, 4) . '. Binance silently reverts to charging the '
+                     . 'fee in the received asset, which changes both the fee and the dust behaviour mid-run. Top the BNB up '
+                     . 'or turn the discount off so the arithmetic stays what the bot measures.';
+        }
+
+        return [
+            'text' => [
+                'bnb_burn'       => $state,
+                'bnb_balance'    => $balance,
+                'bnb_round_trip' => Util::money($roundTrip, 3) . ' % round trip'
+                    . ($on ? ' (0.075 % per side with the discount)' : ' (0.1 % per side)')
+                    . ($paper || !$c['checked'] || !$c['available'] ? ' - assumed, not read from this account' : ''),
+                'bnb_checked'    => $c['at'] !== '' ? self::fmtTime($c['at'], $tz) . ' (' . self::ago($c['at'], $now) . ')' : 'never',
+                'bnb_note'       => $note,
+                'bnb_warning'    => $warning,
+            ],
+            'levels' => [
+                'bnb_burn'    => $level,
+                'bnb_warning' => 'warn',
+            ],
+            'show' => [
+                // the API health rows themselves are always rendered - a mode where the
+                // discount does not apply is information, not a reason to hide it; `bnb`
+                // says whether it applies at all in this mode
+                'bnb'         => !$paper,
+                'bnb_toggle'  => !$paper && $keyed,
+                'bnb_warning' => $warning !== '',
+                'bnb_note'    => $note !== '',
+            ],
+            'raw' => [
+                'bnb_on'    => $on,
+                'bnb_free'  => $c['free'],
+                'bnb_value' => $c['value'],
+                'bnb_round_trip_pct' => $roundTrip,
+            ],
+            'payload' => [
+                'checked'    => $c['checked'],
+                'available'  => $c['available'],
+                'spot'       => $c['spot'],
+                'free'       => $c['free'],
+                'value'      => $c['value'],
+                'price'      => $c['price'],
+                'at'         => $c['at'],
+                'min_balance' => $min,
+                'low'        => $low,
+                'round_trip_pct' => $roundTrip,
+                'next'       => $on ? 0 : 1,
+                'note'       => $note,
+                'warning'    => $warning,
+            ],
+        ];
     }
 
 }

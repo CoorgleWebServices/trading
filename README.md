@@ -441,6 +441,129 @@ would strand that inventory.
 
 ---
 
+## Learning: what the bot records, and what it may change
+
+Learning here is **honest statistics over the bot's own history**, not a model and not alpha. Every
+entry evaluation writes one row to a new `observations` table - the ones it took *and* the ones it
+refused, because the refusals are the control group - recording the conditions at that moment (RSI,
+ATR on 15m and 1h, position in the Bollinger band, volume ratio, the 1h regime, spread, hour, day of
+week, step-value coarseness) and, when the position or cycle closes, the outcome that followed. A
+skipped evaluation resolves immediately to `not_taken`: it carries no PnL and is never counted as a
+win or a loss.
+
+Capture costs **no extra Binance requests**: it reads the candles, book and symbol filters the tick
+already fetched, and writes one small row per evaluated symbol. That is why `learning_enabled` is on
+by default, and a test asserts the same run with capture on and off makes the same calls, the same
+trades and the same equity curve.
+
+**Three rules keep it from being dangerous.**
+
+1. **Learning may never increase risk.** It can adjust the score-component weights (`rsi`, `bb`,
+   `reversal`, `rsi_up`, `vol`) and the effective entry threshold. It cannot touch position size,
+   stop-loss, take-profit, sleeve budgets or any kill switch - not "we don't call that", but
+   structurally: `lib/Learn.php` writes three `state` keys and nothing else, and never loads the
+   config writer at all. The `learn-caps` test snapshots the whole configuration and database,
+   runs a recompute on evidence engineered to demand an enormous change, and asserts that the only
+   thing that moved was one weight. `learn-caps-repeat` then proves repetition cannot launder a
+   bounded step into an unbounded one: thirty recomputes in a row against 98 %-vs-2 % evidence
+   worth thousands of USDT, re-checking the whole config and the whole `state` table after **every
+   single run**, including ten with every component already pinned at its cap and nowhere left to
+   put the next point.
+2. **Evidence before action.** A claim needs `learn_min_samples` (60) **decided** outcomes - wins
+   and losses, never rows - in each of two buckets, *and* non-overlapping 95 % Wilson confidence
+   intervals. A lucky five-trade streak moves nothing; nor do 110 break-even trades, which swell
+   the row count without deciding anything. Each delta is capped at ±10 points and at the
+   component's own base value (a component can be neutralised, never inverted), at most **one**
+   component changes per recompute, and the effective threshold stays inside
+   `[entry_threshold − 10, 100]`.
+3. **Never train on what it then trades.** A recompute reads only trades **closed before** it runs,
+   refuses to re-run inside `learn_recompute_hours`, and stamps what it saw, so the panel can say
+   which trades were evidence and which were the out-of-sample test.
+
+`learning_apply` is **off** by default: the Insights page shows exactly what a recompute *would* do
+and writes nothing. That is how you build trust before letting it act - and at a few trades a day
+the honest answer will be "not enough data yet" for weeks. Recomputes are operator-triggered
+(**Recompute now** on the Insights page); nothing changes a weight behind your back.
+
+**What it cannot conclude.** It cannot tell you that a condition *causes* profit, only that trades
+carrying it have so far done better than trades that did not. It cannot see anything it never
+traded: a skipped evaluation has no outcome, so the control group tells you what the gates refused,
+never what refusing cost you. It cannot separate a real edge from a regime that happened to last
+three weeks - the window is 90 days by default and markets change faster than that. And it cannot
+manufacture significance: the buckets are fixed in advance (so they cannot be drawn around whatever
+looks good), the reported pair is the strongest of a whole scan (so the threshold is widened for
+the number of comparisons that scan could have made), and a claim that only clears a plain 95 %
+because it was the best of thirty-eight is reported as **inconclusive**, not as a finding.
+
+Arithmetic, honestly: at 3 trades a day, `learn_min_samples = 60` decided outcomes **in each of two
+buckets** is 120 trades, of which a bucket typically holds a fraction - so six to ten weeks before
+the first claim is even possible, and longer before it is stable. There is no way to shorten that
+except by trading more, which is the opposite of what the risk layer is for.
+
+| key | default | notes |
+|---|---|---|
+| `learning_enabled` | `true` | capture observations and compute insights (no extra API calls) |
+| `learning_apply` | `false` | actually feed the adjustments back into scoring |
+| `learn_min_samples` | `60` | per bucket, before any claim is called confident |
+| `learn_recompute_hours` | `168` | minimum gap between recomputes |
+| `learn_window_days` | `90` | how far back evidence is drawn |
+| `bnb_min_balance` | `1.0` | warn when BNB fee burn is on but the balance is below this |
+
+Observations are retained for **365 days** (`Db::prune()`), much longer than the 30-day retention of
+signals, equity and logs: a 90-day evidence window is worthless once the rows behind it have been
+deleted. Beyond that the table is pruned like everything else, so it cannot grow without bound.
+
+### Reading the Insights page
+
+`?page=insights`, behind the panel login. Top to bottom:
+
+* **The header sentence.** The one line that matters. It is either "Nothing has been captured yet",
+  "Not enough data yet" with the count still needed, or "N resolved trades are in - enough for a
+  claim to be possible". It never says more than the sample supports.
+* **The counts.** Observations in the window split into entered and skipped; resolved outcomes split
+  into win / loss / flat / not-taken / **still open**; the win-loss total to reason from; and how
+  many more are needed. *Still open* matters: an open trade has no outcome, so it is excluded from
+  every figure - and that exclusion is one-sided, because a winner takes profit and closes while a
+  loser rides. Every number here is a count, never an extrapolation.
+* **Evidence by engine.** Which engines the window's rows came from. The condition cards pool
+  **every** engine into one win rate, while the weight suggestions read **signal-engine rows only** -
+  so a window dominated by grid fills can produce a confident-looking card about conditions the
+  weights will never act on. The row says so in as many words.
+* **Current weights.** Each score component's base points, its learned delta, the resulting points,
+  and the cap that applies (±10, and never past the component's own base). Plus when the last
+  recompute ran, what it changed and on what evidence, whether `learning_apply` is on, and what a
+  recompute *would* do right now.
+* **Skipped vs entered.** The conditions the bot most often refused, so you can see whether the
+  gates are too tight. These averages describe what was refused; they are **not** evidence that
+  entering those setups would have paid.
+* **One card per condition.** Confident cards are open, the rest start collapsed. Each holds a
+  bucket table - bucket, `n`, **Still open**, win rate, its 95 % confidence interval, average PnL,
+  total PnL, and whether the bucket clears `learn_min_samples` - plus the separation figure and a
+  plain-language note. Buckets are fixed in advance and an empty bucket is shown rather than
+  dropped: "no evidence here" is information too.
+* **The state pill** on each card is `CONFIDENT`, `INCONCLUSIVE` or `NO DATA`. `CONFIDENT` means
+  both buckets cleared the sample floor **and** their intervals stayed disjoint after the threshold
+  was widened for every bucket comparison the scan could have reported. If a note says the intervals
+  separate at 95 % on their own but not once widened, that is the page telling you the finding is
+  the best of many draws and could still be luck.
+* **Recompute now** (POST + CSRF) runs `Learn::recompute()` and reports its decision - including
+  "nothing changed, and here is why", which is the usual answer.
+
+The dashboard carries one line of this: the strongest confident insight with its sample size, or
+"not enough data yet".
+
+### BNB fee discount
+
+The API health card shows whether **BNB fee burn** is on, the account's free BNB and the effective
+round-trip cost (0.15 % with the discount, 0.2 % without), with a POST + CSRF toggle. If your host
+does not serve `/sapi`, the panel says so and points you at the Binance UI - that is a limitation,
+not an error. When burn is on and the BNB balance falls below `bnb_min_balance`, Binance silently
+goes back to charging the received asset, which changes both the fee and the dust behaviour
+mid-run; the panel warns about exactly that. `fee_pct` remains informational only - the live taker
+rate comes from the account.
+
+---
+
 ## Recommended rollout
 
 0. **Pick the engine first.** The steps below describe the signal engine. `grid` and `pmm` are
@@ -622,8 +745,17 @@ always sell it by hand on Binance; the next reconciliation will notice.
   overlaid equity sparklines and a Pause/Resume button per sleeve) and a **Scanner** card (rank,
   price, 24 h change, ATR %, spread, 24 h quote volume, step value, required size, score, the gates
   that rejected a row, and an **Assign to...** control per row).
+* **Insights** (`?page=insights`): what the observations say. A header with the totals and, while
+  the evidence is thin, a plain sentence saying no conclusion is available yet and roughly how many
+  more resolved trades are needed; one card per condition with its bucket table (range, n, win rate
+  *with* its confidence interval, average PnL) and a plain-language note; a **current weights** card
+  (the learned deltas, their caps, when a recompute last ran, what it changed and on what evidence,
+  and whether `learning_apply` is on); a **skipped vs entered** card showing what the gates refused
+  most often; and the **Recompute now** action. The dashboard carries one line of it: the strongest
+  confident insight with its sample size, or "not enough data yet".
 * **Actions**: Start, Pause, Reset halt, Panic sell (sells at market and disables trading; needs a
-  confirmation tick box), Run tick now, Reset paper account, Logout.
+  confirmation tick box), Run tick now, Reset paper account, Logout, and - on the API health card -
+  the BNB fee-burn toggle and its read-only refresh.
 * **Settings**: every parameter with validation (the take-profit must be at least three times the
   round-trip fee, the stop between 0.2 % and 5 %, symbols must end with the quote asset, ...), the
   cron command, the cron key, and "Test API connection". The **Portfolio** section holds
@@ -762,6 +894,59 @@ which aborts the tick still hands the rotating cursor on so the sleeves behind i
 (`grid_paused_reason`) and never writes the global `paused_until` / `pause_reason` the other
 sleeves read - while single-engine mode still writes both, unchanged.
 
+Learning adds ten more: `learn-wilson` (the interval matches known values; k=0 and k=n do not
+divide by zero), `learn-buckets` (edges are inclusive-low / exclusive-high, empty buckets are
+reported rather than dropped), `learn-capture` (an entry and a skip each write exactly one
+observation, a close resolves it with the right outcome and PnL, a skip resolves to `not_taken`,
+and no observation is ever written or resolved twice), `learn-evidence` (below `learn_min_samples`
+nothing is confident and no adjustment is produced; a lucky five-trade streak produces none; a
+strong, well-sampled separation produces exactly one bounded adjustment), `learn-walkforward` (a
+recompute sees only trades closed before it and refuses to re-fire inside `learn_recompute_hours`),
+`learn-apply-off` (with `learning_apply` false the scorer returns byte-identical results, so every
+existing strategy test stays valid), `learn-neutral` (the same four-tick run with capture on and
+off makes the same market-data calls and produces the same trades, signals, equity and state - the
+proof that `learning_enabled = true` is a safe default) and, above all, `learn-caps`: the safety
+test that snapshots the entire configuration and every table, runs a recompute on evidence
+engineered to demand an enormous change, and asserts that position size, take-profit, stop-loss,
+every sleeve budget and every kill-switch key came back byte-identical, that the only state keys
+written were the learning ones, and that the deltas obey ±10, one component per run and the
+threshold range.
+
+Two more groups close the gaps that mattered most. `learn-caps-repeat` is the safety proof run
+thirty times: it snapshots the whole config and the whole `state` table, then recomputes ten times
+against 98 %-vs-2 % evidence worth thousands of USDT, ten more with every component already pinned
+at its cap, and ten more back-to-back at the same instant - re-checking after **every single run**
+that the only state keys that moved were `learn_weights`, `learn_at` and the learn log, that no
+weight ever escaped ±10 or its own base value, that no table other than `state` was written, and
+that every kill-switch key came back byte-identical. Repetition cannot walk a weight past its cap.
+`learn-capture-engine` freezes the engine capture rule: three grid ticks that place rungs and fill
+none write **no** observation at all (counting placements instead of fills would file roughly 300
+unresolvable rows for every one a cycle could close), the tick where a rung actually fills writes
+exactly one `entered` row, the cycle that closes it resolves that same row with
+`exit_reason = 'cycle_closed'` and a hold measured from the **lot's** buy rather than from when the
+observation was written, and a pmm run whose `pmm_refresh_sec` is shorter than the tick gap
+cancels and re-posts its quotes all day without writing a single entry observation.
+
+`learn-evidence` also pins the three ways a sample can look bigger than it is: 55 flat outcomes
+plus 6 decided ones per side is 61 rows a bucket - past the floor if rows were what counted - and
+produces no adjustment; a marginal separation that clears a plain 95 % on its own is reported as
+inconclusive once the threshold is widened for the 38 bucket comparisons the scan could have made,
+while the planted 80/20 relationship survives the same widening; and a bucket with unresolved
+entries reports them in its **Still open** column and says in its note which way that censoring
+cuts.
+
+Three panel and storage groups sit alongside them. `panel-insights` pins what the Insights page
+says: the engine-mix row states the split and what it means, and the dashboard headline carries the
+multiple-comparison correction itself rather than quietly restating a scan result as a bare 95 %
+finding. `panel-bnb` pins the unit rule behind the fee-discount row - 0.5 BNB is worth about 300
+USDT, so comparing that bare quantity against a 1.0 **USDT** threshold would invent a low-balance
+warning that does not exist; the panel warns only on a balance it could actually value, says
+plainly when it could not, and the `toggle_bnb_burn` action is held to the same rule by inspecting
+its source with the comments stripped. `db-prune` pins retention: signals, equity and logs at 30
+days, observations at 365 (and never shorter than the tail horizon), spent engine orders deleted
+while anything still resting, anything that filled and anything a lot still points at survives -
+plus the presence of every index the hot per-tick predicates rely on.
+
 ---
 
 ## Files and data
@@ -772,9 +957,11 @@ trader/
   lib/           the code     assets/    css + js    tests/      offline tests
   docs/DESIGN.md the design contract every file follows;  docs/DESIGN-ENGINES.md the same for grid + pmm
   docs/DESIGN-PORTFOLIO.md  the contract for portfolio mode (sleeves) and the volatility scanner
+  docs/DESIGN-LEARNING.md   the contract for observation capture, evidence and bounded feedback
   data/          runtime (auto-created): config.json (secrets, 0600), trader.sqlite (positions,
-                 orders, trades, signals, equity, logs - 30 days retention), bot.log (rotates at
-                 2 MB), tick.lock
+                 orders, trades, signals, equity, logs - 30 days retention; observations are kept
+                 for a year, since a 90-day evidence window is worthless once deleted), bot.log
+                 (rotates at 2 MB), tick.lock
 ```
 
 Back up `data/` if you care about the history. To start over, stop the cron, delete `data/` and open

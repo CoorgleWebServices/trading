@@ -589,6 +589,13 @@ final class Risk
             'scanner_min_atr_pct'         => ['f', 0.0, 50.0],
             'scanner_max_atr_pct'         => ['f', 0.01, 100.0],
             'scanner_top_n'               => ['i', 1, 100],
+            // learning (DESIGN-LEARNING.md §5) + the §7 BNB warning threshold. These bound how
+            // much evidence learning demands and how often it may look at it; none of them is
+            // reachable by lib/Learn.php, which writes state only and never the config.
+            'learn_min_samples'           => ['i', 1, 100000],
+            'learn_recompute_hours'       => ['i', 1, 8760],
+            'learn_window_days'           => ['i', 1, 3650],
+            'bnb_min_balance'             => ['f', 0.0, 100000.0],
         ];
         foreach ($numeric as $key => $spec) {
             if (!array_key_exists($key, $in)) {
@@ -627,7 +634,7 @@ final class Risk
         }
 
         foreach (['enabled', 'adaptive', 'force_https', 'allow_live_engines', 'grid_exit_liquidates', 'post_only',
-                  'portfolio_enabled', 'scanner_enabled'] as $key) {
+                  'portfolio_enabled', 'scanner_enabled', 'learning_enabled', 'learning_apply'] as $key) {
             if (array_key_exists($key, $in)) {
                 $cfg[$key] = self::toBool($in[$key]);
             }
