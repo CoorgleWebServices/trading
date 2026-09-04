@@ -653,7 +653,7 @@ function panel_layout(string $title, string $body, array $opts = []): string
     $h .= '<meta name="viewport" content="width=device-width, initial-scale=1">';
     $h .= '<meta name="referrer" content="no-referrer">';
     $h .= '<title>' . $e($title) . ' - Micro-Trader</title>';
-    $h .= '<link rel="stylesheet" href="assets/panel.css?v=1">';
+    $h .= '<link rel="stylesheet" href="assets/panel.css?v=' . panel_asset_version('assets/panel.css') . '">';
     $h .= '</head><body' . ($auto ? ' data-autorefresh="20"' : '') . '>';
     $h .= '<header class="topbar"><div class="topbar-inner">';
     $h .= '<div class="brand"><span class="logo" aria-hidden="true">◈</span> Micro-Trader';
@@ -681,8 +681,25 @@ function panel_layout(string $title, string $body, array $opts = []): string
     if ($auto) {
         $h .= '<span class="refresh-info" data-refresh-info>auto-refresh every 20 s</span>';
     }
-    $h .= '</footer><script src="assets/panel.js?v=1" defer></script></body></html>';
+    $h .= '</footer><script src="assets/panel.js?v=' . panel_asset_version('assets/panel.js') . '" defer></script></body></html>';
     return $h;
+}
+
+/**
+ * Cache-busting token for a static asset: the file's modification time, so a deploy
+ * (git pull, FTP upload) always invalidates the browser's copy. Falls back to the
+ * release marker when the file cannot be stat'ed.
+ */
+function panel_asset_version(string $relPath): string
+{
+    static $cache = [];
+    if (isset($cache[$relPath])) {
+        return $cache[$relPath];
+    }
+    $full = TRADER_ROOT . '/' . ltrim($relPath, '/');
+    $mtime = @filemtime($full);
+    $cache[$relPath] = ($mtime !== false && $mtime > 0) ? (string) $mtime : '2';
+    return $cache[$relPath];
 }
 
 /* ====================================================================== */
