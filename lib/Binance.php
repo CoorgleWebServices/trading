@@ -627,6 +627,69 @@ final class Binance
     }
 
     /** MARKET BUY by quote amount; returns the raw FULL response. */
+    /**
+     * Whether the account pays SPOT trading fees in BNB, which is a 25 % discount
+     * (0.075 % instead of 0.1 % per side). Wallet endpoint, weight 1.
+     *
+     * This lives under /sapi, which not every environment serves — the Spot Demo and
+     * testnet hosts may not — so an unavailable endpoint returns null instead of
+     * throwing, and the caller tells the operator to use the Binance UI instead.
+     *
+     * @return array|null ['spot'=>bool, 'interest'=>bool], or null when unsupported
+     */
+    public function bnbBurnStatus(): ?array
+    {
+        try {
+            $r = $this->request('GET', '/sapi/v1/bnbBurn', [], true, false, false);
+        } catch (BinanceException $e) {
+            Log::debug('bnbBurn status unavailable', ['code' => $e->binanceCode, 'http' => $e->httpStatus]);
+            return null;
+        }
+        if (!is_array($r)) {
+            return null;
+        }
+        return [
+            'spot'     => self::truthy($r['spotBNBBurn'] ?? null),
+            'interest' => self::truthy($r['interestBNBBurn'] ?? null),
+        ];
+    }
+
+    /**
+     * Turn the BNB fee discount on or off for SPOT trading. Weight 1.
+     * Returns null when the endpoint is not served by this host (demo/testnet);
+     * any other failure throws so the panel can report why it did not take effect.
+     *
+     * @return array|null ['spot'=>bool, 'interest'=>bool]
+     */
+    public function setBnbBurn(bool $spotBurn): ?array
+    {
+        try {
+            $r = $this->request('POST', '/sapi/v1/bnbBurn', ['spotBNBBurn' => $spotBurn ? 'true' : 'false'], true, false, false);
+        } catch (BinanceException $e) {
+            if ($e->httpStatus === 404 || $e->httpStatus === 405) {
+                Log::debug('bnbBurn toggle unavailable on this host', ['http' => $e->httpStatus]);
+                return null;
+            }
+            throw $e;
+        }
+        if (!is_array($r)) {
+            return null;
+        }
+        return [
+            'spot'     => self::truthy($r['spotBNBBurn'] ?? null),
+            'interest' => self::truthy($r['interestBNBBurn'] ?? null),
+        ];
+    }
+
+    /** Binance returns these flags as real booleans or as the strings "true"/"false". */
+    private static function truthy($v): bool
+    {
+        if (is_bool($v)) {
+            return $v;
+        }
+        return strtolower(trim((string) $v)) === 'true';
+    }
+
     public function marketBuyQuote(string $symbol, string $quoteStr, string $clientId): array
     {
         return $this->request('POST', '/api/v3/order', [
