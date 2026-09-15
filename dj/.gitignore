@@ -1,0 +1,20 @@
+# The desk's runtime directory. The repository root .gitignore anchors its own
+# "data/*" rule to the root, so it does NOT cover dj/data/ — without this file
+# dj/data/config.json (which carries the bcrypt password hash) would be
+# committable. Keep the directory's .htaccess tracked, nothing else.
+data/*
+!data/.htaccess
+
+# databases, journals and logs anywhere under dj/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.db
+*.log
+*.log.[0-9]
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp

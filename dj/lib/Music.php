@@ -1,5 +1,4 @@
 <?php
-
 declare(strict_types=1);
 
 require_once __DIR__ . '/Data.php';
@@ -143,7 +142,7 @@ final class Music
         $tBpm = self::bpm($track);
         $lo = $tBpm * (1 - self::BPM_TOLERANCE);
         $hi = $tBpm * (1 + self::BPM_TOLERANCE);
-        $tKey = self::normalizeKey($track['key']);
+        $tKey = self::normalizeKey(isset($track['key']) ? $track['key'] : '');
         $tEnergy = self::energy($track);
         $tId = isset($track['id']) ? (string)$track['id'] : null;
 

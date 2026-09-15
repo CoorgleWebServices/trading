@@ -137,6 +137,11 @@ frame-ancestors 'none'; form-action 'self'`. No inline `<script>`, no `onclick`,
 `style` attributes. `data/` denied by `.htaccess`. Errors logged, never displayed.
 
 First visit with no password set shows a setup screen; once set, the setup route is unreachable.
+That screen is the one route `forceHttps()` lets through over plain HTTP, so it warns when the
+request is not encrypted and leaves the http→https checkbox unticked on such a request — ticking
+it there would close setup behind an operator and redirect them to a TLS endpoint their host may
+not have. `Auth::isHttps()` honours `X-Forwarded-Proto`, so a proxy-terminated host still counts
+as encrypted.
 
 ## 9. Look
 

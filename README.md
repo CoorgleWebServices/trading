@@ -949,6 +949,30 @@ plus the presence of every index the hot per-tick predicates rely on.
 
 ---
 
+## The DJ desk (`dj/`) - a separate application
+
+`dj/` is **not part of the trading panel**. It is a second, independent app that happens to live in
+the same repository and can be uploaded to the same hosting: the 9Bar DJ desk - a crate, a prep
+bench, a set builder, a practice log, gigs and a skill ladder.
+
+The two share a domain and nothing else:
+
+* **Its own README.** Everything about it - what it does, how to install it, how to get your data
+  back out - is in [`dj/README.md`](dj/README.md). Its design contract is
+  [`docs/DESIGN-DJ.md`](docs/DESIGN-DJ.md).
+* **Its own login.** A separate password, hashed into `dj/data/config.json`. Logging in to the
+  trading panel does not log you in to the desk, and neither session can reach the other.
+* **Its own database.** `dj/data/dj.sqlite`. It never reads `data/trader.sqlite`, and the panel
+  never reads the desk's.
+* **Its own code.** No file under `dj/` may require, include or read `lib/`, `config.php` or
+  `index.php` from the panel - the desk's test suite asserts it. Deleting either directory leaves
+  the other one working.
+* **Its own tests.** `php dj/tests/run.php`, offline, run separately from the panel's own suite.
+
+It needs no `curl`, no cron job and no API key; `pdo_sqlite` and `json` are enough.
+
+---
+
 ## Files and data
 
 ```
@@ -962,6 +986,8 @@ trader/
                  orders, trades, signals, equity, logs - 30 days retention; observations are kept
                  for a year, since a 90-day evidence window is worthless once deleted), bot.log
                  (rotates at 2 MB), tick.lock
+  dj/            a SEPARATE application (the 9Bar DJ desk) with its own README, login, database
+                 and tests - see the section above; nothing in it belongs to the bot
 ```
 
 Back up `data/` if you care about the history. To start over, stop the cron, delete `data/` and open
