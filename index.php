@@ -164,6 +164,10 @@ if ($page === 'settings') {
     echo panel_layout('Insights', page_insights($cfg, Panel::insights($cfg, $db)), ['page' => 'insights']);
 } elseif ($page === 'cron') {
     echo panel_layout('Cron', page_cron($cfg), ['page' => 'cron']);
+} elseif ($page === 'diagnostics') {
+    // Which files and features are actually on this server. Read-only, and it
+    // reports presence only - never a key, a password, a balance or data/ contents.
+    echo panel_layout('Diagnostics', page_diagnostics($cfg), ['page' => 'diagnostics']);
 } else {
     $status = Panel::status($cfg, $db);
     echo panel_layout('Dashboard', page_dashboard($cfg, $status), ['page' => 'dashboard', 'status' => $status, 'autorefresh' => true]);
@@ -1616,6 +1620,7 @@ function panel_layout(string $title, string $body, array $opts = []): string
         $h .= '<a href="?page=insights"' . ($current === 'insights' ? ' class="active"' : '') . '>Insights</a>';
         $h .= '<a href="?page=settings"' . ($current === 'settings' ? ' class="active"' : '') . '>Settings</a>';
         $h .= '<a href="?page=cron"' . ($current === 'cron' ? ' class="active"' : '') . '>Cron</a>';
+        $h .= '<a href="?page=diagnostics"' . ($current === 'diagnostics' ? ' class="active"' : '') . '>Diagnostics</a>';
         $h .= '<form method="post" action="index.php" class="inline">' . Panel::csrfField()
             . '<input type="hidden" name="action" value="logout"><button type="submit" class="linkbtn">Logout</button></form>';
         $h .= '</nav>';
@@ -1723,6 +1728,85 @@ function page_warnings(array $warnings): string
         $h .= '<li>' . Panel::e((string) $w) . '</li>';
     }
     return $h . '</ul></div>';
+}
+
+/**
+ * Deploy diagnostics (DESIGN.md §12). Answers "is this feature actually on the
+ * server?", which is the question a half-finished upload creates: the panel may
+ * show a control whose library file never arrived, and the control then does
+ * nothing. A feature counts as present only when every file it needs exists AND
+ * the marker is in the file, so a stale upload cannot report a working feature.
+ *
+ * Deliberately reports presence and absence only. No keys, no password, no
+ * balances, nothing out of data/.
+ */
+function page_diagnostics(array $cfg): string
+{
+    $e = 'Panel::e';
+    $root = TRADER_ROOT;
+    $marker = function (string $file, string $needle) use ($root): bool {
+        $p = $root . '/' . $file;
+        return is_file($p) && strpos((string) @file_get_contents($p), $needle) !== false;
+    };
+    $yn = function (bool $ok): string {
+        return $ok ? '<span class="ok-tag">yes</span>' : '<span class="bad-tag">no</span>';
+    };
+
+    $core = ['index.php','cron.php','config.php','bootstrap.php','lib/Util.php','lib/Db.php','lib/Log.php',
+             'lib/Binance.php','lib/Indicators.php','lib/Strategy.php','lib/Risk.php','lib/Exchange.php',
+             'lib/Bot.php','lib/Panel.php','assets/panel.css','assets/panel.js'];
+    $extra = ['lib/EngineOrders.php' => 'grid + market making',
+              'lib/EngineGrid.php'   => 'grid',
+              'lib/EnginePmm.php'    => 'market making',
+              'lib/Sleeve.php'       => 'portfolio sleeves',
+              'lib/Scanner.php'      => 'volatility scanner',
+              'lib/Learn.php'        => 'learning / insights'];
+
+    $feats = [
+        'Demo mode'            => [['lib/Binance.php'], 'lib/Binance.php', 'demo-api.binance.com'],
+        'Grid engine'          => [['lib/EngineGrid.php','lib/EngineOrders.php','lib/Bot.php'], 'lib/Bot.php', 'EngineGrid'],
+        'Market making (pmm)'  => [['lib/EnginePmm.php','lib/EngineOrders.php','lib/Bot.php'], 'lib/Bot.php', 'EnginePmm'],
+        'Portfolio sleeves'    => [['lib/Sleeve.php','index.php'], 'index.php', 'portfolio_enabled'],
+        'Volatility scanner'   => [['lib/Scanner.php','lib/Bot.php'], 'lib/Bot.php', 'Scanner'],
+        'Learning / Insights'  => [['lib/Learn.php','index.php'], 'index.php', 'insights'],
+        'BNB fee discount'     => [['lib/Binance.php'], 'lib/Binance.php', 'bnbBurn'],
+    ];
+
+    $missing = [];
+    foreach ($core as $f) { if (!is_file($root . '/' . $f)) { $missing[] = $f; } }
+    foreach (array_keys($extra) as $f) { if (!is_file($root . '/' . $f)) { $missing[] = $f; } }
+
+    $h = '<section class="card"><h2>Deploy check</h2>';
+    $h .= $missing
+        ? '<p class="flash flash-danger">' . count($missing) . ' file(s) are not on this server. Upload the full folder again, overwriting, and the features below will appear. Missing: <code>' . $e(implode(', ', $missing)) . '</code></p>'
+        : '<p class="flash flash-ok">Every file is present. If a control still does not appear, hard refresh the page (Ctrl+Shift+R, or Cmd+Shift+R on a Mac) so the browser reloads the stylesheet and script.</p>';
+
+    $h .= '<h3>Features</h3><div class="table-wrap"><table><thead><tr><th>Feature</th><th>Available</th><th>Why not</th></tr></thead><tbody>';
+    foreach ($feats as $label => $spec) {
+        $lack = [];
+        foreach ($spec[0] as $nf) { if (!is_file($root . '/' . $nf)) { $lack[] = $nf; } }
+        $ok  = !$lack && $marker($spec[1], $spec[2]);
+        $why = $lack ? 'missing ' . implode(', ', $lack) : ($ok ? '' : 'file is present but out of date - upload it again');
+        $h .= '<tr><td>' . $e($label) . '</td><td>' . $yn($ok) . '</td><td class="muted">' . $e($why) . '</td></tr>';
+    }
+    $h .= '</tbody></table></div>';
+
+    $h .= '<h3>Optional files</h3><div class="table-wrap"><table><thead><tr><th>File</th><th>Present</th><th>Needed for</th></tr></thead><tbody>';
+    foreach ($extra as $f => $what) {
+        $h .= '<tr><td><code>' . $e($f) . '</code></td><td>' . $yn(is_file($root . '/' . $f)) . '</td><td class="muted">' . $e($what) . '</td></tr>';
+    }
+    $h .= '</tbody></table></div>';
+
+    $h .= '<h3>Runtime</h3><div class="table-wrap"><table><tbody>';
+    foreach (['curl','pdo_sqlite','json','openssl'] as $x) {
+        $h .= '<tr><td>PHP extension <code>' . $e($x) . '</code></td><td>' . $yn(extension_loaded($x)) . '</td></tr>';
+    }
+    $h .= '<tr><td>PHP version</td><td><code>' . $e(PHP_VERSION) . '</code></td></tr>';
+    $h .= '<tr><td><code>data/</code> writable</td><td>' . $yn(is_writable($root . '/data')) . '</td></tr>';
+    $h .= '<tr><td>Folder</td><td><code>' . $e($root) . '</code></td></tr>';
+    $h .= '</tbody></table></div>';
+    $h .= '<p class="muted">This page reads file names only. It never shows your API key, panel password, balances or anything stored in <code>data/</code>.</p>';
+    return $h . '</section>';
 }
 
 function page_cron(array $cfg): string

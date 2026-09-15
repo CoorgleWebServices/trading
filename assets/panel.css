@@ -354,3 +354,12 @@ form.inline.assign .assign-select {
 .insight-note { padding-bottom: 12px; }
 .bnb-warning { margin: 10px 0 6px; }
 .bnb-actions { margin-top: 8px; gap: 6px 8px; }
+
+/* Diagnostics: yes/no markers. Colour is not the only signal — the word carries
+   the meaning on its own, so this stays readable without colour perception. */
+.ok-tag, .bad-tag {
+  display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase; padding: 1px 7px; border-radius: 4px; border: 1px solid;
+}
+.ok-tag  { color: var(--ok, #2c7a57);  border-color: var(--ok, #2c7a57);  background: rgba(44,122,87,.10); }
+.bad-tag { color: var(--bad, #b03434); border-color: var(--bad, #b03434); background: rgba(176,52,52,.10); }
