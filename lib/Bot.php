@@ -280,7 +280,10 @@ final class Bot
         }
         if ($status !== 'skipped') {
             try {
-                $this->db->prune();
+                // retention is measured from THIS tick's clock, not the wall clock: the rows
+                // the tick just wrote (equity, sleeve_equity, signals) carry $this->nowIso(),
+                // so a wall-clock cutoff would delete them whenever the two clocks differ.
+                $this->db->prune(30, 365, $this->nowSec());
             } catch (Throwable $e) {
                 // retention is best effort
             }
@@ -326,7 +329,7 @@ final class Bot
     {
         $pos = $this->db->openPosition();
         if ($pos === null) {
-            $pos = $this->positionWhere("status = 'STUCK'", []);
+            $pos = $this->positionWhere(self::STUCK_WHERE, []);
         }
         if ($pos === null) {
             return null;
@@ -481,7 +484,13 @@ final class Bot
         $this->readUsedWeight();
 
         $open  = $this->db->openPosition();
-        $stuck = $open === null ? $this->positionWhere("status = 'STUCK'", []) : null;
+        // Scalp rows are excluded here for the same reason Db::openPosition() excludes them: the
+        // halt branch below routes $stuck through retryStuck() -> sellPosition() -> closeFromFill(),
+        // which writes pnl_usdt but neither gross_usdt nor fees_usdt and never reaches
+        // Scalper::recordOutcome() - so a scalp loss would miss both §2's gross/fees/net verdict
+        // and §5's consecutive-loss breaker. Open scalp rows go to runScalpLoop() instead, which
+        // is what the comment on the halt branch below already says should happen.
+        $stuck = $open === null ? $this->positionWhere(self::STUCK_WHERE, []) : null;
         if ($open !== null && $bal['equity'] <= 0.0) {
             // an empty balance snapshot with a tracked position is not a kill-switch case, it is bad data
             Log::error('tick: equity is zero while a position is open; skipping survival check', ['symbol' => $open['symbol']]);
@@ -542,7 +551,10 @@ final class Bot
                 // the loop keeps the per-position gross_usdt / fees_usdt bookkeeping §2's
                 // verdict depends on, which a bare sell through closeFromFill() would not.
                 $this->notes[] = count($scalpOpen) . ' open scalp position(s) still managed under the halt';
-                $this->runScalpLoop();
+                // exits only, explicitly: Scalper::entryBlock() reads the same kill switch and
+                // already reports `halted`, so this is belt and braces - but a branch whose only
+                // job is to carry positions out should not depend on a second class agreeing.
+                $this->runScalpLoop(true);
             }
             if (!$already) {
                 $this->notes[] = 'KILL SWITCH ' . $reason;
@@ -553,6 +565,26 @@ final class Bot
         }
         if ($action === 'no_entry' && $svReason !== '') {
             $this->notes[] = 'survival: ' . $svReason;
+        }
+
+        // DESIGN-SCALP.md §4: "an open position is ALWAYS managed even when entries are paused".
+        // The portfolio branch below, and the grid/pmm/signal branches after it, all return
+        // before the scalp branch, so without this a position left open by turning
+        // `portfolio_enabled` on - or by switching `engine` away from scalp - would sit with no
+        // take-profit, no stop and no max-hold until the user noticed. Exits only: the sleeves
+        // (or the selected engine) own the free quote here, so no new scalp entry may be opened
+        // against it. The halt branch above already ran the loop and returned, so this cannot
+        // run twice in one tick.
+        if ($this->portfolio || $this->engine !== 'scalp') {
+            $scalpStranded = $this->scalpOpenRows();
+            if ($scalpStranded !== [] && ($this->engine !== 'scalp' || $this->scalpExitsOnlyAvailable())) {
+                $this->notes[] = count($scalpStranded) . ' open scalp position(s) managed (exits only)';
+                // the loop reports the SCALP engine's no-trade reason, which is not the engine
+                // that owns this tick: keep whatever the owning path has set or will set
+                $keepReason = $this->noTradeReason;
+                $this->runScalpLoop(true);
+                $this->noTradeReason = $keepReason;
+            }
         }
 
         // ---- 5-7. portfolio mode runs every sleeve instead (DESIGN-PORTFOLIO.md §6)
@@ -584,7 +616,7 @@ final class Bot
 
         // ---- 6. entries
         $open  = $this->db->openPosition();
-        $stuck = $open === null ? $this->positionWhere("status = 'STUCK'", []) : null;
+        $stuck = $open === null ? $this->positionWhere(self::STUCK_WHERE, []) : null;
         if ($open !== null || $stuck !== null) {
             if ($this->noTradeReason === '') {
                 $this->noTradeReason = $open !== null ? 'position_open' : 'position_stuck';
@@ -812,9 +844,14 @@ final class Bot
                 break;
             }
         }
+        // Same `<> 'scalp'` filter as Db::openPosition(), and it matters most here: this runs on
+        // EVERY tick, and the `reconciled_missing` close below books pnl_usdt = 0 with no
+        // gross_usdt / fees_usdt. On a scalp row that is exactly backwards -
+        // Scalper::markStuck('scalp_unsellable') parks a row BECAUSE the coins are gone - so real
+        // money spent would be recorded as a break-even trade and §2's verdict would be a lie.
         $open = $this->db->openPosition();
         if ($open === null) {
-            $open = $this->positionWhere("status = 'STUCK'", []);
+            $open = $this->positionWhere(self::STUCK_WHERE, []);
         }
         if ($open === null) {
             return;
@@ -1572,7 +1609,7 @@ final class Bot
         $signalRuns = in_array('signal', $order, true) && Sleeve::symbols($this->cfg, 'signal') !== [];
         if (!$signalRuns) {
             $openPos = $this->db->openPosition();
-            $stuckPos = $openPos === null ? $this->positionWhere("status = 'STUCK'", []) : null;
+            $stuckPos = $openPos === null ? $this->positionWhere(self::STUCK_WHERE, []) : null;
             if ($openPos !== null) {
                 $this->managePosition($openPos, $acct);
             } elseif ($stuckPos !== null) {
@@ -1781,7 +1818,7 @@ final class Bot
     {
         // ---- 5. position management. Exits are ALWAYS managed, drawdown pause or not.
         $open  = $this->db->openPosition();
-        $stuck = $open === null ? $this->positionWhere("status = 'STUCK'", []) : null;
+        $stuck = $open === null ? $this->positionWhere(self::STUCK_WHERE, []) : null;
         if ($open !== null) {
             $this->managePosition($open, $acct);
         } elseif ($stuck !== null) {
@@ -1790,7 +1827,7 @@ final class Bot
 
         // ---- 6. entries
         $open  = $this->db->openPosition();
-        $stuck = $open === null ? $this->positionWhere("status = 'STUCK'", []) : null;
+        $stuck = $open === null ? $this->positionWhere(self::STUCK_WHERE, []) : null;
         if ($open !== null || $stuck !== null) {
             if ($this->noTradeReason === '') {
                 $this->noTradeReason = $open !== null ? 'position_open' : 'position_stuck';
@@ -2018,7 +2055,7 @@ final class Bot
      * budget is already spent, so a slow tick still manages its open positions rather than
      * leaving them unattended for a minute.
      */
-    private function runScalpLoop(): void
+    private function runScalpLoop(bool $exitsOnly = false): void
     {
         if (!class_exists('Scalper')) {
             return;
@@ -2040,8 +2077,8 @@ final class Bot
             $scalper = new Scalper($this->cfg, $this->db, $this->ex, $this->info);
             // non-essential: a market-data failure inside the loop goes through the api-error
             // ladder (and so can pause the bot) but must not turn the whole tick into an error
-            $r = $this->step('scalp_loop', function () use ($scalper, $deadlineMs) {
-                return $scalper->run($deadlineMs);
+            $r = $this->step('scalp_loop', function () use ($scalper, $deadlineMs, $exitsOnly) {
+                return $scalper->run($deadlineMs, $exitsOnly);
             }, false);
         } catch (BotAbort $e) {
             throw $e;
@@ -2132,6 +2169,25 @@ final class Bot
             throw $e;
         } catch (Throwable $e) {
             Log::warn('movers: refresh failed - ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Whether lib/Scalper.php's run() takes the exits-only flag (DESIGN-SCALP.md §4). Without it
+     * the loop is free to OPEN a position, which must never happen on a tick the portfolio
+     * sleeves own: they budget the free quote. Under any engine other than scalp
+     * Scalper::entryBlock() already refuses on its own with `engine_not_scalp`, so the flag is
+     * not needed there and this is not consulted.
+     */
+    private function scalpExitsOnlyAvailable(): bool
+    {
+        if (!class_exists('Scalper')) {
+            return false;
+        }
+        try {
+            return (new ReflectionMethod('Scalper', 'run'))->getNumberOfParameters() >= 2;
+        } catch (Throwable $e) {
+            return false;
         }
     }
 
@@ -3472,6 +3528,23 @@ final class Bot
         $v = $st->fetchColumn();
         return $v === false || $v === null ? 0.0 : max(0.0, (float) $v);
     }
+
+    /**
+     * The one definition of "a STUCK position THIS bot owns".
+     *
+     * Scalp runs many positions at once and marks its own rows STUCK (Scalper::markStuck()),
+     * which it then manages itself on every poll - so retryStuck() and the survival layer must
+     * never pick one up, or the two would both try to sell the same inventory. The clause lived
+     * inline at seven call sites; it is here so a future engine marker cannot be added to some
+     * of them and forgotten at the rest. COALESCE because `engine` is an added column and rows
+     * written before it existed read NULL on some databases.
+     *
+     * Deliberately carries NO `mode` clause, exactly like the seven inline copies it replaces:
+     * positionWhere() has never filtered on mode and changing that here would be a behaviour
+     * change dressed up as a refactor. (Db::openPosition() is the same; Db::positionWhere()'s
+     * SQL is pre-existing and out of scope.)
+     */
+    const STUCK_WHERE = "status = 'STUCK' AND COALESCE(engine, 'signal') <> 'scalp'";
 
     /** Latest position row matching $where (typed like Db::openPosition()). */
     private function positionWhere(string $where, array $params): ?array

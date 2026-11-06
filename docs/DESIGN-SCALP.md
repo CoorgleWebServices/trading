@@ -67,7 +67,7 @@ reached on a host whose cron fires once a minute.
   ask for every symbol at once. Verify its current weight from the docs before shipping and record
   it in a comment; budget conservatively at 4. At 20 polls per minute that is ≤ 80 weight/min
   against a 6000/min limit, so the universe can grow without re-architecting.
-* Per symbol the loop keeps a short in-memory ring buffer (`scalp_window` ticks, default 20) of
+* Per symbol the loop keeps a short in-memory ring buffer (`scalp_window` ticks, default 8) of
   mid prices. Nothing is persisted per tick — only entries, exits and the run summary are.
 
 ### Entry
@@ -105,7 +105,7 @@ The user's explicit request, and the thing that makes running this safe to walk 
 | key | default | notes |
 |---|---|---|
 | `scalp_universe_size` | `20` | symbols traded at once; 1–30 |
-| `scalp_order_usdt` | `6.0` | per position; must clear `Risk::requiredSize()` |
+| `scalp_order_usdt` | `50.0` | per position; must clear `Risk::requiredSize()` AND be large enough that the §3 dust rule (step value <= 0.3 % of one order) does not gate the whole market. One stepSize costs ~0.13 USDT on SOL, ~0.24 on ETH, ~0.68 on BTC, so a 6 USDT order leaves only the cheapest coins eligible. |
 | `scalp_budget_per_symbol` | `100.0` | default cap per symbol (§7) |
 | `scalp_budgets` | `{}` | per-symbol overrides, e.g. `{"BTCUSDT":200,"DOGEUSDT":50}` |
 | `scalp_max_open` | `6` | concurrent positions, one per symbol |
@@ -113,7 +113,7 @@ The user's explicit request, and the thing that makes running this safe to walk 
 | `scalp_sl_pct` | `0.20` | stop |
 | `scalp_max_hold_sec` | `120` | time exit |
 | `scalp_dip_pct` | `0.15` | pullback needed before a bounce entry |
-| `scalp_window` | `20` | ticks held per symbol |
+| `scalp_window` | `8` | ticks held per symbol. MUST fit inside one loop: the buffer is in memory and cron rebuilds the engine every minute, so a window needing more polls than `scalp_run_seconds / scalp_poll_sec` affords never fills and the engine places no order at all. `Risk::validateConfig()` warns. |
 | `scalp_poll_sec` | `3` | seconds between polls |
 | `scalp_run_seconds` | `50` | loop length inside one cron tick |
 | `scalp_max_consecutive_losses` | `5` | then pause and wait for a human |

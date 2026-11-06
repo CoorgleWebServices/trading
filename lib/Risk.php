@@ -913,7 +913,7 @@ final class Risk
             }
         }
 
-        if ($engine === 'grid' || $engine === 'pmm') {
+        if ($engine === 'grid' || $engine === 'pmm' || $engine === 'scalp') {
             if (self::mode($cfg) === 'live' && !self::b($cfg, 'allow_live_engines', false)) {
                 $warnings[] = 'engine ' . $engine . ' is saved but will place no order in live mode'
                     . ' until allow_live_engines is enabled';
@@ -1145,6 +1145,53 @@ final class Risk
             }
         }
 
+        // ---- the window must FIT INSIDE ONE CRON TICK, or the engine never enters at all.
+        //      The ring buffer lives in memory for the length of one Scalper instance and cron
+        //      builds a fresh one every minute (DESIGN-SCALP.md §4: "Nothing is persisted per
+        //      tick"). So a window of W ticks at `scalp_poll_sec` P seconds needs W x P seconds
+        //      of book, out of the floor(R / P) polls one `scalp_run_seconds` R affords. When
+        //      W > floor(R / P) the window is still warming when the tick ends, every poll is
+        //      refused `window_warming`, and the user watches an engine that places no order
+        //      and says nothing about why. The shipped defaults (W 20, P 3, R 50) are exactly
+        //      that case: 16 polls against a 20-tick window.
+        //
+        //      A WARNING, not an error, and the defaults are NOT changed here: the number is
+        //      stated with the arithmetic so the user decides, which is the same treatment §6
+        //      gives the break-even target.
+        $win  = self::i($cfg, 'scalp_window', 20);
+        $poll = self::f($cfg, 'scalp_poll_sec', 3.0);
+        $runS = self::f($cfg, 'scalp_run_seconds', 50.0);
+        if (self::engineName($cfg) === 'scalp' && $win > 0 && $poll > 0.0 && $runS > 0.0) {
+            $pollsPerTick = (int) floor($runS / $poll);
+            if ($win > $pollsPerTick) {
+                $warnings[] = 'scalp_window (' . $win . ' ticks) does not fit inside one cron tick: at '
+                    . 'scalp_poll_sec ' . self::fmtBound($poll) . ' s the window needs '
+                    . self::fmtBound((float) $win * $poll) . ' s of book, but scalp_run_seconds '
+                    . self::fmtBound($runS) . ' affords only ' . $pollsPerTick . ' polls. The ring '
+                    . 'buffer is in memory and cron builds a fresh engine every minute, so the window '
+                    . 'NEVER fills and every poll is refused window_warming - the engine will place '
+                    . 'no order at all. Set scalp_window to ' . max(1, $pollsPerTick - 4) . ' or less '
+                    . '(leaving some polls to actually trade in), or raise scalp_run_seconds, or '
+                    . 'lower scalp_poll_sec.';
+            } elseif ($win > $pollsPerTick - 2) {
+                $warnings[] = 'scalp_window (' . $win . ' ticks) only just fits inside one cron tick ('
+                    . $pollsPerTick . ' polls at scalp_poll_sec ' . self::fmtBound($poll) . ' s), so the '
+                    . 'window is still warming for all but ' . max(0, $pollsPerTick - $win) . ' of them '
+                    . 'and entries will be rare. Lower scalp_window for more decision points per minute.';
+            }
+        }
+
+        // ---- portfolio mode and scalp both want the whole tick, and portfolio wins
+        //      (Bot::tick() returns after runPortfolioTick()). A WARNING, not an error: the
+        //      combination is legal, it saves, and open scalp positions are still carried to
+        //      their exit by the management-only loop - it is only ENTRIES that stop. Saying
+        //      nothing would leave a user staring at a scalp card that never opens a trade.
+        if (self::b($cfg, 'portfolio_enabled', false) && self::engineName($cfg) === 'scalp') {
+            $warnings[] = 'portfolio_enabled is on with engine = scalp: the sleeves own the tick, '
+                . 'so scalp opens no new position; open scalp positions are still managed to '
+                . 'their exit';
+        }
+
         // ---- the per-symbol allocation, measured against the FREE QUOTE actually in the
         //      account (§7), exactly like checkSleeveBudgets() does for the sleeves.
         //      A WARNING, not an error: §7 is explicit that not every symbol is deployed at
@@ -1178,14 +1225,42 @@ final class Risk
             }
         }
 
-        // ---- a scalp order has to clear the smallest minNotional on the exchange (5 USDT on
-        //      most USDT pairs, 1 on DOGEUSDT) or Movers gates every symbol `too_small` and the
-        //      engine runs with an empty universe while looking perfectly healthy.
-        $order = self::f($cfg, 'scalp_order_usdt', 6.0);
-        if ($order > 0.0 && $order < 5.5 && $quote === 'USDT') {
-            $warnings[] = 'scalp_order_usdt is ' . self::fmtBound($order) . ' USDT. Most USDT pairs '
-                . 'have a 5 USDT minimum and need headroom above it, so at this size the movers '
-                . 'board will gate most symbols `too_small` and only a few cheap pairs will trade.';
+        // ---- order size vs the two rules that decide how much of the market is tradeable.
+        //
+        //      minNotional: below ~5.5 USDT most USDT pairs cannot be entered at all and Movers
+        //      gates them `too_small`.
+        //
+        //      The DUST RULE is the one that actually bites, and it is far less obvious. Movers
+        //      requires one quantity step to cost at most 0.3 % of one order, because a BUY's
+        //      commission is taken in the base asset and the remainder is floored to the step -
+        //      so whatever a step costs is left in the wallet as dust that a scalp, which never
+        //      accumulates, will not sweep. One stepSize costs roughly 0.13 USDT on SOLUSDT,
+        //      0.24 on ETHUSDT, 0.68 on BTCUSDT and 0.20 on DOGEUSDT, so an order has to be
+        //      about 330 x a symbol's step value before that symbol is even offered. At 6 USDT
+        //      the cap is 1.8 cents a step and essentially every liquid pair is gated; worse, on
+        //      any symbol that did slip through, a winning take-profit would still close at a
+        //      loss, because the stranded dust is larger than the 0.25 % the trade made.
+        //
+        //      Both are WARNINGS: a deliberately tiny order on one cheap pair is a legitimate
+        //      experiment. But neither may be silent, because the symptom of both is an engine
+        //      that looks perfectly healthy and never trades - which is exactly the complaint
+        //      this engine was written to answer.
+        $order = self::f($cfg, 'scalp_order_usdt', 50.0);
+        if ($order > 0.0 && $quote === 'USDT') {
+            if ($order < 5.5) {
+                $warnings[] = 'scalp_order_usdt is ' . self::fmtBound($order) . ' USDT. Most USDT '
+                    . 'pairs have a 5 USDT minimum and need headroom above it, so at this size the '
+                    . 'movers board will gate most symbols `too_small` and nothing will trade.';
+            }
+            if ($order < 40.0) {
+                $warnings[] = 'scalp_order_usdt is ' . self::fmtBound($order) . ' USDT, so the dust '
+                    . 'rule allows a quantity step of at most ' . self::fmtBound($order * 0.003)
+                    . ' USDT. One step costs about 0.13 USDT on SOLUSDT, 0.24 on ETHUSDT, 0.20 on '
+                    . 'DOGEUSDT and 0.68 on BTCUSDT, so at this size the movers board will gate '
+                    . 'those and most other liquid pairs `dust_step` and the universe will be '
+                    . 'nearly empty. Raise it to about 50 USDT (which is half the default 100 USDT '
+                    . 'per-symbol budget) unless you are deliberately trading one cheap pair.';
+            }
         }
     }
 

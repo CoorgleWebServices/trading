@@ -132,7 +132,15 @@ function trader_config_defaults(): array
         //     break-even win rate near 67 %. Risk::validateConfig() says so explicitly rather
         //     than letting the arithmetic stay buried here.
         'scalp_universe_size'         => 20,
-        'scalp_order_usdt'            => 6.0,
+        // 50, not the signal engine's 6. The dust rule (Movers, 0.3 % of one order per quantity
+        // step) is what decides how much of the market the board can even offer: one stepSize of
+        // SOL costs ~0.13 USDT, of ETH ~0.24, of BTC ~0.68, so a 6 USDT order gates every one of
+        // them `dust_step` and leaves a universe of only the very cheapest coins - and on any
+        // symbol that did slip through, a sixth of the position would be left as unsellable dust
+        // and a winning take-profit would still close at a loss. 50 admits most liquid pairs,
+        // is half of the 100 USDT default per-symbol budget, and at `scalp_max_open` 6 deploys
+        // at most 300 USDT.
+        'scalp_order_usdt'            => 50.0,
         'scalp_budget_per_symbol'     => 100.0,
         // Per-symbol overrides, e.g. {"BTCUSDT":200,"DOGEUSDT":50}. A MAP, not a list, so
         // trader_config_merge() routes it through trader_config_budgets() instead of
@@ -143,7 +151,13 @@ function trader_config_defaults(): array
         'scalp_sl_pct'                => 0.20,
         'scalp_max_hold_sec'          => 120,
         'scalp_dip_pct'               => 0.15,
-        'scalp_window'                => 20,
+        // 8, not 20. The ring buffer is IN MEMORY and cron builds a fresh engine every minute,
+        // so the window has to fill inside one `scalp_run_seconds` loop or it never fills at all
+        // and every poll is refused `window_warming` - an engine that looks healthy and places
+        // no order, ever. At the default 3 s poll a 50 s loop affords 16 polls, so 8 ticks of
+        // warm-up leaves 8 polls to actually trade in. Risk::validateConfig() warns when a
+        // configured window does not fit.
+        'scalp_window'                => 8,
         'scalp_poll_sec'              => 3,
         'scalp_run_seconds'           => 50,
         'scalp_max_consecutive_losses' => 5,

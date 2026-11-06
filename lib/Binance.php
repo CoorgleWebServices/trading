@@ -239,9 +239,14 @@ final class Binance
                 $this->markInvalid($symbols[0]);
                 return [];
             }
-            $out = [];
-            foreach ($symbols as $s) {
-                foreach ($this->exchangeInfo([$s]) as $k => $v) {
+            // Bisect instead of fanning out to singletons: exchangeInfo costs weight 20 per
+            // request, so one bad symbol in a 60-90 symbol batch (Movers::topUpInfo feeds
+            // scalp_universe_size * 3) would otherwise burn ~1800 request weight in one burst,
+            // a third of the 6000/min budget. Halving costs ~2*log2(n) requests instead of n.
+            $half = (int) floor(count($symbols) / 2);
+            $out  = [];
+            foreach ([array_slice($symbols, 0, $half), array_slice($symbols, $half)] as $part) {
+                foreach ($this->exchangeInfo($part) as $k => $v) {
                     $out[$k] = $v;
                 }
             }
@@ -536,7 +541,7 @@ final class Binance
      * GET /api/v3/ticker/24hr — 24 hour rolling window statistics.
      *
      * **WEIGHT 80 WITH NO SYMBOLS.** Called with an empty $symbols this asks the exchange for
-     * EVERY listed symbol (thousands of rows, ~1 MB of JSON) and costs **80** of the 1200
+     * EVERY listed symbol (thousands of rows, ~1 MB of JSON) and costs **80** of the 6000
      * request weight the account gets per minute. NEVER call it on a per-tick path and never
      * in a loop: the whole point of the hourly `Scanner::refresh()` (guarded by
      * `Scanner::due()` / `scanner_refresh_min`) is that this call happens once an hour.

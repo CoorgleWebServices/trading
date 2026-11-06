@@ -80,6 +80,7 @@ if (file_exists(__DIR__ . '/Movers.php')) {
  *   `scalp_resumed_at`   ISO time a human last resumed
  *   `scalp_stop_requested` '1' asks the running loop to give the tick lock up
  *   `scalp_last_run_at`, `scalp_last_summary`, `scalp_last_run_id`, `scalp_last_error`
+ *   `scalp_last_error_at` ISO time `scalp_last_error` was written; cleared with it
  */
 final class Scalper
 {
@@ -120,14 +121,14 @@ final class Scalper
     /** DESIGN-SCALP.md §6 defaults, so the engine behaves the same against an older config.json. */
     const DEFAULTS = [
         'scalp_universe_size'          => 20,
-        'scalp_order_usdt'             => 6.0,
+        'scalp_order_usdt'             => 50.0,
         'scalp_budget_per_symbol'      => 100.0,
         'scalp_max_open'               => 6,
         'scalp_tp_pct'                 => 0.25,
         'scalp_sl_pct'                 => 0.20,
         'scalp_max_hold_sec'           => 120,
         'scalp_dip_pct'                => 0.15,
-        'scalp_window'                 => 20,
+        'scalp_window'                 => 8,
         'scalp_poll_sec'               => 3,
         'scalp_run_seconds'            => 50,
         'scalp_max_consecutive_losses' => 5,
@@ -144,6 +145,12 @@ final class Scalper
     const ST_STOP      = 'scalp_stop_requested';
     const ST_RUN       = 'scalp_last_run_id';
     const ST_ERROR     = 'scalp_last_error';
+    /**
+     * ISO time ST_ERROR was last written, so the panel can age the note ("3m ago") instead of
+     * showing a stale failure as if it had just happened. Written and cleared in lockstep with
+     * ST_ERROR and never on its own.
+     */
+    const ST_ERROR_AT  = 'scalp_last_error_at';
 
     /** Refusal reasons. */
     const R_PAUSED   = 'loss_breaker';
@@ -158,7 +165,11 @@ final class Scalper
     const R_TURN     = 'no_turn';
     const R_SPREAD   = 'spread_wide';
     const R_BOOK     = 'no_book';
+    /** Entries refused because this run was asked to manage exits only (run(..., true)). */
+    const R_EXITS_ONLY = 'exits_only';
     const R_ENGINE   = 'engine_not_scalp';
+    /** The survival layer could not be read this poll; entries are refused (§5). */
+    const R_RISK_DOWN = 'risk_unavailable';
 
     /** Exit reasons written to `positions.exit_reason`. */
     const X_TP   = 'scalp_tp';
@@ -196,10 +207,34 @@ final class Scalper
     private $quoteFreeCache = null;
     /** @var array [ASSET => float] mirrored free base balances */
     private $baseFreeCache = [];
+    /**
+     * @var array [SYMBOL => true] symbols whose book could not be had this run: absent from
+     *            bookTickerAll() AND a failed or empty single bookTicker(). Remembered so a
+     *            STUCK position on a halted or delisted symbol costs ONE wasted request per
+     *            run instead of one per poll, forever - the same per-process memo rule as
+     *            Binance::$invalidSymbols. Cleared the moment a real book shows up again, so
+     *            a transient outage un-sticks itself.
+     */
+    private $noBook = [];
     /** @var bool */
     private $stopFlag = false;
     /** @var int client-id uniqueness tail */
     private $seq = 0;
+    /**
+     * @var array|null this poll's scalp `positions` rows grouped by symbol, or null outside a
+     *                 poll. ONE read per poll feeds the entry gate and every §7 ledger.
+     */
+    private $pollRowsBySymbol = null;
+    /** @var array|null the OPEN/STUCK rows of that same snapshot, oldest first. */
+    private $pollOpenRows = null;
+    /**
+     * @var bool management-only run: exits are managed exactly as always, entries are refused
+     *           with `exits_only`. Set by run()'s optional trailing parameter, which is how
+     *           Bot asks the loop to carry stranded scalp positions to their exit while
+     *           another engine (or the portfolio sleeves) owns the tick - DESIGN-SCALP.md §5:
+     *           "Open positions keep being managed to their exit".
+     */
+    private $exitsOnly = false;
 
     /**
      * @param array         $cfg     config (DESIGN.md §3 + DESIGN-SCALP.md §6)
@@ -352,16 +387,45 @@ final class Scalper
      *                              panel's "run now"), an absolute `microtime(true) * 1000`
      *                              deadline the loop must not pass (float), or null for
      *                              `scalp_run_seconds` from now.
+     * @param bool $exitsOnly       manage the open positions and open NOTHING. Optional and
+     *                              trailing, so every existing one-argument call is unchanged.
+     *                              Entries are refused with `exits_only`; exits run exactly as
+     *                              they always do (DESIGN-SCALP.md §5). With no explicit
+     *                              universe such a run polls only the symbols it is holding,
+     *                              because a management-only pass has no use for the movers
+     *                              board and must not pay its weight-80 refresh.
      * @return array ['status','summary','run_id','polls','entries','exits',
      *                'gross','fees','net','gross_usdt','fees_usdt','net_usdt',
      *                'blocked','note','universe','paused','streak','refusals']
      */
-    public function run($arg = null): array
+    public function run($arg = null, bool $exitsOnly = false): array
     {
+        $this->exitsOnly = $exitsOnly;
         $symbols    = is_array($arg) ? $arg : null;
         $deadlineTs = null;
         if ($arg !== null && !is_array($arg) && is_numeric($arg)) {
             $deadlineTs = ((float) $arg) / 1000.0;      // absolute ms -> seconds
+        }
+        if ($symbols === null && $this->exitsOnly) {
+            // Management-only: the universe IS what we hold. universe(null) would refresh the
+            // movers board (weight 80) and rank symbols this run may not touch; universe() with
+            // an explicit list still pins the open rows, so nothing can be stranded.
+            $held = [];
+            try {
+                foreach ($this->openRows() as $p) {
+                    $s = strtoupper(trim((string) (isset($p['symbol']) ? $p['symbol'] : '')));
+                    if ($s !== '') {
+                        $held[$s] = true;
+                    }
+                }
+            } catch (RuntimeException $e) {
+                // leave $symbols null: universe() below reads the same rows and reports the
+                // failure as the clean `db_error` summary this method already has a branch for
+                $held = [];
+            }
+            if ($held !== []) {
+                $symbols = array_keys($held);
+            }
         }
 
         $startTs = $this->now();
@@ -386,8 +450,33 @@ final class Scalper
             );
         }
 
-        $universe = $this->universe($symbols);
-        $runId    = $this->openRun($startTs);
+        try {
+            $universe = $this->universe($symbols);
+        } catch (BinanceException $e) {
+            // NOT a `db_error`: BinanceException extends RuntimeException, so without this
+            // clause the rate limit universe() re-throws would be flattened into the clean
+            // summary below and never reach Bot::step('scalp_loop') -> handleApiError(),
+            // which is the only code that sets `api_paused_until`. Let it out.
+            throw $e;
+        } catch (RuntimeException $e) {
+            // The universe pins every symbol holding a position, so it reads the same rows the
+            // poll does and fails the same way. run() still owes its caller a summary, so the
+            // tick ends as a clean `db_error` with zero orders rather than an exception.
+            $runId = $this->openRun($startTs);
+            $this->closeRun($runId, $totals, 'db_error');
+            Log::error('scalp: cannot read its own positions - ' . $e->getMessage());
+            return $this->summary(
+                'error',
+                'scalp could not read its own positions; no order placed',
+                $runId,
+                $totals,
+                'db_error',
+                [],
+                $refusals,
+                true
+            );
+        }
+        $runId = $this->openRun($startTs);
         $this->db->setState(self::ST_RUN, (string) $runId);
 
         if ($universe === []) {
@@ -421,21 +510,36 @@ final class Scalper
         while (true) {
             $books = $this->books($universe);
             $totals['polls']++;
-            if ($books === []) {
-                $note = self::R_BOOK;
-            } else {
+            // EXITS ARE MANAGED FIRST AND ALWAYS (§4 Exit). poll() therefore runs even when
+            // the book call failed, so bidFor() can still price an open position and carry it
+            // to its stop or its timeout; skipping the poll left every open position
+            // unmanaged for the whole run. poll([]) can OPEN nothing - $norm is empty, so no
+            // ring buffer is touched and entryOrder([]) yields no candidates.
+            $noBook = ($books === []);
+            try {
                 $r = $this->poll($books);
-                $totals['entries'] += (int) $r['entries'];
-                $totals['exits']   += (int) $r['exits'];
-                $totals['gross']   += (float) $r['gross_usdt'];
-                $totals['fees']    += (float) $r['fees_usdt'];
-                $totals['net']     += (float) $r['net_usdt'];
-                foreach ($r['refusals'] as $sym => $reason) {
-                    $refusals[$sym] = $reason;
-                }
-                if (isset($r['refusals']['*'])) {
-                    $note = (string) $r['refusals']['*'];
-                }
+            } catch (RuntimeException $e) {
+                // The poll could not read its own positions. It must NOT proceed as if there
+                // were none, so end the tick here; the run row is still closed below and the
+                // summary reports `db_error`.
+                $status = 'error';
+                $note   = 'db_error';
+                Log::error('scalp: aborting the loop - ' . $e->getMessage());
+                break;
+            }
+            $totals['entries'] += (int) $r['entries'];
+            $totals['exits']   += (int) $r['exits'];
+            $totals['gross']   += (float) $r['gross_usdt'];
+            $totals['fees']    += (float) $r['fees_usdt'];
+            $totals['net']     += (float) $r['net_usdt'];
+            foreach ($r['refusals'] as $sym => $reason) {
+                $refusals[$sym] = $reason;
+            }
+            if (isset($r['refusals']['*'])) {
+                $note = (string) $r['refusals']['*'];
+            }
+            if ($noBook) {
+                $note = self::R_BOOK;           // and no_book is not masked by poll()'s refusal
             }
             if ($this->stopRequested()) {
                 // consume the request so it stops THIS loop and not every future one
@@ -491,6 +595,7 @@ final class Scalper
     {
         $nowTs  = $this->now();
         $nowIso = self::isoOf($nowTs);
+        $this->clearSnapshot();                 // never carry a previous poll's rows
         $out    = [
             'entries' => 0, 'exits' => 0,
             'gross_usdt' => 0.0, 'fees_usdt' => 0.0, 'net_usdt' => 0.0,
@@ -508,6 +613,7 @@ final class Scalper
                 continue;
             }
             $norm[$u] = ['bid' => $bid, 'ask' => $ask];
+            unset($this->noBook[$u]);           // a book is back: allow the fallback again
         }
         // ---- ring buffers: one mid per symbol per poll, in memory only
         foreach ($norm as $u => $book) {
@@ -540,10 +646,25 @@ final class Scalper
             $out['closed'][]    = $closed;
         }
 
-        // ---- 2. entries, only when nothing blocks them
+        // ---- 2. entries, only when nothing blocks them.
+        //      A management-only run (run(..., true)) stops here: it exists purely to carry the
+        //      rows above to their exit, so it opens nothing. Placed AFTER the exit phase on
+        //      purpose - the whole point of such a run is that the exits still happen.
+        if ($this->exitsOnly) {
+            $out['refusals']['*'] = self::R_EXITS_ONLY;
+            return $out;
+        }
+        //      ONE `positions` read serves the whole entry phase from here on: the gate, the
+        //      held/open-count derivation and every per-symbol §7 ledger. It is taken AFTER
+        //      the exit writes above, so `net` and `available` are current. The ledger is
+        //      still DERIVED on every poll (§7) - it is handed its rows instead of rescanning
+        //      a symbol's whole history once per candidate, which is what made the poll rate
+        //      decay as the table grew.
+        $this->snapshot();
         $block = $this->entryBlock($nowTs);
         if ($block !== '') {
             $out['refusals']['*'] = $block;
+            $this->clearSnapshot();
             return $out;
         }
 
@@ -584,7 +705,11 @@ final class Scalper
             // ---- §7 per-symbol budget, checked HERE, per entry, against a freshly derived
             //      ledger: a symbol that has spent its own pot stops on its own while the
             //      others carry on. Exits are never budget-blocked.
-            $ledger = self::symbolLedger($this->db, $this->cfg, $sym, $this->mode);
+            $ledger = self::symbolLedgerFrom(
+                isset($this->pollRowsBySymbol[$sym]) ? $this->pollRowsBySymbol[$sym] : [],
+                $this->cfg,
+                $sym
+            );
             if ($order > $ledger['available'] + self::EPS) {
                 $out['refusals'][$sym] = self::R_BUDGET;
                 continue;
@@ -605,6 +730,7 @@ final class Scalper
             $openCount++;
             $entries1h++;
         }
+        $this->clearSnapshot();
         return $out;
     }
 
@@ -635,7 +761,15 @@ final class Scalper
                 self::ENGINE
             );
         } catch (Throwable $e) {
-            $block = '';
+            // Fail CLOSED: the survival layer is the one check that must win when it cannot
+            // be evaluated. Reading an unreadable kill switch as "nothing blocks entries"
+            // would open fresh market positions under an active halt or cap (§5), and
+            // silently. Returning here rather than assigning $block is deliberate: it
+            // bypasses the SIGNAL_ONLY_BLOCKS filter below, which must never be able to
+            // downgrade this refusal. Exits never consult entryBlock(), so open positions
+            // are still managed to their exit while the gate is unreadable.
+            Log::warn('scalp: risk gate unavailable - ' . $e->getMessage());
+            return self::R_RISK_DOWN;
         }
         if ($block !== '') {
             $bare  = $block;
@@ -673,7 +807,7 @@ final class Scalper
     /** Quote to spend per position (§6 `scalp_order_usdt`), floored to what fmtQuote sends. */
     public static function orderUsdt(array $cfg): float
     {
-        $v = self::cfgFloat($cfg, 'scalp_order_usdt', 6.0);
+        $v = self::cfgFloat($cfg, 'scalp_order_usdt', 50.0);
         if ($v <= 0.0) {
             $v = 6.0;
         }
@@ -743,6 +877,18 @@ final class Scalper
                 try {
                     $movers = new Movers($this->cfg, $this->db, $this->ex);
                     $movers->refresh($this->info, false, array_keys($pinned));
+                } catch (BinanceException $e) {
+                    // A rate limit is the one failure the tick's error policy MUST see:
+                    // Movers::fetchTickers() re-throws it precisely so the caller can set
+                    // `api_paused_until`. run() is called inside Bot::step('scalp_loop'),
+                    // which does exactly that - swallowing it here would leave the breaker
+                    // unarmed and the loop would then poll bookTicker for the rest of the
+                    // tick against an exchange that has just asked us to stop. Every other
+                    // movers failure still leaves the previous board in place, as before.
+                    if ($e->retryAfter !== null) {
+                        throw $e;
+                    }
+                    Log::warn('scalp: movers refresh failed - ' . $e->getMessage());
                 } catch (Throwable $e) {
                     Log::warn('scalp: movers refresh failed - ' . $e->getMessage());
                 }
@@ -941,7 +1087,7 @@ final class Scalper
     /** `scalp_window`, clamped to MIN_WINDOW..MAX_WINDOW. */
     public static function windowOf(array $cfg): int
     {
-        $n = (int) round(self::cfgFloat($cfg, 'scalp_window', 20.0));
+        $n = (int) round(self::cfgFloat($cfg, 'scalp_window', 8.0));
         return (int) Util::clamp((float) $n, (float) self::MIN_WINDOW, (float) self::MAX_WINDOW);
     }
 
@@ -1030,17 +1176,34 @@ final class Scalper
      */
     public static function symbolLedger(Db $db, array $cfg, string $symbol, ?string $mode = null): array
     {
-        $sym    = strtoupper(trim($symbol));
-        $budget = self::budgetFor($cfg, $sym);
-        $m      = $mode === null ? self::cfgMode($cfg) : $mode;
-        $rows   = [];
+        $sym  = strtoupper(trim($symbol));
+        $m    = $mode === null ? self::cfgMode($cfg) : $mode;
+        $rows = [];
+        $err  = false;
         if ($sym !== '') {
             try {
                 $rows = $db->scalpPositions($sym, $m);
             } catch (Throwable $e) {
                 $rows = [];
+                $err  = true;
             }
         }
+        return self::symbolLedgerFrom($rows, $cfg, $sym, $err);
+    }
+
+    /**
+     * The same ledger, derived from rows ALREADY fetched - so one poll can read the scalp
+     * positions once and still check every candidate against §7's per-symbol pot, instead of
+     * rescanning a symbol's whole history per candidate. Nothing is stored: this is the same
+     * derivation, just handed its input.
+     *
+     * @param array $rows  `positions` rows for ONE symbol, any status, as scalpPositions() returns
+     * @param bool  $error true when those rows could NOT be read, which forces `available` shut
+     */
+    public static function symbolLedgerFrom(array $rows, array $cfg, string $symbol, bool $error = false): array
+    {
+        $sym      = strtoupper(trim($symbol));
+        $budget   = self::budgetFor($cfg, $sym);
         $deployed = 0.0;
         $gross    = 0.0;
         $fees     = 0.0;
@@ -1071,6 +1234,12 @@ final class Scalper
             }
         }
         $available = self::available($budget, $realised, $deployed);
+        if ($error) {
+            // §7 fails CLOSED too: a ledger we could not read is not a ledger with its whole
+            // budget free. Handing a symbol a fresh pot on a transient read error is how one
+            // coin quietly spends another's money.
+            $available = 0.0;
+        }
         return [
             'symbol'    => $sym,
             'budget'    => self::fin($budget),
@@ -1087,6 +1256,9 @@ final class Scalper
             'win_rate'  => $trades > 0 ? round($wins / $trades * 100.0, 2) : null,
             'open'      => $open,
             'net_pct'   => $budget > 0.0 ? round($realised / $budget * 100.0, 4) : null,
+            // Additive: true ONLY when the rows behind this ledger could not be read, so a
+            // reader can tell "this symbol has not traded" from "we do not know".
+            'error'     => $error,
         ];
     }
 
@@ -1184,12 +1356,9 @@ final class Scalper
         $open     = 0;
         $deployed = 0.0;
         try {
-            foreach ($db->scalpPositions(null, $m) as $r) {
-                $status = strtoupper(trim((string) (isset($r['status']) ? $r['status'] : '')));
-                if (in_array($status, self::OPEN_STATUSES, true)) {
-                    $open++;
-                    $deployed += self::rowF($r, 'entry_quote');
-                }
+            foreach (self::openPositions($db, $cfg, $m) as $r) {
+                $open++;
+                $deployed += self::rowF($r, 'entry_quote');
             }
         } catch (Throwable $e) {
             // leave the open figures at zero
@@ -1245,7 +1414,60 @@ final class Scalper
      */
     public function openRows(): array
     {
+        if ($this->pollOpenRows !== null) {
+            return $this->pollOpenRows;         // this poll's snapshot; no second query
+        }
         return self::openPositions($this->db, $this->cfg, $this->mode);
+    }
+
+    /**
+     * Take this poll's one read of the scalp `positions` rows in this mode, grouped by symbol
+     * and with the open ones kept oldest-first. Called AFTER the exit writes, so what it holds
+     * is current. A failure is NOT swallowed - see openPositions().
+     */
+    private function snapshot(): void
+    {
+        $rows = self::scalpRows($this->db, $this->mode);
+        $this->pollRowsBySymbol = [];
+        $this->pollOpenRows     = [];
+        foreach ($rows as $r) {
+            if (!is_array($r)) {
+                continue;
+            }
+            $s = strtoupper(trim((string) (isset($r['symbol']) ? $r['symbol'] : '')));
+            if ($s === '') {
+                continue;
+            }
+            $this->pollRowsBySymbol[$s][] = $r;
+            $status = strtoupper(trim((string) (isset($r['status']) ? $r['status'] : '')));
+            if (in_array($status, self::OPEN_STATUSES, true)) {
+                $this->pollOpenRows[] = $r;
+            }
+        }
+        // Oldest first - `scalp_max_hold_sec` depends on it, exactly as openPositions() does.
+        usort($this->pollOpenRows, function (array $a, array $b) {
+            return (int) $a['id'] <=> (int) $b['id'];
+        });
+    }
+
+    /** Drop the snapshot, so nothing outside a poll can read a stale position set. */
+    private function clearSnapshot(): void
+    {
+        $this->pollRowsBySymbol = null;
+        $this->pollOpenRows     = null;
+    }
+
+    /**
+     * Every scalp row in $mode, in one query. Shares openPositions()'s rule: a read that
+     * fails is an abort, never an empty set.
+     */
+    private static function scalpRows(Db $db, ?string $mode): array
+    {
+        try {
+            return $db->scalpPositions(null, $mode);
+        } catch (Throwable $e) {
+            throw new RuntimeException('scalp: cannot read positions - ' . $e->getMessage(), 0, $e);
+        }
     }
 
     /** @param string|null $mode null means the configured mode */
@@ -1254,15 +1476,31 @@ final class Scalper
         $m   = $mode === null ? self::cfgMode($cfg) : $mode;
         $out = [];
         try {
-            foreach ($db->scalpPositions(null, $m) as $r) {
-                $status = strtoupper(trim((string) (isset($r['status']) ? $r['status'] : '')));
-                if (in_array($status, self::OPEN_STATUSES, true)) {
+            // Filter in SQL, one indexed query per open status (idx_positions_status), instead
+            // of hydrating every scalp row ever written: this runs three times per poll, and a
+            // month of trading is tens of thousands of CLOSED rows.
+            foreach (self::OPEN_STATUSES as $st) {
+                foreach ($db->scalpPositions(null, $m, $st) as $r) {
                     $out[] = $r;
                 }
             }
         } catch (Throwable $e) {
-            return [];
+            // This is the ONE source of truth for both halves of a poll: exits iterate it and
+            // the entry gate derives `held` / `openCount` from it. Returning an empty set
+            // would silently mean "no positions" - skipping every stop and every max-hold
+            // (§4: exits are managed ALWAYS) and re-entering a symbol already held, doubling
+            // exposure. A poll that cannot read its own positions must abort, which run()
+            // turns into a clean `db_error` tick.
+            throw new RuntimeException(
+                'scalp: cannot read open positions - ' . $e->getMessage(),
+                0,
+                $e
+            );
         }
+        // Oldest first across the merged statuses - `scalp_max_hold_sec` depends on it.
+        usort($out, function (array $a, array $b) {
+            return (int) $a['id'] <=> (int) $b['id'];
+        });
         return $out;
     }
 
@@ -1273,7 +1511,12 @@ final class Scalper
         try {
             return (int) $this->db->scalpEntriesSince($since, $this->mode);
         } catch (Throwable $e) {
-            return 0;
+            // Fail CLOSED: an unreadable count is not "no entries". Returning 0 would switch
+            // scalp_max_trades_per_hour off for the whole poll, at BOTH of its enforcement
+            // points, exactly when the database is least trustworthy.
+            Log::warn('scalp: entry count unreadable, treating the hourly cap as reached',
+                ['mode' => (string) $this->mode]);
+            return PHP_INT_MAX;
         }
     }
 
@@ -1288,8 +1531,13 @@ final class Scalper
         } catch (Throwable $e) {
             // no board yet
         }
-        foreach ($this->openRows() as $p) {
-            $out[] = strtoupper((string) $p['symbol']);
+        try {
+            foreach ($this->openRows() as $p) {
+                $out[] = strtoupper((string) $p['symbol']);
+            }
+        } catch (Throwable $e) {
+            // Read-only path (the scoreboard, the universe pin): render without the held
+            // symbols rather than failing the whole card. Trading paths abort instead.
         }
         return array_values(array_unique($out));
     }
@@ -1324,6 +1572,17 @@ final class Scalper
         if (method_exists($this->ex, 'bookTickerAll')) {
             try {
                 $all = $this->ex->bookTickerAll();
+            } catch (BinanceException $e) {
+                // The one failure the tick's error policy MUST see: its answer is
+                // `api_paused_until`, and swallowing it would let this loop keep hitting an
+                // exchange that has just asked us to stop. Movers::fetchTickers() re-throws
+                // the same case for the same reason. Every other exchange or network error
+                // still costs this poll its book and no more.
+                if ($e->retryAfter !== null || $e->httpStatus === 429 || $e->httpStatus === 418) {
+                    throw $e;
+                }
+                Log::warn('scalp: bookTickerAll failed - ' . $e->getMessage());
+                return [];
             } catch (Throwable $e) {
                 Log::warn('scalp: bookTickerAll failed - ' . $e->getMessage());
                 return [];
@@ -1334,6 +1593,17 @@ final class Scalper
                 if ($api instanceof Binance && method_exists($api, 'bookTickerAll')) {
                     $all = $api->bookTickerAll();
                 }
+            } catch (BinanceException $e) {
+                // The one failure the tick's error policy MUST see: its answer is
+                // `api_paused_until`, and swallowing it would let this loop keep hitting an
+                // exchange that has just asked us to stop. Movers::fetchTickers() re-throws
+                // the same case for the same reason. Every other exchange or network error
+                // still costs this poll its book and no more.
+                if ($e->retryAfter !== null || $e->httpStatus === 429 || $e->httpStatus === 418) {
+                    throw $e;
+                }
+                Log::warn('scalp: bookTickerAll failed - ' . $e->getMessage());
+                return [];
             } catch (Throwable $e) {
                 Log::warn('scalp: bookTickerAll failed - ' . $e->getMessage());
                 return [];
@@ -1375,13 +1645,25 @@ final class Scalper
      */
     private function bidFor(string $symbol): float
     {
+        if (isset($this->noBook[$symbol])) {
+            return 0.0;                         // known bookless this run; do not re-ask
+        }
         try {
             $b = $this->ex->bookTicker($symbol);
         } catch (Throwable $e) {
+            $this->noBook[$symbol] = true;
             Log::warn('scalp: no book for an open position ' . $symbol . ' - ' . $e->getMessage());
             return 0.0;
         }
-        return self::num(isset($b['bid']) ? $b['bid'] : 0.0);
+        $bid = self::num(isset($b['bid']) ? $b['bid'] : 0.0);
+        if ($bid <= 0.0) {
+            // A halted symbol answers HTTP 200 with an empty bid side: no exception, but no
+            // tradeable price either, so remember it exactly as a -1121 is remembered.
+            $this->noBook[$symbol] = true;
+            Log::warn('scalp: empty book for an open position ' . $symbol);
+            return 0.0;
+        }
+        return $bid;
     }
 
     /** Parsed symbol info for the universe, fetched once per run - never inside the poll loop. */
@@ -1516,6 +1798,7 @@ final class Scalper
             Log::warn('scalp: BUY executed nothing', ['symbol' => $symbol, 'client_id' => $cid]);
             return null;
         }
+        $this->clearLastError();                // a CONFIRMED fill: the stale note is now wrong
         $dust = max(0.0, self::num(isset($r['dust_qty']) ? $r['dust_qty'] : 0.0));
         $fill = self::num(isset($r['price']) ? $r['price'] : $ask, $ask);
         $fee  = self::num(isset($r['fee_usdt']) ? $r['fee_usdt'] : 0.0);
@@ -1563,6 +1846,12 @@ final class Scalper
                 'position_id' => $pid, 'qty' => $qty, 'price' => $fill, 'entry_eff' => $eff,
             ]);
         $row = $this->db->position($pid);
+        if (is_array($row) && $this->pollOpenRows !== null) {
+            // The entry loop opens more than one position per poll, so the snapshot has to
+            // carry this one: §7's next ledger must already see the pot it just spent.
+            $this->pollOpenRows[] = $row;
+            $this->pollRowsBySymbol[strtoupper(trim($symbol))][] = $row;
+        }
         return is_array($row) ? $row : null;
     }
 
@@ -1623,13 +1912,53 @@ final class Scalper
             ]);
             return null;                        // nothing left the wallet: leave the row as it is
         }
+        $this->clearLastError();                // a CONFIRMED fill: the stale note is now wrong
         $exitPrice  = self::num(isset($r['price']) ? $r['price'] : $bid, $bid);
         $exitQuote  = self::num(isset($r['quote']) ? $r['quote'] : 0.0);
         $exitFee    = self::num(isset($r['fee_usdt']) ? $r['fee_usdt'] : 0.0);
         $entryQuote = self::rowF($pos, 'entry_quote');
         $entryFee   = self::rowF($pos, 'entry_fee_usdt');
 
-        $net   = $exitQuote - $entryQuote;
+        // A MARKET SELL can fill part of the order and EXPIRE the rest when the book runs dry.
+        // Closing on that fill would book the whole entry cost against a fraction of the
+        // proceeds - a fabricated loss that would poison the verdict (§2), the per-symbol
+        // scoreboard (§7), the breaker (§5) and the daily caps - and orphan the unsold base.
+        // So bank what was received against the cost basis, keep the remainder OPEN, and let
+        // the next poll sell it (exactly what the signal engine does, Bot::sell()).
+        if ($filled + self::EPS < (float) $qtyStr) {
+            $partOutside = self::feeOutsideFlows($this->cfg, $sym, 'SELL', $exitFee,
+                (string) (isset($r['fee_asset']) ? $r['fee_asset'] : ''));
+            $this->db->updatePosition($pid, [
+                'qty'            => max(0.0, $wanted - $filled),
+                'entry_quote'    => $entryQuote - $exitQuote + $partOutside,
+                'entry_fee_usdt' => $entryFee + $exitFee,
+            ]);
+            $this->db->insertTrade([
+                'position_id' => $pid, 'mode' => $this->mode, 'symbol' => $sym, 'side' => 'SELL',
+                'order_id'    => (string) (isset($r['order_id']) ? $r['order_id'] : ''),
+                'client_id'   => $cid,
+                'qty'         => $filled, 'price' => $exitPrice, 'quote' => $exitQuote,
+                'fee_usdt'    => $exitFee,
+                'fee_asset'   => (string) (isset($r['fee_asset']) ? $r['fee_asset'] : ''),
+                'created_at'  => $nowIso,
+            ]);
+            $this->creditSell($base, $exitQuote, $filled);
+            Log::warn('scalp: SELL filled ' . sprintf('%.8f', $filled) . ' of ' . $qtyStr
+                . ', position stays open for the remainder', [
+                    'symbol' => $sym, 'position_id' => $pid, 'reason' => $reason,
+                    'proceeds' => $exitQuote, 'basis_left' => $entryQuote - $exitQuote + $partOutside,
+                ]);
+            return null;                        // no close, no breaker tick, no cap contribution
+        }
+
+        // A commission charged outside BOTH flows (the BNB-discount case) is a real cost that
+        // neither quote figure carries, so take it off net - otherwise a losing round trip
+        // reports break-even, §5's breaker never sees it and §7's `available` overstates the
+        // symbol's pot. With it off, gross = net + fees holds in every fee regime.
+        $outside = self::feeOutsideFlows($this->cfg, $sym, 'SELL', $exitFee,
+                       (string) (isset($r['fee_asset']) ? $r['fee_asset'] : ''))
+                 + $this->entryFeeOutsideFlows($pid, $sym);
+        $net   = $exitQuote - $entryQuote - $outside;
         $fees  = $entryFee + $exitFee;
         $gross = $net + $fees;
 
@@ -1691,6 +2020,7 @@ final class Scalper
         $code = $e instanceof BinanceException ? $e->binanceCode : 0;
         try {
             $this->db->setState(self::ST_ERROR, $side . ' ' . $symbol . ': ' . $e->getMessage());
+            $this->db->setState(self::ST_ERROR_AT, $this->nowIso());
         } catch (Throwable $ignored) {
             // state bookkeeping must never mask the order error
         }
@@ -1761,10 +2091,31 @@ final class Scalper
         if ($this->paused()) {
             return;                             // already paused: do not restamp the reason
         }
-        // What those losses actually cost, so the banner states a number and not just a count
+        // What those losses actually cost, so the banner states a number and not just a count.
+        // SCALP rows only: the streak is counted from scalp closes, so the money quoted beside
+        // it must be too. Db::lastClosed() has no engine filter, so a signal, grid or pmm
+        // close landing in between would make this banner - the one message whose whole job is
+        // to say what the pause cost - attribute another engine's loss to the scalp breaker.
         $lost = 0.0;
         try {
-            foreach (array_slice($this->db->lastClosed($streak, $this->mode), 0, $streak) as $r) {
+            $closed = [];
+            foreach ($this->db->scalpPositions(null, $this->mode, 'CLOSED') as $r) {
+                if (isset($r['pnl_usdt']) && $r['pnl_usdt'] !== null) {
+                    $closed[] = $r;             // a row with no pnl is not a decided trade
+                }
+            }
+            // Same ordering as lastClosed(), just restricted to this engine.
+            usort($closed, function (array $a, array $b) {
+                $ka = (string) (isset($a['closed_at']) && $a['closed_at'] !== null
+                    ? $a['closed_at'] : (isset($a['opened_at']) ? $a['opened_at'] : ''));
+                $kb = (string) (isset($b['closed_at']) && $b['closed_at'] !== null
+                    ? $b['closed_at'] : (isset($b['opened_at']) ? $b['opened_at'] : ''));
+                if ($ka !== $kb) {
+                    return strcmp($ka, $kb);
+                }
+                return (int) $a['id'] <=> (int) $b['id'];
+            });
+            foreach (array_slice($closed, -$streak) as $r) {
                 $lost += self::rowF($r, 'pnl_usdt');
             }
         } catch (Throwable $e) {
@@ -1793,6 +2144,24 @@ final class Scalper
     }
 
     /** Now as an ISO-8601 UTC string, from the injected clock. */
+    /**
+     * Forget ST_ERROR and its stamp together, after a fill the exchange has CONFIRMED.
+     *
+     * Called after the zero-fill guards in buy()/sell(), never at `$this->orders++`: at that
+     * point recoverOrder() may have resolved the throw into an order that filled nothing, and
+     * wiping a live failure note on a 'BUY executed nothing' would hide the very thing the
+     * panel exists to show. `setState(..., null)` is the house clear idiom - see clearPause().
+     */
+    private function clearLastError(): void
+    {
+        try {
+            $this->db->setState(self::ST_ERROR, null);
+            $this->db->setState(self::ST_ERROR_AT, null);
+        } catch (Throwable $ignored) {
+            // clearing the note must never break a completed fill
+        }
+    }
+
     private function nowIso(): string
     {
         return self::isoOf($this->now());
@@ -2026,6 +2395,46 @@ final class Scalper
     {
         $m = strtolower(trim((string) (isset($cfg['mode']) ? $cfg['mode'] : '')));
         return $m === '' ? null : $m;
+    }
+
+    /**
+     * Fee (in quote terms) that normalizeOrder() deducted from NEITHER the position qty nor the
+     * quote proceeds, so `exit_quote - entry_quote` has never seen it. A BUY commission taken in
+     * the base asset already shrank `qty` (lib/Binance.php); a SELL commission taken in the quote
+     * asset was already subtracted from `quote`; anything else (BNB) is an uncounted real cost.
+     * Same rule as Bot::feeUnaccounted() and EngineGrid's liquidation path.
+     */
+    private static function feeOutsideFlows(array $cfg, string $symbol, string $side, float $feeUsdt, string $feeAsset): float
+    {
+        $fa = strtoupper(trim($feeAsset));
+        if ($feeUsdt <= 0.0 || $fa === '') {
+            return 0.0;
+        }
+        $q = self::quoteAsset($cfg);
+        $b = self::baseAsset($symbol, $q, []);
+        if ($side === 'BUY' ? ($b !== '' && $fa === $b) : $fa === $q) {
+            return 0.0;
+        }
+        return $feeUsdt;
+    }
+
+    /** Same, for the BUY trade that opened the position (its fee_asset is on the trade row). */
+    private function entryFeeOutsideFlows(int $positionId, string $symbol): float
+    {
+        try {
+            $st = $this->db->pdo()->prepare(
+                "SELECT fee_usdt, fee_asset FROM trades WHERE position_id = ? AND side = 'BUY' ORDER BY id ASC LIMIT 1"
+            );
+            $st->execute([$positionId]);
+            $row = $st->fetch(PDO::FETCH_ASSOC);
+        } catch (Throwable $e) {
+            return 0.0;
+        }
+        if (!is_array($row)) {
+            return 0.0;
+        }
+        return self::feeOutsideFlows($this->cfg, $symbol, 'BUY', self::rowF($row, 'fee_usdt'),
+            (string) (isset($row['fee_asset']) ? $row['fee_asset'] : ''));
     }
 
     private static function quoteAsset(array $cfg): string

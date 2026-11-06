@@ -308,6 +308,20 @@ SQL;
         // signal position: every row that existed before, and every INSERT that does not mention
         // the column, reads 'signal', so openPosition() keeps returning exactly what it did.
         $this->addColumnIfMissing('positions', 'engine', "TEXT NOT NULL DEFAULT 'signal'");
+
+        // The scalp loop reads its own positions on EVERY poll (~16 a minute per
+        // DESIGN-SCALP.md §4) and the §7 scoreboard reads them per symbol. Both filter on
+        // `engine` first, and idx_positions_status(status) cannot serve the per-poll
+        // scalpPositions(null, $mode), which passes no status at all - so without this they
+        // scan the whole table, which grows by one row per trade forever.
+        //
+        // MUST come AFTER the ALTER above, not in the schema block with the other indexes:
+        // `engine` is an added column, so on a database created before it existed the index
+        // would be built against a column that is not there yet and migrate() would throw.
+        // Idempotent either way, and additive - nothing depends on it existing.
+        $this->pdo->exec(
+            'CREATE INDEX IF NOT EXISTS idx_positions_scalp ON positions(engine, symbol, status)'
+        );
     }
 
     /**
@@ -552,15 +566,21 @@ SQL;
     /* --------------------------------------------------------- scalp engine */
 
     /**
-     * Every OPEN scalp position in $mode, oldest first (so the loop manages the longest-held
-     * one first and `scalp_max_hold_sec` cannot be starved by newer entries).
+     * Every scalp position in $mode that still holds inventory - OPEN *and* STUCK
+     * (Scalper::OPEN_STATUSES) - oldest first (so the loop manages the longest-held one first
+     * and `scalp_max_hold_sec` cannot be starved by newer entries).
+     *
+     * STUCK counts as holding for the same reason capitalSnapshot() counts it as deployed: the
+     * base balance is still there. A STUCK row omitted here would show the panel capital
+     * deployed on a symbol with no row to explain it, and would drop that symbol out of the
+     * pinned movers universe on Bot::scalpOpenRows()'s fallback path.
      *
      * @return array positions rows
      */
     public function openScalpPositions(?string $mode = null): array
     {
         $params = [];
-        $sql    = "SELECT * FROM positions WHERE status = 'OPEN' AND engine = 'scalp'"
+        $sql    = "SELECT * FROM positions WHERE status IN ('OPEN','STUCK') AND engine = 'scalp'"
                 . self::modeClause($mode, $params) . ' ORDER BY id ASC';
         return $this->fetchAll('positions', $sql, $params);
     }
@@ -1115,11 +1135,21 @@ SQL;
      * pure noise once resolved - while a row that filled is the provenance of a
      * lot and a cycle, so it is never deleted here. Nothing live is touched:
      * ENGINE_LIVE_STATUSES rows may still be resting on the exchange.
+     *
+     * The optional trailing $nowTs is the clock the cutoffs are measured from
+     * (UNIX seconds); null means the wall clock, which is what every existing
+     * caller gets. Bot::tick() passes its OWN tick clock, because the rows it
+     * has just written carry that clock: measuring retention against a
+     * different clock than the one the data was stamped with deletes rows the
+     * same tick created. In production the two are the same clock, so nothing
+     * changes; with an injected or fixed clock they are not, and the mismatch
+     * is a real one (it also bites a host whose system time has jumped).
      */
-    public function prune(int $days = 30, int $observationDays = 365): void
+    public function prune(int $days = 30, int $observationDays = 365, ?int $nowTs = null): void
     {
-        $cutoff = Util::nowIso(time() - max(1, $days) * 86400);
-        $obsCutoff = Util::nowIso(time() - max(max(1, $days), $observationDays) * 86400);
+        $now = ($nowTs !== null && $nowTs > 0) ? $nowTs : time();
+        $cutoff = Util::nowIso($now - max(1, $days) * 86400);
+        $obsCutoff = Util::nowIso($now - max(max(1, $days), $observationDays) * 86400);
         $this->pdo->prepare('DELETE FROM signals WHERE created_at < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM equity WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM sleeve_equity WHERE ts < ?')->execute([$cutoff]);

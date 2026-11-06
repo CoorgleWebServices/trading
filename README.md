@@ -170,7 +170,7 @@ You do not need keys for paper mode. For demo, testnet and live:
 
 ---
 
-## Engines: signal, grid, pmm
+## Engines: signal, grid, pmm, scalp
 
 The bot runs exactly one **engine** at a time, chosen with the `engine` setting. The signal engine
 is the default and is what the rest of this file describes; the other two trade continuously and
@@ -181,6 +181,7 @@ are **demo-only by default**.
 | `signal` (default) | one position at a time, entries only on a closed 15m candle | market | mean reversion inside an uptrend | the setup keeps failing (the survival layer bounds it) |
 | `grid` | a ladder of resting buy rungs below an anchor, each with a sell one rung up | limit (post-only) | oscillation inside a range | price **trends out of the range** |
 | `pmm` | pure market making: one bid and one ask around mid, re-quoted every refresh | limit (post-only) | the spread | always, at VIP0 fees - see below |
+| `scalp` | 20 coins at once, ~16 decision points a minute, tiny market orders, a budget per coin | market | tiny mean-reversion bounces | fees, mostly - which is why it measures and shows gross vs net (see below) |
 
 **pmm is expected to LOSE money at VIP0 fees.** Binance charges 0.1 % maker, identical to taker, so
 a round trip costs about 0.2 %, while observed spreads on the majors are 0.01 - 0.05 %. It is
@@ -275,6 +276,213 @@ again and use **Flatten inventory**, or sell it by hand on Binance.
 
 The signal-engine cards reappear as soon as `signal` is selected. Realised engine PnL keeps
 counting against the daily and weekly loss caps either way, so a bad grid still pauses the account.
+
+---
+
+## Scalp: many coins, many trades, one pot per coin
+
+`engine = scalp` is the fourth engine. It is the only one that trades **many symbols at once, many
+times a minute, in tiny size**, and it is the one to pick if what you want is the question *"which
+coin actually makes money?"* answered with numbers instead of opinions.
+
+It is **demo-only**, exactly like `grid` and `pmm`: in `live` mode it places **zero orders** unless
+`allow_live_engines` is explicitly turned on. Leave it off.
+
+### What it actually does
+
+One cron tick runs a **bounded loop** instead of a single pass, which is how you get sub-minute
+trading out of a host whose cron only fires once a minute:
+
+* `scalp_run_seconds` (50) of looping, polling every `scalp_poll_sec` (3) → **~16 decision points
+  per minute**, every minute, across the whole universe.
+* Each poll makes **one** market-data call — `GET /api/v3/ticker/bookTicker` with no symbol, which
+  returns bid and ask for every symbol at once. 20 polls a minute is ≤ 80 weight against a
+  6000/min limit, so the universe can grow without re-architecting.
+* No candles. The loop reads the book and nothing else.
+* Per symbol it keeps an in-memory ring buffer of `scalp_window` mid prices. Nothing is written per
+  tick — only entries, exits and the run summary.
+
+**Entry** (long only). For a symbol with no open position, all of these: the window is full; the
+price has **pulled back** `scalp_dip_pct` (0.15 %) from the window high; the **last two ticks are
+rising** (so one up-tick inside a slide is not mistaken for a bounce); the spread is inside
+`scalp_max_spread_pct`; fewer than `scalp_max_open` positions are open; and the symbol's own budget
+can fund the order.
+
+**Exit**, checked every poll: take profit at `scalp_tp_pct` (0.25 %), stop at `scalp_sl_pct`
+(0.20 %), or max hold at `scalp_max_hold_sec` (120 s). All three are measured **on the bid**, against
+`entry_eff` — the dust-excluded cost basis that already carries the buy fee — because the bid is
+what a sale actually receives. Measuring a target on the ask, or against the raw fill, books profit
+the round trip never produced.
+
+**An open position is always managed.** Exits run first on every poll and are never skipped: not
+when entries are paused, not when the loss breaker has tripped, not when `enabled` is off, not under
+the equity floor, and not when another engine has taken over the tick. Abandoning a position would
+be worse than any losing streak.
+
+### The movers board
+
+`scalp_universe_size` (20) symbols, chosen by a board that answers *"the coins with the most movement
+and the most traders"*:
+
+```
+score = 0.45·move + 0.35·trade count + 0.20·liquidity − spread penalty
+```
+
+Each term is normalised 0–1 across the surviving candidates, so no term can dominate just because of
+its units. **Move** is the intraday range `(high − low) / last`, not the 24 h change percent — a coin
+that rose 5 % and then sat still has nothing in it for a round trip, and `change_pct` cannot tell the
+difference.
+
+The board is a **weight-80** call, so it refreshes at most once per `scalp_universe_refresh_min`
+(10 min) and **never from inside the fast loop**. Candidates are filtered on quote asset, `TRADING`
+status, spot-trading allowed, not a leveraged token, not in `scalp_exclude` (stablecoin pairs),
+24 h quote volume ≥ `scalp_min_quote_vol`, spread ≤ `scalp_max_spread_pct`, and the dust rule
+`stepSize × price ≤ 0.3 % of scalp_order_usdt`.
+
+Rows that fail a gate are **kept with the reason**, not silently dropped, so the panel can tell you
+*why* a coin you expected to see is not being traded. A symbol holding an open position is **pinned**
+into the universe until it closes, even if it falls out of the ranking — a position can never be
+stranded outside the universe it is managed from.
+
+### A budget per coin, so you can see which one makes money
+
+This is the point of the whole exercise. **Every symbol trades its own pot.**
+
+* The cap is `scalp_budgets[SYMBOL]` when you set one, otherwise `scalp_budget_per_symbol` —
+  **100 USDT by default**. Set per-coin overrides as JSON: `{"BTCUSDT":200,"DOGEUSDT":50}`.
+* The ledger is **derived from the `positions` rows every time**, never kept as a running total, so
+  it cannot drift out of step with the trades it describes:
+
+  | field | meaning |
+  |---|---|
+  | `budget` | the cap |
+  | `deployed` | `entry_quote` of the symbol's open positions |
+  | `available` | `max(0, budget + realised net − deployed)` |
+  | `gross`, `fees`, `net` | realised, summed over its closed positions |
+  | `trades`, `wins`, `losses`, `win_rate` | the sample size, always beside the rate |
+
+* **Enforcement:** an entry is refused when `scalp_order_usdt > available` for that symbol, with the
+  reason `symbol_budget`. **A coin that loses its pot stops trading on its own while the others carry
+  on.** That is the per-symbol equivalent of the loss breaker, and it is what stops one bad coin
+  draining the whole run. Exits are *never* budget-blocked — selling returns capital.
+* With 20 symbols at 100 each, the budgets allocate 2000 USDT. The sum is checked against your free
+  balance when you save, as a **warning, not an error**: each cap is a ceiling, and not every symbol
+  is deployed at once.
+
+The **scoreboard** card is the one you will actually read: one row per symbol, sorted by net, showing
+budget, deployed, trades, win rate *with its sample size*, gross, fees, net, and net as a percent of
+that coin's budget.
+
+### The pause after N consecutive losses
+
+* `scalp_max_consecutive_losses` (5, range 2–20). A closed position with net P&L **< 0** increments
+  the counter; **any win resets it to 0**.
+* On reaching the limit the engine sets `scalp_paused`, writes a reason naming the streak, the money
+  lost over it and the time, logs at warn, and **stops opening new positions**. Open positions keep
+  being managed to their exit.
+* The streak counts **only this engine's own closes**. Another engine's losing trade does not pad it.
+* **It does not clear itself.** The dashboard shows a banner with the streak and a **Resume scalping**
+  button (POST + CSRF). That button is the only thing that lifts the pause — it resets the counter to
+  0 and allows entries from the next tick. That is the "pause and ask me" behaviour.
+* If a tick happens to be running when you press it, the panel tells you so and the engine **stays
+  paused** — it never reports a resume that did not happen.
+* This is **additional to**, not instead of, the global survival layer: the equity floor, the drawdown
+  kill switch and the daily and weekly loss caps all still apply and all still win.
+
+### Gross, fees, net — and why 0.25 % against 0.2 % fees is thin
+
+The panel never shows net alone. It shows all three, with the trade count beside them:
+
+```
+Gross P&L (before fees)   +1.42 USDT     ← is there ANY directional edge?
+Fees paid                 −3.10 USDT     ← what it cost to find out
+Net P&L                   −1.68 USDT     ← the answer
+```
+
+Separating them is the whole point. **Gross positive with net negative** means the signal works and
+the fees eat it — a fee problem. **Gross negative** means there is no edge at all, and no fee tier
+would save it.
+
+Now the arithmetic, which you should read before you run this for a week:
+
+* Binance charges **0.1 % per side** at VIP0. A round trip is **0.2 % of the price**.
+* The target is measured on the **bid against `entry_eff`**, which already carries the *buy* fee. So
+  against that reference the sell still owes **0.1 %**. Break-even is 0.1 %, not 0.2 %.
+* A win at `scalp_tp_pct` 0.25 % therefore nets about **+0.15 %**. A loss at `scalp_sl_pct` 0.20 %
+  costs about **−0.30 %** once the sell fee is added.
+* Lose 0.30 to win 0.15 and you need a **~67 % win rate just to break even**, before slippage. The
+  panel states this number for your actual settings.
+* On a 6 USDT order, +0.15 % is **0.9 of a cent**. The fee on that round trip is about 1.2 cents.
+
+`Risk::validateConfig()` says this out loud when you save: it bounds every key, and it warns — never
+silently — when `scalp_tp_pct` is below the round trip or at/below the fee still owed on the sell.
+It is a **warning, not an error**, because measuring a sub-break-even target on demo is a legitimate
+experiment and the reason this engine exists. It saves, and it tells you what it costs.
+
+**A measured run.** Driving the real loop over a deterministic scripted path across 20 symbols for
+the equivalent of ~25 minutes of market (60 closed round trips, paper mode, 0.1 % fees):
+
+```
+closed round trips      60
+Gross P&L (before fees) -0.0239 USDT      ← no directional edge, either way
+Fees paid               -0.7196 USDT      ← 30x the gross, per trade
+Net P&L                 -0.7436 USDT
+win rate                28.3% (17 of 60)
+```
+
+Repeated on three different price paths the gross ranged from −0.02 to −0.45 USDT while the fees were
+a flat −0.72 every time. **Fees were the dominant term in every run.** Scripted prices are not a
+market and 60 trades prove nothing about a real one — but they do show the shape of the thing: the
+fee line is predictable and the edge is not.
+
+### A default you must change before it will trade at all
+
+The ring buffer lives in memory for the life of one `Scalper`, and cron builds a **fresh one every
+minute**. So a window of `W` ticks at `scalp_poll_sec` `P` needs `W × P` seconds of book, out of the
+`floor(scalp_run_seconds / P)` polls one tick affords.
+
+The shipped defaults are `scalp_window` **20**, `scalp_poll_sec` **3**, `scalp_run_seconds` **50** —
+that is a 60-second window against **16 polls**. The window never fills, every poll is refused
+`window_warming`, and **the engine places no order at all** while looking perfectly healthy.
+
+Set `scalp_window` to **8** (or anything up to 12) and it trades. The settings page warns about this
+with the arithmetic when you save, so you do not have to rediscover it.
+
+### Configuration
+
+| key | default | notes |
+|---|---|---|
+| `scalp_universe_size` | `20` | symbols traded at once; 1–30 |
+| `scalp_order_usdt` | `6.0` | per position; must clear the exchange's minimum notional |
+| `scalp_budget_per_symbol` | `100.0` | the default cap per coin |
+| `scalp_budgets` | `{}` | per-coin overrides, e.g. `{"BTCUSDT":200,"DOGEUSDT":50}` |
+| `scalp_max_open` | `6` | concurrent positions, at most one per symbol |
+| `scalp_tp_pct` | `0.25` | take profit, on the bid against `entry_eff` |
+| `scalp_sl_pct` | `0.20` | stop, same basis |
+| `scalp_max_hold_sec` | `120` | time exit |
+| `scalp_dip_pct` | `0.15` | pullback needed before a bounce entry |
+| `scalp_window` | `20` | ticks held per symbol — **see the section above** |
+| `scalp_poll_sec` | `3` | seconds between polls |
+| `scalp_run_seconds` | `50` | loop length inside one cron tick (hard ceiling 55) |
+| `scalp_max_consecutive_losses` | `5` | then pause and wait for you |
+| `scalp_max_trades_per_hour` | `60` | runaway guard; counts entries |
+| `scalp_min_quote_vol` | `20000000` | 24 h quote volume floor |
+| `scalp_max_spread_pct` | `0.05` | |
+| `scalp_universe_refresh_min` | `10` | how often the weight-80 board refreshes |
+| `scalp_exclude` | stablecoin pairs | never ranked |
+
+### What to expect on the dashboard
+
+* a **movers card** — the top 10 with rank, last price, 24 h change, intraday range, **trade count**,
+  quote volume, spread, required size, score, whether it is in the universe, and any gate it failed;
+* a **scalp card** — running or paused, the loss streak against its limit, open positions with age
+  and unrealised percent, entries this hour against the cap, polls in the last run, the last order
+  error with its age, and the Gross / Fees / Net block with the trade count;
+* the **per-symbol scoreboard**, sorted by net;
+* a **pause banner** with the Resume button whenever the breaker has tripped;
+* `?api=status` carries `scalp` and `movers` blocks with the same numbers.
+
+The design contract for all of it is `docs/DESIGN-SCALP.md`.
 
 ---
 
@@ -982,6 +1190,7 @@ trader/
   docs/DESIGN.md the design contract every file follows;  docs/DESIGN-ENGINES.md the same for grid + pmm
   docs/DESIGN-PORTFOLIO.md  the contract for portfolio mode (sleeves) and the volatility scanner
   docs/DESIGN-LEARNING.md   the contract for observation capture, evidence and bounded feedback
+  docs/DESIGN-SCALP.md      the contract for the scalp engine, the movers board and the per-coin budgets
   data/          runtime (auto-created): config.json (secrets, 0600), trader.sqlite (positions,
                  orders, trades, signals, equity, logs - 30 days retention; observations are kept
                  for a year, since a 90-day evidence window is worthless once deleted), bot.log

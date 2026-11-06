@@ -2385,7 +2385,11 @@ final class Panel
         // ---- open positions
         $openRows = [];
         try {
-            $openRows = $db->openScalpPositions($mode);
+            // OPEN *and* STUCK, via the shared lister, exactly as Bot::scalpOpenRows() does: a
+            // STUCK row still holds inventory and still counts as deployed against the symbol's
+            // budget (Scalper::OPEN_STATUSES), so the panel must not report it as nothing open.
+            $openRows = $have ? Scalper::openPositions($db, $cfg, $mode)
+                              : $db->openScalpPositions($mode);
         } catch (Throwable $e) {
             $openRows = [];
         }
@@ -2412,7 +2416,9 @@ final class Panel
                 ['t' => $age . ' s', 'c' => 'num'],
                 ['t' => $unreal === null ? '-' : self::pct($unreal, 3, true),
                  'c' => 'num lvl-' . ($unreal === null ? 'muted' : self::pnlLevel($unreal))],
-                ['t' => (string) ($r['entry_reason'] ?? ''), 'c' => 'tags'],
+                // A parked row must not read like a healthy one: say STUCK in the reason cell.
+                ['t' => (strtoupper((string) ($r['status'] ?? '')) === 'STUCK' ? 'STUCK: ' : '')
+                        . (string) ($r['entry_reason'] ?? ''), 'c' => 'tags'],
             ]];
             $openPayload[] = [
                 'symbol' => $sym, 'qty' => self::f($r['qty'] ?? 0.0), 'entry_eff' => $eff,
@@ -2521,6 +2527,29 @@ final class Panel
         $tables['movers'] = ['rows' => $mrows, 'cols' => 12,
             'empty' => 'No board yet - the tick refreshes it every scalp_universe_refresh_min minutes'];
 
+        // The engine's LAST ORDER ERROR (state `scalp_last_error`, written by Scalper when a
+        // market order throws). It was being recorded and read by nothing, which meant a failed
+        // EXIT - the most dangerous silent state this engine has - lived only in data/bot.log.
+        // A position whose sell keeps being rejected stays OPEN and is retried every poll, so it
+        // is not abandoned; but the user must be able to SEE that their stop is not getting out.
+        // Aged, like every other time-sensitive figure on this card (`scalp_last_run` through
+        // self::ago(), `movers_age` through self::duration()): the copy beside it speaks in the
+        // present tense ("stays OPEN and is retried on the next poll"), so a bare message with
+        // no timestamp reads as a failure happening NOW even when it was resolved days ago.
+        // `scalp_last_error_at` is written beside the message and cleared on the next confirmed
+        // fill; when it is absent (an error recorded before that key existed) the text stays the
+        // bare message rather than inventing an age.
+        $lastErr = trim((string) $st('scalp_last_error', ''));
+        $errAt   = trim((string) $st('scalp_last_error_at', ''));
+        $text['scalp_last_error']   = $lastErr === ''
+            ? 'none'
+            : $lastErr . ($errAt === '' ? '' : ' (' . self::ago($errAt, $now) . ')');
+        $levels['scalp_last_error'] = $lastErr === '' ? 'ok' : 'warn';
+        // Stays the bare message: `raw` is the machine-readable contract for ?api=status, and a
+        // caller that wants the age reads `scalp_last_error_at` beside it.
+        $raw['scalp_last_error']    = $lastErr;
+        $raw['scalp_last_error_at'] = $errAt;
+
         $refreshMin = (int) self::f($cfg['scalp_universe_refresh_min'] ?? 10, 10.0);
         $text['movers_age']   = $moversAge === null ? 'never refreshed' : self::duration($moversAge * 60) . ' ago';
         $levels['movers_age'] = $moversAge === null ? 'muted' : 'ok';
@@ -2562,6 +2591,12 @@ final class Panel
                 'entries_hour'  => $entriesHour,
                 'hour_cap'      => $hourCap,
                 'polls_last_run' => is_array($lastRun) ? (int) ($lastRun['polls'] ?? 0) : 0,
+                // '' when the engine's last order went through; a failed order (a failed EXIT
+                // above all) is otherwise only in the log file.
+                'last_error'    => $lastErr,
+                // ISO timestamp of that error, or '' - so an API consumer can tell a failure
+                // happening now from one that was resolved last week.
+                'last_error_at' => $errAt,
                 'budget_per_symbol' => self::f($cfg['scalp_budget_per_symbol'] ?? 100.0, 100.0),
                 'scoreboard'    => $board,
                 'last_run'      => is_array($lastRun) ? [

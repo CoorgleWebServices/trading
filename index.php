@@ -327,6 +327,33 @@ function handle_action(string $action, array $cfg, Db $db): void
                         'exit_price' => (float) $open['entry_eff'], 'exit_quote' => (float) $open['entry_quote'], 'closed_at' => Util::nowIso(),
                     ]);
                 }
+                // PaperExchange::reset() puts the simulated wallet back to `paper_start_usdt`,
+                // so any scalp row still holding base inventory would claim coins the wallet no
+                // longer has: the next poll would markStuck() it and its `entry_quote` would keep
+                // counting against that symbol's budget forever (DESIGN-SCALP.md §7). Close them
+                // at cost first. STUCK rows count too - they are in Scalper::OPEN_STATUSES and so
+                // in `deployed`, which is why this filters Scalper::openPositions() rather than
+                // asking for OPEN alone.
+                $scalpOpen = [];
+                if (class_exists('Scalper')) {
+                    $scalpOpen = Scalper::openPositions($db, $cfg, 'paper');
+                } elseif (method_exists($db, 'scalpPositions')) {
+                    foreach ($db->scalpPositions(null, 'paper') as $r) {
+                        if (in_array(strtoupper(trim((string) ($r['status'] ?? ''))), ['OPEN', 'STUCK'], true)) {
+                            $scalpOpen[] = $r;
+                        }
+                    }
+                }
+                foreach ($scalpOpen as $p) {
+                    // gross and fees zeroed alongside pnl so the DESIGN-SCALP.md §2
+                    // net = gross - fees invariant still holds for these synthetic closes.
+                    $db->updatePosition((int) $p['id'], [
+                        'status' => 'CLOSED', 'exit_reason' => 'paper_reset',
+                        'pnl_usdt' => 0.0, 'pnl_pct' => 0.0, 'gross_usdt' => 0.0, 'fees_usdt' => 0.0,
+                        'exit_price' => (float) $p['entry_eff'], 'exit_quote' => (float) $p['entry_quote'],
+                        'closed_at' => Util::nowIso(),
+                    ]);
+                }
                 $ex = Exchange::factory($cfg, $db);
                 if ($ex instanceof PaperExchange) {
                     $ex->reset();
@@ -339,7 +366,11 @@ function handle_action(string $action, array $cfg, Db $db): void
                 }
                 Log::warn('panel: paper account reset', ['start_usdt' => (float) ($cfg['paper_start_usdt'] ?? 10.0)]);
                 Panel::flash('ok', 'Paper balances reset to ' . Util::money((float) ($cfg['paper_start_usdt'] ?? 10.0), 2) . ' ' . (string) $cfg['quote_asset']
-                    . '. Closed trades stay in the history; the kill-switch state was cleared.');
+                    . '. Closed trades stay in the history; the kill-switch state was cleared.'
+                    . (count($scalpOpen) > 0
+                        ? ' ' . count($scalpOpen) . ' open scalp position(s) were closed at cost as paper_reset, '
+                            . 'so their capital is back in each symbol\'s budget.'
+                        : ''));
             } catch (Throwable $e) {
                 Panel::flash('danger', 'Reset failed: ' . $e->getMessage());
             }
@@ -830,8 +861,13 @@ function handle_scalp_action(array $cfg, Db $db): void
             $sc->resume();
             return ['status' => 'ok', 'summary' => (string) $streak, 'ms' => 0];
         });
-        if ((string) ($res['status'] ?? '') === 'busy') {
-            Panel::flash('warn', 'A tick is running right now - try Resume again in a few seconds.');
+        $st = (string) ($res['status'] ?? '');
+        if ($st === 'skipped') {
+            Panel::flash('warn', 'A tick is running right now - try Resume again in a few seconds. '
+                . 'The engine is still paused.');
+        } elseif ($st !== 'ok') {
+            Panel::flash('danger', 'Resume did not run (' . ($st === '' ? 'unknown status' : $st)
+                . '): ' . trim((string) ($res['summary'] ?? '')) . ' The engine is still paused.');
         } else {
             Panel::flash('ok', 'Scalping resumed. The losing streak was reset to 0 and entries are '
                 . 'allowed again from the next tick. The global kill switches (equity floor, '
@@ -1056,7 +1092,7 @@ function panel_portfolio_defaults(): array
         'scanner_top_n'           => 10,
         'scanner_exclude'         => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT'],
         'scalp_universe_size'     => 20,
-        'scalp_order_usdt'        => 6.0,
+        'scalp_order_usdt'        => 50.0,
         'scalp_budget_per_symbol' => 100.0,
         'scalp_budgets'           => [],
         'scalp_max_open'          => 6,
@@ -1064,7 +1100,7 @@ function panel_portfolio_defaults(): array
         'scalp_sl_pct'            => 0.20,
         'scalp_max_hold_sec'      => 120,
         'scalp_dip_pct'           => 0.15,
-        'scalp_window'            => 20,
+        'scalp_window'            => 8,
         'scalp_poll_sec'          => 3,
         'scalp_run_seconds'       => 50,
         'scalp_max_consecutive_losses' => 5,
@@ -2404,7 +2440,8 @@ function panel_scalp_dashboard(array $s, string $quote): string
     // actually managed. The user asked for "multiple trades every minute or second", so both
     // numbers belong on the card: the cap is what stops it, the poll count is what it achieved.
     $h .= '<p class="muted small">Entries: <span class="' . $e('lvl-' . (string) ($lvl['scalp_entries_hour'] ?? 'muted'))
-        . '" data-field="scalp_entries_hour">' . $e((string) ($txt['scalp_entries_hour'] ?? '-')) . '</span>. '
+        . '" data-field="scalp_entries_hour" data-level="scalp_entries_hour" data-level-prefix="lvl-">'
+        . $e((string) ($txt['scalp_entries_hour'] ?? '-')) . '</span>. '
         . 'Polls in the last run: <span data-field="scalp_polls">' . $e((string) ($txt['scalp_polls'] ?? '0')) . '</span>. '
         . 'Last run: <span data-field="scalp_last_run">' . $e((string) ($txt['scalp_last_run'] ?? '')) . '</span>. '
         . 'Cadence: <span data-field="scalp_cadence">' . $e((string) ($txt['scalp_cadence'] ?? '')) . '</span>. '
@@ -2432,6 +2469,18 @@ function panel_scalp_dashboard(array $s, string $quote): string
         . '</tr></thead><tbody data-table="scalp_open" data-cols="7">'
         . Panel::tableRows(isset($s['tables']['scalp_open']) && is_array($s['tables']['scalp_open']) ? $s['tables']['scalp_open'] : [])
         . '</tbody></table></div>';
+    // The engine's last order error. A rejected SELL is the one failure that really matters here:
+    // the position stays OPEN and is retried every poll, so it is not abandoned, but the user has
+    // to be able to see that their stop is not getting out. It was previously only in bot.log.
+    $h .= '<p class="muted small">Last order error: <span class="'
+        . $e('lvl-' . (string) ($lvl['scalp_last_error'] ?? 'muted'))
+        . '" data-field="scalp_last_error" data-level="scalp_last_error" data-level-prefix="lvl-">'
+        . $e((string) ($txt['scalp_last_error'] ?? 'none')) . '</span>. '
+        . 'A rejected sell leaves the position OPEN and is retried on the next poll rather than '
+        . 'abandoned; a sell that is below the exchange minimum is marked STUCK and sold the moment '
+        . 'the notional recovers. Either way the capital still counts as deployed against that '
+        . 'symbol\'s budget, so it cannot be spent twice.</p>';
+
     $h .= '<p class="muted small">Age is in SECONDS because that is the scale this engine works on - '
         . 'a position is timed out at scalp_max_hold_sec whether it is up or down. Unrealised is measured '
         . 'against entry_eff (the dust-excluded basis that already carries the buy fee) from the last price '
@@ -2768,7 +2817,7 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
             . 'the fees took. Run it on <strong>demo</strong> and read the Gross / Fees / Net block before you consider real money.</div>';
     $scalp .= '<div class="grid3">';
     $scalp .= panel_input('scalp_universe_size', $v, 'Symbols traded at once', 'number', '1-30; the top N eligible rows of the movers board', '1');
-    $scalp .= panel_input('scalp_order_usdt', $v, 'Quote per position', 'number', 'must clear the symbol required size (minNotional + step)');
+    $scalp .= panel_input('scalp_order_usdt', $v, 'Quote per position', 'number', 'must clear minNotional + one step; too small and the dust rule gates most of the market');
     $scalp .= panel_input('scalp_max_open', $v, 'Max open positions', 'number', '1-30, one per symbol', '1');
     $scalp .= panel_input('scalp_budget_per_symbol', $v, 'Default budget per symbol', 'number', 'each symbol spends only its own pot');
     $scalp .= panel_input('scalp_tp_pct', $v, 'Take profit %', 'number', 'on the bid, against entry_eff');
@@ -2782,7 +2831,7 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
             . 'Leave empty for no overrides.</span>'
             . '<textarea name="scalp_budgets" rows="2">' . $e(panel_budgets_text($v)) . '</textarea></label>';
     $scalp .= '<div class="grid3">';
-    $scalp .= panel_input('scalp_window', $v, 'Ticks held per symbol', 'number', '3-200; the entry needs a full window', '1');
+    $scalp .= panel_input('scalp_window', $v, 'Ticks held per symbol', 'number', '3-200; MUST fit in one loop (run_seconds / poll_sec) or the window never fills and nothing trades', '1');
     $scalp .= panel_input('scalp_poll_sec', $v, 'Seconds between polls', 'number', '1-30; one bookTicker call for every symbol per poll');
     $scalp .= panel_input('scalp_run_seconds', $v, 'Loop length per tick (s)', 'number', '1-55; must end inside the cron tick', '1');
     $scalp .= panel_input('scalp_max_trades_per_hour', $v, 'Max entries per hour', 'number', 'runaway guard', '1');
@@ -2941,9 +2990,9 @@ function panel_engine_defaults(): array
         'grid_range_up_pct' => 4.0, 'grid_range_down_pct' => 6.0, 'grid_exit_liquidates' => false,
         'pmm_spread_pct' => 0.25, 'pmm_order_usdt' => 1.30, 'pmm_refresh_sec' => 60,
         'pmm_target_base_pct' => 50, 'pmm_max_base_pct' => 80,
-        'scalp_universe_size' => 20, 'scalp_order_usdt' => 6.0, 'scalp_budget_per_symbol' => 100.0,
+        'scalp_universe_size' => 20, 'scalp_order_usdt' => 50.0, 'scalp_budget_per_symbol' => 100.0,
         'scalp_budgets' => [], 'scalp_max_open' => 6, 'scalp_tp_pct' => 0.25, 'scalp_sl_pct' => 0.20,
-        'scalp_max_hold_sec' => 120, 'scalp_dip_pct' => 0.15, 'scalp_window' => 20,
+        'scalp_max_hold_sec' => 120, 'scalp_dip_pct' => 0.15, 'scalp_window' => 8,
         'scalp_poll_sec' => 3, 'scalp_run_seconds' => 50, 'scalp_max_consecutive_losses' => 5,
         'scalp_max_trades_per_hour' => 60, 'scalp_min_quote_vol' => 20000000.0,
         'scalp_min_trade_count' => 50000, 'scalp_max_spread_pct' => 0.05,

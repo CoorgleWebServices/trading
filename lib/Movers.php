@@ -437,11 +437,15 @@ final class Movers
         foreach ($out as $i => $r) {
             $sym = (string) $r['symbol'];
             $in  = false;
-            if (isset($pinned[$sym])) {
-                $in = true;
-            } elseif ((int) $r['eligible'] === 1 && $chosen < $size) {
+            if ((int) $r['eligible'] === 1 && $chosen < $size) {
+                // Quota FIRST: a pinned row that is eligible and inside the top N pays for its
+                // slot like any other, so the universe never exceeds `scalp_universe_size`.
                 $in = true;
                 $chosen++;
+            } elseif (isset($pinned[$sym])) {
+                // Fallback only: gated, or ranked outside the quota, but holding a position -
+                // never strand a live position (§3).
+                $in = true;
             }
             $out[$i]['in_universe'] = $in ? 1 : 0;
             $out[$i]['rank']        = $i + 1;
@@ -543,9 +547,10 @@ final class Movers
     }
 
     /**
-     * Symbols worth an exchangeInfo lookup: those whose only complaint is `no_info` (or which
-     * pass outright), best first. Spending the batched call on coins already rejected for being
-     * illiquid or wide would buy nothing.
+     * Symbols worth an exchangeInfo lookup: those whose ONLY complaint is `no_info`, best
+     * first. Spending the batched call on coins already rejected for being illiquid or wide
+     * would buy nothing, and neither would spending it on a row that is already passing -
+     * that row's filters are cached, which is exactly why it has no gate.
      *
      * @return array list of symbols, at most $limit
      */
@@ -557,14 +562,11 @@ final class Movers
                 continue;
             }
             $gates = isset($r['gates']) && is_array($r['gates']) ? $r['gates'] : [];
-            $ok    = true;
-            foreach ($gates as $g) {
-                if ((string) $g !== 'no_info') {
-                    $ok = false;
-                    break;
-                }
-            }
-            if ($ok) {
+            // The row must actually CARRY the gate. A row with `gates === []` has its filters
+            // cached already and needs nothing - counting it would spend the $limit on symbols
+            // topUpInfo() then skips, and since compareRows() sorts every eligible row ahead of
+            // every gated one, a board of cached symbols leaves no slot for a brand-new mover.
+            if (array_values($gates) === ['no_info']) {
                 $out[] = (string) $r['symbol'];
             }
             if (count($out) >= max(1, $limit)) {
