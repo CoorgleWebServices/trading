@@ -5312,6 +5312,63 @@ T::group('panel-csp', ['Panel'], static function (): void {
         . 'assertions above extended to cover it', T::dump($emitters));
 });
 
+T::group('scalp-dust-sweep', ['Scalper', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    // Every round trip strands up to one stepSize: the BUY commission comes out of the base
+    // asset and the remainder is floored to the step. If the SELL only ever sells the position's
+    // own quantity, that crumb stays in the wallet and accumulates on every single trade - and
+    // an untracked base balance is exactly what the survival layer halts on. Measured: 20 round
+    // trips on DOGEUSDT stranded 11.14 DOGE = 0.98 USDT against a minNotional of 1.00, so the
+    // engine halted ITSELF on the 21st trade. An engine that cannot run long enough to produce
+    // a verdict is no use, and the verdict is the whole point of it.
+    $db   = freshDb('scalp-dust-sweep');
+    $info = scalpInfo(['DOGEUSDT']);
+    $md   = new FakeMarketData();
+    $md->setSymbolInfo('DOGEUSDT', $info['DOGEUSDT']);
+    $ex  = new PaperExchange($md, $db, 0.1, 5000.0);
+    $cfg = scalpCfg(['scalp_window' => 4, 'scalp_order_usdt' => 50.0]);
+    $sc  = new Scalper($cfg, $db, $ex, $info);
+
+    $wallet = static function (PaperExchange $ex): float {
+        $r = new ReflectionProperty('PaperExchange', 'balances');
+        $r->setAccessible(true);
+        $b = $r->getValue($ex);
+        return isset($b['DOGE']) ? (float) $b['DOGE'] : 0.0;
+    };
+
+    // 20 real round trips: in at 0.0883 on a dip, out at 0.0920 on the target.
+    for ($i = 0; $i < 20; $i++) {
+        $md->setPrice('DOGEUSDT', 0.088300, 0.088320, 0.088300);
+        $sc->seedWindow('DOGEUSDT', [0.09710, 0.088300, 0.088305]);
+        $sc->poll(['DOGEUSDT' => ['bid' => 0.088300, 'ask' => 0.088320]]);
+        $md->setPrice('DOGEUSDT', 0.092000, 0.092020, 0.092000);
+        $sc->poll(['DOGEUSDT' => ['bid' => 0.092000, 'ask' => 0.092020]]);
+    }
+
+    $closed = count($db->scalpPositions('DOGEUSDT', 'paper', 'CLOSED'));
+    T::eq(20, $closed, 'twenty round trips actually completed - without this the dust assertion '
+        . 'below would pass on an engine that never traded at all');
+
+    $left  = $wallet($ex);
+    $value = $left * 0.0883;
+    $minNotional = (float) $info['DOGEUSDT']['minNotional'];
+    T::ok($value < $minNotional, 'after 20 round trips the stranded DOGE is worth less than '
+        . 'DOGEUSDT minNotional, so the engine cannot halt itself on its own leftovers',
+        sprintf('%.8f DOGE = %.4f USDT vs minNotional %.2f', $left, $value, $minNotional));
+
+    // and it does not creep: the sweep has to hold at ANY trade count, not just the first few
+    T::ok($value < 0.25, 'and it is nowhere near the floor - the dust is swept, not merely slowed',
+        sprintf('%.4f USDT', $value));
+
+    // the sweep must never try to sell coins the wallet does not hold
+    T::ok($left >= 0.0, 'the wallet balance never goes negative', sprintf('%.8f', $left));
+
+    // the money still adds up after all that sweeping
+    $v = Scalper::verdictOf($db, $cfg, 'paper');
+    T::eq(20, (int) $v['trades'], 'the verdict counts all twenty');
+    T::near((float) $v['net'], (float) $v['gross'] - (float) $v['fees'], 1e-9,
+        'and gross - fees = net still reconciles with the dust swept into the sale');
+});
+
 T::group('untracked-halt-floor', ['Bot', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
     // The survival layer halts on a base balance it has no position row for. The threshold used
     // to be the SYMBOL's minNotional alone, which is wrong once the account is more than tiny:

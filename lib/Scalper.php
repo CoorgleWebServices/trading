@@ -1878,7 +1878,20 @@ final class Scalper
         $step = (string) (isset($info['stepSize']) ? $info['stepSize'] : '0.00000001');
         $base = self::baseAsset($sym, self::quoteAsset($this->cfg), $info);
 
-        $wanted = self::num(isset($pos['qty']) ? $pos['qty'] : 0.0);
+        // SWEEP THE DUST. Every round trip strands up to one stepSize: the BUY commission comes
+        // out of the base asset and the remainder is floored to the step, so the crumb stays in
+        // the wallet. Selling only `qty` leaves it there forever, and it accumulates per symbol
+        // on every single trade - at ~0.09 USDT a trade on DOGEUSDT, whose minNotional is 1.00,
+        // the engine used to halt ITSELF on `untracked_position` after about a dozen round
+        // trips. An engine that cannot run long enough to produce a verdict is no use, and the
+        // verdict is the entire point (§2).
+        //
+        // So sell the position's quantity PLUS the dust this symbol has carried, exactly as the
+        // signal engine does (Bot::sellPosition + Bot::dustCarried). Capped at what the wallet
+        // actually holds, so this can never try to sell coins that are not there, and floored to
+        // the step as always. One position per symbol (§4) is what makes this safe: there is no
+        // other scalp row whose base this could take.
+        $wanted = self::num(isset($pos['qty']) ? $pos['qty'] : 0.0) + $this->dustCarried($sym);
         $onHand = $this->baseFree($base);
         $qtyStr = Util::floorToStep($onHand > 0.0 ? min($wanted, $onHand) : $wanted, $step);
         if ((float) $qtyStr <= self::EPS) {
@@ -2039,6 +2052,29 @@ final class Scalper
             'client_id' => $clientId, 'qty' => $r['qty'],
         ]);
         return $r;
+    }
+
+    /**
+     * Base quantity this symbol's closed scalp positions left behind as dust, in the current
+     * mode. Same query and same purpose as Bot::dustCarried(); kept here because Scalper does
+     * not hold a Bot and the two engines must agree on what "carried dust" means.
+     */
+    private function dustCarried(string $symbol): float
+    {
+        try {
+            $st = $this->db->pdo()->prepare(
+                'SELECT COALESCE(SUM(dust_qty), 0) FROM positions WHERE symbol = ? AND mode = ?'
+            );
+            $st->execute([strtoupper(trim($symbol)), $this->mode]);
+            $v = $st->fetchColumn();
+        } catch (Throwable $e) {
+            return 0.0;                 // never let bookkeeping stop a sell
+        }
+        if ($v === false || $v === null || !is_numeric($v)) {
+            return 0.0;
+        }
+        $f = (float) $v;
+        return (is_finite($f) && $f > 0.0) ? $f : 0.0;
     }
 
     private function markStuck(array $pos, string $reason): void
