@@ -49,7 +49,7 @@ register_shutdown_function(static function () use ($tmpRoot): void {
 
 /* ------------------------------------------------------------ lib loading */
 
-$libs = ['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'Sleeve', 'Scanner', 'EngineOrders', 'EngineGrid', 'EnginePmm', 'Learn', 'Bot', 'Panel'];
+$libs = ['Util', 'Db', 'Log', 'Binance', 'Indicators', 'Strategy', 'Risk', 'Exchange', 'Sleeve', 'Scanner', 'EngineOrders', 'EngineGrid', 'EnginePmm', 'Learn', 'Movers', 'Scalper', 'Bot', 'Panel'];
 $missing = [];
 foreach ($libs as $lib) {
     $file = $PROJECT . '/lib/' . $lib . '.php';
@@ -5109,6 +5109,713 @@ T::group('learn-neutral', ['Bot', 'PaperExchange', 'FakeMarketData', 'Db', 'Stra
     // ... and it did capture, otherwise the equality above would prove nothing
     T::eq(4, (int) $on['observations'], 'capture on wrote the four observations of the two evaluations');
     T::eq(0, (int) $off['observations'], 'capture off wrote none');
+});
+
+/* ============================================================ scalp engine
+ *
+ * docs/DESIGN-SCALP.md §10. The two groups the user explicitly asked for are `scalp-breaker`
+ * and `scalp-budget`; the others pin down the ranking, the entry and exit rules, the
+ * gross/fees/net accounting and the demo-only guard.
+ *
+ * Every group drives the PUBLIC surface only - poll(), seedWindow(), run(), entryDecision(),
+ * exitReason(), symbolLedger(), verdictOf(), scoreboardOf() - and against a real PaperExchange,
+ * so an order that slipped past a gate would really be recorded in `positions`. That is what
+ * makes "0 orders placed" mean something rather than being a test that never reached an entry.
+ */
+
+/** Config for the scalp groups. `scalp_window` is deliberately small so a poll can fill it. */
+function scalpCfg(array $over = []): array
+{
+    return array_merge([
+        'enabled' => true, 'engine' => 'scalp', 'mode' => 'paper', 'quote_asset' => 'USDT',
+        'symbols' => ['DOGEUSDT'], 'fee_pct' => 0.1,
+        'scalp_order_usdt' => 20.0, 'scalp_budget_per_symbol' => 100.0, 'scalp_budgets' => [],
+        'scalp_max_consecutive_losses' => 3, 'scalp_max_open' => 6,
+        'scalp_tp_pct' => 0.25, 'scalp_sl_pct' => 0.20, 'scalp_max_hold_sec' => 120,
+        'scalp_dip_pct' => 0.15, 'scalp_window' => 4, 'scalp_poll_sec' => 1,
+        'scalp_run_seconds' => 2, 'scalp_max_trades_per_hour' => 60,
+        'scalp_universe_size' => 20, 'scalp_min_quote_vol' => 20000000.0,
+        'scalp_min_trade_count' => 50000, 'scalp_max_spread_pct' => 0.05,
+        'scalp_universe_refresh_min' => 10, 'scalp_exclude' => ['USDCUSDT'],
+        'equity_floor_usdt' => 5.0, 'max_consecutive_losses' => 99, 'max_trades_per_day' => 99,
+        'daily_loss_cap_pct' => 50.0, 'weekly_loss_cap_pct' => 90.0, 'allow_live_engines' => false,
+    ], $over);
+}
+
+/**
+ * A full set of symbol filters for the scalp groups. FakeMarketData::SYMBOL_INFO carries no
+ * `status` / `spotAllowed`, which Movers (like Scanner) requires before it will rank a symbol,
+ * so the groups that exercise the ranking supply their own.
+ */
+function scalpInfo(array $symbols): array
+{
+    $out = [];
+    foreach ($symbols as $sym) {
+        $base = isset(FakeMarketData::SYMBOL_INFO[$sym]) ? FakeMarketData::SYMBOL_INFO[$sym] : [];
+        $out[$sym] = array_merge([
+            'base' => substr($sym, 0, strlen($sym) - 4), 'quote' => 'USDT',
+            'status' => 'TRADING', 'spotAllowed' => true,
+            'stepSize' => '0.00100000', 'minQty' => '0.00100000', 'minNotional' => 5.0,
+            'tickSize' => '0.00001000',
+        ], $base);
+        $out[$sym]['status']      = 'TRADING';
+        $out[$sym]['spotAllowed'] = true;
+        $out[$sym]['quote']       = 'USDT';
+    }
+    return $out;
+}
+
+/** A CLOSED scalp position, as the engine would have left it. */
+function scalpClosed(Db $db, string $sym, float $gross, float $fees, string $mode = 'paper'): int
+{
+    return $db->insertPosition([
+        'mode' => $mode, 'engine' => 'scalp', 'symbol' => $sym, 'status' => 'CLOSED',
+        'qty' => 10.0, 'entry_price' => 1.0, 'entry_eff' => 1.0, 'entry_quote' => 10.0,
+        'entry_fee_usdt' => $fees / 2, 'exit_price' => 1.0, 'exit_quote' => 10.0,
+        'exit_fee_usdt' => $fees / 2, 'gross_usdt' => $gross, 'fees_usdt' => $fees,
+        'pnl_usdt' => $gross - $fees, 'stop_price' => 0.9, 'take_profit_price' => 1.1,
+        'trail_high' => 1.0, 'opened_at' => Util::nowIso(), 'closed_at' => Util::nowIso(),
+    ]);
+}
+
+/** An OPEN scalp position holding $quote of its symbol's budget. */
+function scalpOpen(Db $db, string $sym, float $quote, string $mode = 'paper'): int
+{
+    return $db->insertPosition([
+        'mode' => $mode, 'engine' => 'scalp', 'symbol' => $sym, 'status' => 'OPEN',
+        'qty' => 10.0, 'entry_price' => 1.0, 'entry_eff' => 1.0, 'entry_quote' => $quote,
+        'entry_fee_usdt' => 0.01, 'stop_price' => 0.9, 'take_profit_price' => 1.1,
+        'trail_high' => 1.0, 'opened_at' => Util::nowIso(),
+    ]);
+}
+
+/**
+ * A scalp engine wired to a real PaperExchange, with every symbol quoted at 1.0001 / 1.0002 and
+ * a window one tick short of full - so the next poll() completes the buffer and sees a dip from
+ * the seeded high. poll() pushes its own mid BEFORE deciding, so seeding a FULL window would
+ * push the high out and the dip would vanish.
+ *
+ * @return array [Scalper, FakeMarketData, PaperExchange, books]
+ */
+function scalpRig(Db $db, array $symbols, array $cfg, float $start = 5000.0): array
+{
+    $info = scalpInfo($symbols);
+    $md   = new FakeMarketData();
+    $books = [];
+    foreach ($symbols as $sym) {
+        $md->setSymbolInfo($sym, $info[$sym]);
+        $md->setPrice($sym, 1.0001, 1.0002, 1.0001);
+        $books[$sym] = ['bid' => 1.0001, 'ask' => 1.0002];
+    }
+    $ex = new PaperExchange($md, $db, (float) $cfg['fee_pct'], $start);
+    $sc = new Scalper($cfg, $db, $ex, $info);
+    foreach ($symbols as $sym) {
+        $sc->seedWindow($sym, [1.10, 1.00, 1.0001]);
+    }
+    return [$sc, $md, $ex, $books];
+}
+
+/** Re-seed every window so the next poll() will want to enter again. */
+function scalpReseed(Scalper $sc, FakeMarketData $md, array $symbols): array
+{
+    $books = [];
+    foreach ($symbols as $sym) {
+        $sc->seedWindow($sym, [1.10, 1.00, 1.0001]);
+        $md->setPrice($sym, 1.0001, 1.0002, 1.0001);
+        $books[$sym] = ['bid' => 1.0001, 'ask' => 1.0002];
+    }
+    return $books;
+}
+
+/** Move every symbol to one price and return the matching books. */
+function scalpMove(FakeMarketData $md, array $symbols, float $bid, float $ask): array
+{
+    $books = [];
+    foreach ($symbols as $sym) {
+        $md->setPrice($sym, $bid, $ask, $bid);
+        $books[$sym] = ['bid' => $bid, 'ask' => $ask];
+    }
+    return $books;
+}
+
+T::group('scalp-movers', ['Movers', 'Risk', 'Util'], static function (): void {
+    $cfg = scalpCfg();
+    // A hand-built board. Each row is one thing the ranking has to get right.
+    $t = [
+        // a liquid mover with many trades and a tight book: must come out on top
+        ['symbol' => 'GOODUSDT', 'last' => 10.0, 'bid' => 9.999, 'ask' => 10.001,
+         'high' => 10.4, 'low' => 9.6, 'quote_vol' => 500000000.0, 'count' => 3000000, 'change_pct' => 1.0],
+        // the same range, but hardly anyone trades it: the 35 % trade-count term must sink it
+        ['symbol' => 'THINUSDT', 'last' => 10.0, 'bid' => 9.999, 'ask' => 10.001,
+         'high' => 10.4, 'low' => 9.6, 'quote_vol' => 500000000.0, 'count' => 60000, 'change_pct' => 1.0],
+        // a bigger range than either, but below the trade-count floor: GATED, never ranked above
+        ['symbol' => 'QUIETUSDT', 'last' => 10.0, 'bid' => 9.999, 'ask' => 10.001,
+         'high' => 12.0, 'low' => 8.0, 'quote_vol' => 500000000.0, 'count' => 100, 'change_pct' => 1.0],
+        // a huge range and plenty of trades, but a 0.2 % book: GATED spread_wide
+        ['symbol' => 'WIDEUSDT', 'last' => 10.0, 'bid' => 9.99, 'ask' => 10.01,
+         'high' => 12.0, 'low' => 8.0, 'quote_vol' => 500000000.0, 'count' => 3000000, 'change_pct' => 1.0],
+        // volatile but illiquid: GATED illiquid
+        ['symbol' => 'ILLIQUSDT', 'last' => 10.0, 'bid' => 9.999, 'ask' => 10.001,
+         'high' => 12.0, 'low' => 8.0, 'quote_vol' => 400000.0, 'count' => 3000000, 'change_pct' => 1.0],
+        // rose 5 % and stayed there: a big change_pct with NO range. Must not outrank GOODUSDT -
+        // this is the whole reason the score uses range and not change_pct.
+        ['symbol' => 'DRIFTUSDT', 'last' => 10.0, 'bid' => 9.999, 'ask' => 10.001,
+         'high' => 10.02, 'low' => 9.98, 'quote_vol' => 500000000.0, 'count' => 3000000, 'change_pct' => 5.0],
+        // leveraged tokens and the excluded stablecoin pair: DROPPED outright, not gated
+        ['symbol' => 'BTCUPUSDT', 'last' => 10.0, 'bid' => 9.999, 'ask' => 10.001,
+         'high' => 12.0, 'low' => 8.0, 'quote_vol' => 500000000.0, 'count' => 3000000, 'change_pct' => 1.0],
+        ['symbol' => 'ETHBULLUSDT', 'last' => 10.0, 'bid' => 9.999, 'ask' => 10.001,
+         'high' => 12.0, 'low' => 8.0, 'quote_vol' => 500000000.0, 'count' => 3000000, 'change_pct' => 1.0],
+        ['symbol' => 'USDCUSDT', 'last' => 1.0, 'bid' => 0.9999, 'ask' => 1.0001,
+         'high' => 1.002, 'low' => 0.998, 'quote_vol' => 900000000.0, 'count' => 3000000, 'change_pct' => 0.01],
+        // a real coin whose base merely ENDS in "UP": must survive
+        ['symbol' => 'JUPUSDT', 'last' => 10.0, 'bid' => 9.999, 'ask' => 10.001,
+         'high' => 10.3, 'low' => 9.7, 'quote_vol' => 500000000.0, 'count' => 2000000, 'change_pct' => 1.0],
+        // another quote asset entirely: dropped
+        ['symbol' => 'ETHBTC', 'last' => 0.05, 'bid' => 0.0499, 'ask' => 0.0501,
+         'high' => 0.06, 'low' => 0.04, 'quote_vol' => 500000000.0, 'count' => 3000000, 'change_pct' => 1.0],
+    ];
+    $syms = ['GOODUSDT', 'THINUSDT', 'QUIETUSDT', 'WIDEUSDT', 'ILLIQUSDT', 'DRIFTUSDT', 'JUPUSDT'];
+    $info = scalpInfo($syms);
+    // a leveraged token with filters, to prove the drop is on the NAME not on missing info
+    $info['BTCUPUSDT'] = scalpInfo(['BTCUPUSDT'])['BTCUPUSDT'];
+
+    $rows = Movers::rank($t, $info, $cfg);
+    $by   = [];
+    foreach ($rows as $r) {
+        $by[$r['symbol']] = $r;
+    }
+
+    // ---- dropped outright
+    T::eq(false, isset($by['BTCUPUSDT']), 'BTCUPUSDT is dropped as a leveraged token');
+    T::eq(false, isset($by['ETHBULLUSDT']), 'ETHBULLUSDT is dropped as a leveraged token');
+    T::eq(false, isset($by['USDCUSDT']), 'the excluded stablecoin pair is dropped');
+    T::eq(false, isset($by['ETHBTC']), 'a pair in another quote asset is dropped');
+    T::eq(true, isset($by['JUPUSDT']), 'JUPUSDT is a real coin and survives the leveraged test');
+
+    // ---- gated, not dropped: the row is kept so the panel can explain the rejection
+    T::eq(true, isset($by['QUIETUSDT']), 'a thin-trade coin is KEPT, not dropped');
+    T::contains($by['QUIETUSDT']['gates'], 'thin_trades', 'and carries the thin_trades gate');
+    T::eq(0, (int) $by['QUIETUSDT']['eligible'], 'it is not eligible');
+    T::eq(0.0, (float) $by['QUIETUSDT']['score'], 'a gated row scores 0, whatever its range');
+    T::contains($by['WIDEUSDT']['gates'], 'spread_wide', 'a 0.2 % book is gated spread_wide');
+    T::contains($by['ILLIQUSDT']['gates'], 'illiquid', 'a 0.4 M volume coin is gated illiquid');
+
+    // ---- the ranking itself
+    T::eq('GOODUSDT', (string) $rows[0]['symbol'], 'the liquid, heavily traded mover ranks first');
+    T::ok((float) $by['GOODUSDT']['score'] > (float) $by['THINUSDT']['score'],
+        'the same range with 50x fewer trades scores lower (the "many traders" term bites)');
+    T::ok((float) $by['GOODUSDT']['score'] > (float) $by['DRIFTUSDT']['score'],
+        'a 5 % one-way drift with no range scores BELOW a 8 % intraday range: '
+        . 'the board scores range, not change_pct');
+    T::ok((int) $by['GOODUSDT']['rank'] < (int) $by['QUIETUSDT']['rank'],
+        'every eligible row outranks every gated one');
+
+    // ---- the metrics the user asked to see
+    T::near(8.0, (float) $by['GOODUSDT']['range_pct'], 1e-6, 'range_pct is (high - low) / last');
+    T::eq(3000000, (int) $by['GOODUSDT']['trade_count'], 'the 24 h trade count is carried through');
+    T::ok((float) $by['GOODUSDT']['spread_pct'] > 0.0 && (float) $by['GOODUSDT']['spread_pct'] < 0.05,
+        'the spread is measured and inside the limit');
+
+    // ---- determinism: the same input gives byte-identical output
+    T::eq(json_encode($rows), json_encode(Movers::rank($t, $info, $cfg)),
+        'rank() is deterministic on a fixture');
+
+    // ---- the universe
+    $uni = Movers::universeOf($rows);
+    T::contains($uni, 'GOODUSDT', 'the top mover is in the traded universe');
+    T::eq(false, in_array('QUIETUSDT', $uni, true), 'a gated coin is never in the universe');
+    $small = Movers::rank($t, $info, scalpCfg(['scalp_universe_size' => 2]));
+    T::eq(2, count(Movers::universeOf($small)), 'scalp_universe_size caps the universe at 2');
+
+    // ---- a symbol holding a position stays in the universe even when it ranks nowhere
+    $pinned = Movers::rank($t, $info, scalpCfg(['scalp_universe_size' => 1]), ['QUIETUSDT']);
+    T::contains(Movers::universeOf($pinned), 'QUIETUSDT',
+        'a GATED symbol holding an open position is still pinned into the universe - '
+        . 'dropping it would strand that position');
+
+    // ---- fail open on a feed with no trade counts: a missing field must not halt all trading
+    $noCount = [];
+    foreach ($t as $row) {
+        unset($row['count']);
+        $noCount[] = $row;
+    }
+    $nc = Movers::rank($noCount, $info, $cfg);
+    $ncUni = Movers::universeOf($nc);
+    T::ok($ncUni !== [], 'a feed carrying no trade counts still produces a universe '
+        . '(the floor fails OPEN rather than gating every symbol on the exchange)');
+});
+
+T::group('scalp-entry', ['Scalper', 'Util'], static function (): void {
+    $cfg = scalpCfg(['scalp_window' => 4, 'scalp_dip_pct' => 0.15, 'scalp_max_spread_pct' => 0.05]);
+    $full = [1.10, 1.00, 1.0001, 1.00015];      // dip from 1.10, last two rising
+
+    T::eq('', Scalper::entryDecision($full, 1.0001, 1.0002, $cfg), 'a full window with a dip and a turn enters');
+    T::eq('window_warming', Scalper::entryDecision([1.10, 1.00], 1.0001, 1.0002, $cfg),
+        'a partial window never enters - there is no high to dip from');
+    T::eq('no_dip', Scalper::entryDecision([1.0000, 1.00005, 1.0001, 1.00015], 1.0001, 1.0002, $cfg),
+        'no pullback from the window high means no entry');
+    T::eq('no_turn', Scalper::entryDecision([1.10, 1.00, 1.0002, 1.0001], 1.0001, 1.0002, $cfg),
+        'a falling last two ticks means no entry, however deep the dip');
+    T::eq('spread_wide', Scalper::entryDecision($full, 1.00, 1.01, $cfg),
+        'a wide book is refused: the round trip pays the spread before the price moves');
+    T::eq('no_book', Scalper::entryDecision($full, 0.0, 1.0002, $cfg), 'no bid means no entry');
+    T::eq('no_book', Scalper::entryDecision($full, 1.0002, 1.0001, $cfg), 'a crossed book means no entry');
+});
+
+T::group('scalp-exit', ['Scalper', 'Util'], static function (): void {
+    $cfg = scalpCfg(['scalp_tp_pct' => 0.25, 'scalp_sl_pct' => 0.20, 'scalp_max_hold_sec' => 120]);
+    $now = '2026-09-03T12:00:00Z';
+    // entry_eff is the dust-excluded basis that already carries the BUY fee. Every threshold is
+    // measured against IT, on the BID, because that is what a sale actually receives.
+    $pos = ['entry_eff' => 100.0, 'entry_price' => 99.9, 'opened_at' => '2026-09-03T11:59:30Z'];
+
+    T::eq('', Scalper::exitReason($pos, 100.1, $cfg, $now), '+0.10 % holds');
+    T::eq('scalp_tp', Scalper::exitReason($pos, 100.25, $cfg, $now), 'the bid at +0.25 % of entry_eff takes profit');
+    T::eq('scalp_sl', Scalper::exitReason($pos, 99.80, $cfg, $now), 'the bid at -0.20 % of entry_eff stops out');
+    T::eq('', Scalper::exitReason($pos, 100.20, $cfg, $now),
+        '+0.20 % is NOT a take-profit: the target is against entry_eff, not the raw fill');
+    // measured against the raw fill (99.9) a bid of 100.15 would be +0.25 % and would "win"
+    T::eq('', Scalper::exitReason($pos, 100.15, $cfg, $now),
+        'a bid that is +0.25 % on the raw FILL but only +0.15 % on entry_eff does NOT take profit - '
+        . 'booking that would be a profit the round trip never produced');
+    $old = ['entry_eff' => 100.0, 'entry_price' => 99.9, 'opened_at' => '2026-09-03T11:57:00Z'];
+    T::eq('scalp_timeout', Scalper::exitReason($old, 100.1, $cfg, $now),
+        'a position past scalp_max_hold_sec times out even while it is up');
+    T::eq('scalp_tp', Scalper::exitReason($old, 100.30, $cfg, $now),
+        'but the take-profit still wins over the timeout');
+});
+
+T::group('scalp-breaker', ['Scalper', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    // THE GROUP THE USER ASKED FOR: "if it is like 5 or 10 consecutive loss, then it should
+    // pause and ask me to resume". Driven through real fills on a real PaperExchange.
+    $db   = freshDb('scalp-breaker');
+    $syms = ['DOGEUSDT', 'XRPUSDT', 'ADAUSDT', 'SOLUSDT'];
+    $cfg  = scalpCfg(['scalp_max_consecutive_losses' => 3]);
+    [$sc, $md, $ex, $books] = scalpRig($db, $syms, $cfg);
+
+    T::eq(false, $sc->paused(), 'starts unpaused');
+    T::eq(3, $sc->lossLimit(), 'the limit is read from scalp_max_consecutive_losses');
+
+    // open on every symbol, then stop them all out
+    $in = $sc->poll($books);
+    T::ok((int) $in['entries'] >= 3, 'the first poll opened positions across symbols',
+        T::dump($in['entries']));
+    $low = scalpMove($md, $syms, 0.95, 0.9501);
+    $out = $sc->poll($low);
+    T::ok((int) $out['exits'] >= 3, 'they all stopped out', T::dump($out['exits']));
+    T::ok((float) $out['net_usdt'] < 0.0, 'at a net loss', T::dump($out['net_usdt']));
+
+    T::ok($sc->lossStreak() >= 3, 'the losing streak reached the limit', T::dump($sc->lossStreak()));
+    T::eq(true, $sc->paused(), 'the breaker PAUSED the engine by itself - nothing in this test paused it');
+    T::strContains($sc->pauseReason(), 'losing trades in a row', 'the pause reason names the streak');
+    T::eq('loss_breaker', $sc->entryBlock(), 'entryBlock() reports loss_breaker');
+
+    // the load-bearing assertion: a paused engine places NO order on a window that says enter
+    $again = scalpReseed($sc, $md, $syms);
+    $before = count($db->scalpPositions(null, 'paper'));
+    $held   = $sc->poll($again);
+    T::eq(0, (int) $held['entries'], 'a PAUSED poll opened 0 positions');
+    T::eq($before, count($db->scalpPositions(null, 'paper')), 'and wrote no new position row');
+    T::strContains(json_encode($held['refusals']), 'loss_breaker', 'the refusal is attributed to the breaker');
+
+    // it does not clear itself
+    $fresh = new Scalper($cfg, $db, $ex, scalpInfo($syms));
+    T::eq(true, $fresh->paused(), 'the pause survives a new engine instance - it lives in the database');
+
+    // ... and the global kill switch still overrides, independently of the breaker
+    $fresh->resume();
+    T::eq(false, $fresh->paused(), 'resume() lifts the pause');
+    T::eq(0, $fresh->lossStreak(), 'and resets the streak to 0');
+    $db->setState('halted', '1');
+    $db->setState('halt_reason', 'equity_floor');
+    $halted = new Scalper($cfg, $db, $ex, scalpInfo($syms));
+    $r = $halted->run();
+    T::eq(0, (int) $r['entries'], 'with the GLOBAL kill switch on, the scalp engine opens nothing either');
+    $db->setState('halted', null);
+    $db->setState('halt_reason', null);
+
+    // a win resets the streak
+    $sc2 = new Scalper($cfg, $db, $ex, scalpInfo($syms));
+    $b2 = scalpReseed($sc2, $md, $syms);
+    $e2 = $sc2->poll($b2);
+    T::ok((int) $e2['entries'] >= 1, 'entries are allowed again after the resume', T::dump($e2['entries']));
+    $db->setState('scalp_losses', 2);                 // two losses preceded this trade
+    $hi = scalpMove($md, $syms, 1.10, 1.1001);
+    $w  = $sc2->poll($hi);
+    T::ok((int) $w['exits'] >= 1, 'the position closed at the target', T::dump($w['exits']));
+    T::ok((float) $w['net_usdt'] > 0.0, 'it was a win', T::dump($w['net_usdt']));
+    T::eq(0, $sc2->lossStreak(), 'ANY win resets the consecutive-loss counter to 0');
+    T::eq(false, $sc2->paused(), 'and the engine is not paused');
+});
+
+T::group('scalp-breaker-manages-open', ['Scalper', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    // While entries are paused, an OPEN position must still be managed to its exit. Abandoning
+    // a position would be worse than the losing streak that paused the engine.
+    $db  = freshDb('scalp-open');
+    $cfg = scalpCfg();
+    [$sc, $md, $ex, $books] = scalpRig($db, ['DOGEUSDT'], $cfg);
+
+    $r = $sc->poll($books);
+    T::eq(1, (int) $r['entries'], 'one position is open');
+    $open = $db->scalpPositions('DOGEUSDT', 'paper', 'OPEN');
+    T::eq(1, count($open), 'and it is in the positions table');
+    $pid = (int) $open[0]['id'];
+
+    $db->setState('scalp_paused', '1');
+    $paused = new Scalper($cfg, $db, $ex, scalpInfo(['DOGEUSDT']));
+    T::eq(true, $paused->paused(), 'the engine is paused');
+    $low = scalpMove($md, ['DOGEUSDT'], 0.95, 0.9501);
+    $r2  = $paused->poll($low);
+
+    T::eq(0, (int) $r2['entries'], 'the paused engine opened nothing');
+    T::eq(1, (int) $r2['exits'], 'but it STILL exited the open position');
+    $row = $db->position($pid);
+    T::eq('CLOSED', (string) $row['status'], 'the position is closed, not abandoned');
+    T::eq('scalp_sl', (string) $row['exit_reason'], 'it closed on its stop');
+});
+
+T::group('scalp-budget', ['Scalper', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    // THE OTHER GROUP THE USER ASKED FOR: "I should be able to set a budget for each and every
+    // trading thing ... by default let it be $100 ... we'll see which one is making profit."
+    $db  = freshDb('scalp-budget');
+    $cfg = scalpCfg(['scalp_budgets' => ['DOGEUSDT' => 50.0, 'BTCUSDT' => 250.0]]);
+
+    T::near(100.0, Scalper::budgetFor($cfg, 'SOLUSDT'), 1e-9, 'the default budget is 100 USDT');
+    T::near(50.0, Scalper::budgetFor($cfg, 'DOGEUSDT'), 1e-9, 'a per-symbol override beats the default');
+    T::near(250.0, Scalper::budgetFor($cfg, 'btcusdt'), 1e-9, 'the override is case-insensitive');
+    T::near(77.0, Scalper::budgetFor(scalpCfg(['scalp_budgets' => '{"XRPUSDT":77}']), 'XRPUSDT'), 1e-9,
+        'a JSON-string budgets map is accepted (that is what the panel form posts)');
+
+    // the invariant: available is never negative, NaN or infinite
+    T::eq(100.0, Scalper::available(100.0, 0.0, 0.0), 'available(100, 0, 0) = 100');
+    T::eq(70.0, Scalper::available(100.0, 0.0, 30.0), '30 deployed leaves 70');
+    T::eq(0.0, Scalper::available(100.0, -500.0, 0.0), 'a deeply underwater symbol clamps to 0, never negative');
+    T::eq(0.0, Scalper::available(0.0, 0.0, 0.0), 'a zero budget gives 0');
+    T::ok(is_finite(Scalper::available(INF, NAN, INF)), 'available() is finite even on INF / NAN input');
+
+    $empty = Scalper::symbolLedger($db, $cfg, 'SOLUSDT', 'paper');
+    T::eq(100.0, (float) $empty['available'], 'an untraded symbol has its whole budget available');
+    T::eq(0, (int) $empty['trades'], 'and no trades');
+    T::eq(null, $empty['win_rate'], 'win_rate is null, not 0 % - "no trades" and "never won" are different claims');
+
+    // one symbol loses its pot; the others must be untouched
+    for ($i = 0; $i < 30; $i++) {
+        scalpClosed($db, 'SOLUSDT', -10.0, 1.0);
+    }
+    $broke = Scalper::symbolLedger($db, $cfg, 'SOLUSDT', 'paper');
+    T::eq(0.0, (float) $broke['available'], 'the broke symbol has nothing left to spend');
+    T::eq(30, (int) $broke['trades'], 'its 30 trades are counted');
+    T::eq(30, (int) $broke['losses'], 'all 30 as losses');
+    $other = Scalper::symbolLedger($db, $cfg, 'DOGEUSDT', 'paper');
+    T::eq(50.0, (float) $other['available'], 'another symbol is completely untouched by it');
+    T::eq(0, (int) $other['trades'], 'and has traded nothing');
+
+    // an open position deploys only its own symbol's budget
+    $db2 = freshDb('scalp-budget-open');
+    scalpOpen($db2, 'XRPUSDT', 30.0);
+    $held = Scalper::symbolLedger($db2, $cfg, 'XRPUSDT', 'paper');
+    T::eq(30.0, (float) $held['deployed'], 'the open position deploys 30');
+    T::eq(70.0, (float) $held['available'], 'leaving 70 of its own pot');
+    $untouched = Scalper::symbolLedger($db2, $cfg, 'ADAUSDT', 'paper');
+    T::eq(0.0, (float) $untouched['deployed'], 'and deploys NOTHING from any other symbol');
+    T::eq(100.0, (float) $untouched['available'], 'whose budget is intact');
+
+    // a close returns the capital to that symbol
+    $db3 = freshDb('scalp-budget-close');
+    scalpClosed($db3, 'XRPUSDT', 0.40, 0.02);
+    $after = Scalper::symbolLedger($db3, $cfg, 'XRPUSDT', 'paper');
+    T::eq(0.0, (float) $after['deployed'], 'after the close nothing is deployed');
+    T::near(100.38, (float) $after['available'], 1e-9, 'and the profit is added to its pot');
+
+    // paper and live ledgers are separate
+    $db4 = freshDb('scalp-budget-mode');
+    for ($i = 0; $i < 10; $i++) {
+        scalpClosed($db4, 'SOLUSDT', -20.0, 1.0, 'live');
+    }
+    $paper = Scalper::symbolLedger($db4, $cfg, 'SOLUSDT', 'paper');
+    T::eq(100.0, (float) $paper['available'], 'live losses do not drain the paper budget');
+
+    // the scoreboard's nets must sum to the verdict's net, or the card is lying
+    $db5 = freshDb('scalp-budget-board');
+    scalpClosed($db5, 'DOGEUSDT', 0.40, 0.02);
+    scalpClosed($db5, 'XRPUSDT', -0.30, 0.02);
+    scalpClosed($db5, 'SOLUSDT', -0.10, 0.02);
+    $board = Scalper::scoreboardOf($db5, $cfg, 'paper', []);
+    $v     = Scalper::verdictOf($db5, $cfg, 'paper');
+    $sum   = 0.0;
+    foreach ($board as $row) {
+        $sum += (float) $row['net'];
+    }
+    T::near((float) $v['net'], $sum, 1e-9, "the scoreboard's per-symbol nets sum to the run's net");
+    T::eq(3, (int) $v['trades'], 'the verdict counts every closed trade');
+    T::near((float) $v['net'], (float) $v['gross'] - (float) $v['fees'], 1e-9,
+        'the verdict reconciles: gross - fees = net');
+
+    // ---- and now the part that matters: the budget REFUSES a real entry.
+    // Two symbols, same price path, same window, same poll. Only the budget differs.
+    $db6 = freshDb('scalp-budget-refuse');
+    for ($i = 0; $i < 11; $i++) {
+        scalpClosed($db6, 'XRPUSDT', -10.0, 0.5);      // XRPUSDT has spent its whole 100
+    }
+    $c6 = scalpCfg();
+    T::eq(0.0, (float) Scalper::symbolLedger($db6, $c6, 'XRPUSDT', 'paper')['available'],
+        'setup: XRPUSDT has 0 available');
+    T::eq(100.0, (float) Scalper::symbolLedger($db6, $c6, 'DOGEUSDT', 'paper')['available'],
+        'setup: DOGEUSDT has 100 available');
+
+    [$sc6, $md6, $ex6, $books6] = scalpRig($db6, ['XRPUSDT', 'DOGEUSDT'], $c6);
+    $r6 = $sc6->poll($books6);
+    T::eq(0, count($db6->scalpPositions('XRPUSDT', 'paper', 'OPEN')),
+        'the symbol that spent its pot opened 0 positions');
+    T::eq(1, count($db6->scalpPositions('DOGEUSDT', 'paper', 'OPEN')),
+        'the symbol with its pot intact opened 1 - so the gate is PER SYMBOL, not global: '
+        . 'one bad coin stops on its own while the others carry on');
+    T::strContains(json_encode($r6['refusals']), 'symbol_budget',
+        'and the refusal is reported as symbol_budget');
+});
+
+T::group('scalp-pnl', ['Scalper', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    // §2: gross, fees and net must reconcile per trade and in the run summary, and gross must
+    // never silently equal net. Everything the user will be told about profit rests on this.
+    $db  = freshDb('scalp-pnl');
+    $cfg = scalpCfg();
+    [$sc, $md, $ex, $books] = scalpRig($db, ['DOGEUSDT'], $cfg);
+
+    $sc->poll($books);
+    $hi = scalpMove($md, ['DOGEUSDT'], 1.10, 1.1001);
+    $r  = $sc->poll($hi);
+    T::eq(1, (int) $r['exits'], 'the position closed');
+
+    $row = $db->scalpPositions('DOGEUSDT', 'paper', 'CLOSED')[0];
+    $g = (float) $row['gross_usdt'];
+    $f = (float) $row['fees_usdt'];
+    $n = (float) $row['pnl_usdt'];
+    T::near($n, $g - $f, 1e-9, 'per trade: gross - fees = net (= pnl_usdt)');
+    T::ok($f > 0.0, 'fees were actually charged', T::dump($f));
+    T::ok(abs($g - $n) > 1e-9, 'gross is NOT silently equal to net');
+    T::near($n, (float) $r['net_usdt'], 1e-9, "the poll's net matches the stored trade");
+    T::near($g, (float) $r['gross_usdt'], 1e-9, "the poll's gross matches too");
+    T::near($f, (float) $r['fees_usdt'], 1e-9, 'and its fees');
+
+    // the fees are both sides, not just the sell
+    T::ok($f >= (float) $row['entry_fee_usdt'] + (float) $row['exit_fee_usdt'] - 1e-9,
+        'fees_usdt covers the buy commission as well as the sell');
+
+    $v = Scalper::verdictOf($db, $cfg, 'paper');
+    T::eq(1, (int) $v['trades'], 'the verdict sees the one trade');
+    T::near($n, (float) $v['net'], 1e-9, 'and the same net');
+    T::ok($v['breakeven_win_rate'] !== null, 'the verdict carries a break-even win rate');
+    T::near(66.67, (float) $v['breakeven_win_rate'], 0.1,
+        'at tp 0.25 / sl 0.20 / fee 0.1 that rate is about 67 % - the honest cost of this strategy');
+});
+
+T::group('scalp-guard', ['Scalper', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    // Demo-only, the hourly cap, and the loop's own time budget.
+    $db   = freshDb('scalp-guard');
+    $syms = ['DOGEUSDT'];
+    $info = scalpInfo($syms);
+    $md   = new FakeMarketData();
+    $md->setSymbolInfo('DOGEUSDT', $info['DOGEUSDT']);
+    $md->setPrice('DOGEUSDT', 1.0001, 1.0002, 1.0001);
+    $paper = new PaperExchange($md, $db, 0.1, 5000.0);
+    $books = ['DOGEUSDT' => ['bid' => 1.0001, 'ask' => 1.0002]];
+
+    // A decorator over the REAL paper exchange that only lies about mode(). Everything else is
+    // real, so an order that slipped through would really be written to `positions` - which is
+    // what makes "0 orders" below mean something.
+    $live = new class($paper) implements ExchangeInterface {
+        private $inner;
+        public function __construct($inner)
+        {
+            $this->inner = $inner;
+        }
+        public function mode(): string
+        {
+            return 'live';
+        }
+        public function api(): ?Binance
+        {
+            return $this->inner->api();
+        }
+        public function klines(string $s, string $i, int $l): array
+        {
+            return $this->inner->klines($s, $i, $l);
+        }
+        public function prices(array $s): array
+        {
+            return $this->inner->prices($s);
+        }
+        public function bookTicker(string $s): array
+        {
+            return $this->inner->bookTicker($s);
+        }
+        public function symbolInfo(array $s): array
+        {
+            return $this->inner->symbolInfo($s);
+        }
+        public function syncTime(): int
+        {
+            return $this->inner->syncTime();
+        }
+        public function serverTimeMs(): int
+        {
+            return $this->inner->serverTimeMs();
+        }
+        public function ticker24h(array $s = []): array
+        {
+            return $this->inner->ticker24h($s);
+        }
+        public function account(): array
+        {
+            return $this->inner->account();
+        }
+        public function marketBuy(string $sy, float $q, array $i, string $c): array
+        {
+            return $this->inner->marketBuy($sy, $q, $i, $c);
+        }
+        public function marketSell(string $sy, string $q, array $i, string $c): array
+        {
+            return $this->inner->marketSell($sy, $q, $i, $c);
+        }
+        public function getOrder(string $sy, string $c): ?array
+        {
+            return $this->inner->getOrder($sy, $c);
+        }
+    };
+
+    $blocked = new Scalper(scalpCfg(['mode' => 'live', 'allow_live_engines' => false]), $db, $live, $info);
+    T::eq(true, $blocked->liveBlocked(), 'live without allow_live_engines is blocked');
+    $run = $blocked->run();
+    T::eq('halted', (string) $run['status'], 'run() halts instead of trading');
+    T::eq(0, count($db->scalpPositions(null, 'live')), 'run() created ZERO positions');
+    $blocked->seedWindow('DOGEUSDT', [1.10, 1.00, 1.0001]);
+    $pr = $blocked->poll($books);
+    T::eq(0, (int) $pr['entries'], 'a direct poll() places no order either');
+    T::eq(0, count($db->scalpPositions(null, 'live')), 'still ZERO positions');
+
+    // the control: the SAME path does trade once live is allowed, so the test is not vacuous
+    $allowed = new Scalper(scalpCfg(['mode' => 'live', 'allow_live_engines' => true]), $db, $live, $info);
+    T::eq(false, $allowed->liveBlocked(), 'allow_live_engines lifts the block');
+    $allowed->seedWindow('DOGEUSDT', [1.10, 1.00, 1.0001]);
+    T::eq(1, (int) $allowed->poll($books)['entries'],
+        'and the same entry path then places exactly 1 order - so "0 orders" above was the guard, '
+        . 'not a test that never reached an entry');
+
+    // the hourly cap
+    $db2 = freshDb('scalp-cap');
+    for ($i = 0; $i < 5; $i++) {
+        scalpClosed($db2, 'DOGEUSDT', 0.01, 0.01);
+    }
+    $capped = new Scalper(scalpCfg(['scalp_max_trades_per_hour' => 5]), $db2, $paper, $info);
+    T::eq('hourly_cap', $capped->entryBlock(), 'five entries this hour against a cap of 5 blocks the sixth');
+    $loose = new Scalper(scalpCfg(['scalp_max_trades_per_hour' => 60]), $db2, $paper, $info);
+    T::eq('', $loose->entryBlock(), 'and a cap of 60 does not');
+
+    // the loop honours its time budget
+    $db3 = freshDb('scalp-time');
+    $md3 = new FakeMarketData();
+    $md3->setSymbolInfo('DOGEUSDT', $info['DOGEUSDT']);
+    $md3->setPrice('DOGEUSDT', 1.0001, 1.0002, 1.0001);
+    $ex3 = new PaperExchange($md3, $db3, 0.1, 5000.0);
+    $db3->replaceMovers([['symbol' => 'DOGEUSDT', 'ts' => Util::nowIso(), 'rank' => 1,
+        'in_universe' => 1, 'eligible' => 1, 'score' => 1.0, 'gates' => []]]);
+    $db3->setState('movers_at', Util::nowIso());
+    $t0 = microtime(true);
+    $r3 = (new Scalper(scalpCfg(['scalp_run_seconds' => 2, 'scalp_poll_sec' => 1]), $db3, $ex3, $info))->run();
+    $elapsed = microtime(true) - $t0;
+    T::ok($elapsed < 10.0, 'a 2 s loop returns well inside the cron tick', T::dump(round($elapsed, 2)));
+    T::ok((int) $r3['polls'] >= 1, 'and it did poll', T::dump($r3['polls']));
+});
+
+T::group('scalp-config', ['Risk', 'Scalper', 'Util'], static function (): void {
+    // The break-even warning of §6: the user may configure a sub-break-even target deliberately,
+    // but they must never be able to do it WITHOUT being told the number.
+    $base = scalpCfg();
+
+    T::near(66.67, (float) Scalper::breakEvenWinRate($base), 0.1,
+        'tp 0.25 / sl 0.20 / fee 0.1 needs about a 67 % win rate to break even');
+    T::eq(null, Scalper::breakEvenWinRate(scalpCfg(['scalp_tp_pct' => 0.05])),
+        'a target at or below one side of the fee has no break-even win rate at all');
+
+    [$cfg, $errors, $warnings] = Risk::validateConfig(['scalp_tp_pct' => 0.05], $base);
+    T::eq([], $errors, 'a sub-fee target is a WARNING, not an error - it may be a deliberate measurement');
+    T::strContains(implode(' | ', $warnings), 'EVERY winning trade',
+        'but the warning says plainly that every winning trade still closes at a loss');
+
+    [, $e2, $w2] = Risk::validateConfig(['scalp_tp_pct' => 0.25, 'scalp_sl_pct' => 0.20], $base);
+    T::eq([], $e2, 'the default target validates');
+    T::strContains(implode(' | ', $w2), 'win rate just to break even',
+        'and still states the win rate it would take');
+
+    // bounds
+    [, $e3] = Risk::validateConfig(['scalp_run_seconds' => 600], $base);
+    T::ok($e3 !== [], 'a loop longer than the cron tick is rejected', T::dump($e3));
+    [, $e4] = Risk::validateConfig(['scalp_max_consecutive_losses' => 1], $base);
+    T::ok($e4 !== [], 'a breaker limit below 2 is rejected', T::dump($e4));
+    [, $e5] = Risk::validateConfig(['scalp_universe_size' => 50], $base);
+    T::ok($e5 !== [], 'a universe over 30 symbols is rejected', T::dump($e5));
+
+    // the budgets map
+    [$c6, $e6] = Risk::validateConfig(['scalp_budgets' => '{"BTCUSDT":200,"DOGEUSDT":50}'], $base);
+    T::eq([], $e6, 'a well-formed budgets map validates');
+    T::eq(200.0, (float) $c6['scalp_budgets']['BTCUSDT'], 'and is decoded');
+    [, $e7] = Risk::validateConfig(['scalp_budgets' => 'not json'], $base);
+    T::ok($e7 !== [], 'an unparseable budgets map is an ERROR, not a silent reset to the default budget',
+        T::dump($e7));
+    [, $e8] = Risk::validateConfig(['scalp_budgets' => ['DOGEUSDT' => -5]], $base);
+    T::ok($e8 !== [], 'a negative budget is rejected', T::dump($e8));
+
+    // the engine is selectable
+    T::contains(Risk::ENGINES, 'scalp', 'scalp is a registered engine');
+    T::eq('scalp', Risk::engineName(['engine' => 'scalp']), 'and engineName() returns it');
+});
+
+T::group('scalp-panel', ['Panel', 'Scalper', 'Movers', 'Db', 'Util'], static function (): void {
+    // §9: the panel must never show net alone, and must refuse to call a thin sample a result.
+    $db  = freshDb('scalp-panel');
+    $cfg = scalpCfg();
+
+    $s = Panel::status($cfg, $db);
+    T::eq(true, !empty($s['show']['scalp']), 'the scalp card shows when the engine is active');
+    T::eq(true, isset($s['scalp']) && is_array($s['scalp']), '?api=status carries a scalp block');
+    T::eq(true, isset($s['movers']) && is_array($s['movers']), 'and a movers block');
+    T::strContains((string) $s['text']['scalp_verdict'], 'nothing to conclude',
+        'with no trades it says there is nothing to conclude');
+
+    // a thin sample must not be reported as a result, however green it is
+    for ($i = 0; $i < 5; $i++) {
+        scalpClosed($db, 'DOGEUSDT', 1.00, 0.02);
+    }
+    $s2 = Panel::status($cfg, $db);
+    T::strContains((string) $s2['text']['scalp_verdict'], 'too few to conclude',
+        'five winning trades are still reported as too few to conclude anything');
+    T::ok((float) $s2['scalp']['net'] > 0.0, 'even though the net is positive',
+        T::dump($s2['scalp']['net']));
+    T::strContains((string) $s2['text']['scalp_trades'], '5 closed',
+        'and the trade count is always stated beside the number');
+    T::strContains((string) $s2['text']['scalp_win_rate'], 'break-even needs',
+        'the win rate is shown against the break-even rate it has to beat');
+
+    // gross and fees are both reported, separately
+    T::ok(isset($s2['text']['scalp_gross']) && isset($s2['text']['scalp_fees'])
+        && isset($s2['text']['scalp_net']), 'gross, fees and net are three separate rows');
+    T::near((float) $s2['scalp']['net'], (float) $s2['scalp']['gross'] - (float) $s2['scalp']['fees'], 1e-9,
+        "and the panel's three numbers reconcile");
+
+    // the pause banner
+    $db->setState('scalp_paused', '1');
+    $db->setState('scalp_pause_reason', '3 losing trades in a row');
+    $s3 = Panel::status($cfg, $db);
+    T::eq(true, !empty($s3['show']['scalp_paused']), 'the pause banner shows while paused');
+    T::strContains((string) $s3['text']['scalp_pause_reason'], 'losing trades',
+        'and carries the reason');
+    T::eq(true, (bool) $s3['scalp']['paused'], 'the API block says paused');
+
+    // with another engine selected, nothing of this renders
+    $off = Panel::status(scalpCfg(['engine' => 'signal']), $db);
+    T::eq(false, !empty($off['show']['scalp']), 'with the signal engine the scalp card is hidden');
+    T::eq(true, isset($off['scalp']), 'but the API block is still present, so the contract is stable');
 });
 
 /* ============================================================ summary */

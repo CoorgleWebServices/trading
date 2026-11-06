@@ -34,6 +34,14 @@ final class Panel
     const CSP = "default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'";
     /** Round trips a sleeve needs before the "best method" line is allowed to look like a result. */
     const PORTFOLIO_MIN_SAMPLE = 30;
+
+    /**
+     * Closed scalp trades before the panel will call the result anything but noise
+     * (DESIGN-SCALP.md §2). Higher than PORTFOLIO_MIN_SAMPLE on purpose: this engine trades many
+     * times a minute, so 30 trades can be four minutes of one coin's luck, and the whole point
+     * of the run is to answer the profit question honestly rather than early.
+     */
+    const SCALP_MIN_SAMPLE = 200;
     /** DESIGN-PORTFOLIO.md §6.4 default, used only when the config key is absent. */
     const SLEEVE_DRAWDOWN_DEFAULT = 25.0;
 
@@ -1067,6 +1075,16 @@ final class Panel
         $tables = array_merge($tables, $pf['tables']);
         $show   = array_merge($show, $pf['show']);
 
+        // ---- scalp engine card, movers board and per-symbol scoreboard (DESIGN-SCALP.md §9).
+        // Additive and database-only: with `engine` set to anything else, show.scalp is false
+        // and every block above is byte-for-byte what it was.
+        $sc     = self::scalpBlock($cfg, $db, $st, $now, $tz);
+        $text   = array_merge($text, $sc['text']);
+        $levels = array_merge($levels, $sc['levels']);
+        $raw    = array_merge($raw, $sc['raw']);
+        $tables = array_merge($tables, $sc['tables']);
+        $show   = array_merge($show, $sc['show']);
+
         // ---- the learning line and the BNB fee-discount rows (DESIGN-LEARNING.md §6, §7).
         // Additive and database-only: no network call is ever made while rendering.
         $learn  = self::learnBlock($cfg, $db, $now);
@@ -1093,6 +1111,8 @@ final class Panel
             'portfolio' => $pf['portfolio'],
             'scanner'   => $pf['scanner'],
             'sleeve_sparkline' => $pf['sparkline'],
+            'scalp'     => $sc['scalp'],
+            'movers'    => $sc['movers'],
             'learn'     => $learn['payload'],
             'bnb'       => $bnb['payload'],
             'raw'       => $raw,
@@ -2148,6 +2168,417 @@ final class Panel
                 'refresh_min' => $refreshMin,
                 'top_n'       => $topN,
                 'rows'        => $payload,
+            ],
+        ];
+    }
+
+    /**
+     * Scalp engine card, movers board and per-symbol scoreboard (DESIGN-SCALP.md §9).
+     *
+     * Database-only: no network call is ever made while rendering a page. Always returns the
+     * whole shape so `?api=status` keeps one stable contract whatever the active engine is;
+     * `show.scalp` is what decides whether the dashboard renders the blocks.
+     *
+     * The one thing this method must not do is let the user read a profit that is not there.
+     * §2 is explicit: never show net alone, always show the trade count beside it, and always
+     * separate the directional edge (gross) from what the exchange took (fees). The verdict
+     * block below is the whole reason the engine exists.
+     *
+     * @param callable $st state reader
+     * @return array{text:array,levels:array,raw:array,tables:array,show:array,scalp:array,movers:array}
+     */
+    private static function scalpBlock(array $cfg, Db $db, callable $st, int $now, string $tz): array
+    {
+        $text = [];
+        $levels = [];
+        $raw = [];
+        $tables = [];
+
+        $engine = strtolower(trim((string) ($cfg['engine'] ?? 'signal')));
+        $on     = $engine === 'scalp';
+        $mode   = (string) ($cfg['mode'] ?? 'paper');
+        $quote  = (string) ($cfg['quote_asset'] ?? 'USDT');
+
+        $liveBlocked = $on && $mode === 'live' && empty($cfg['allow_live_engines']);
+        $paused      = $st('scalp_paused', '') === '1';
+        $pauseReason = $st('scalp_pause_reason', '');
+        $streak      = max(0, (int) $st('scalp_losses', '0'));
+        // bootstrap.php loads lib/*.php behind file_exists(), and the panel is the one page a
+        // user reaches when a deploy went wrong - so a missing lib/Scalper.php has to degrade to
+        // an empty card, never to a white page. Same reason `Sleeve` and `Bot` are checked before
+        // use elsewhere in this file.
+        $have        = class_exists('Scalper');
+        $haveMovers  = class_exists('Movers');
+        $limit       = $have ? Scalper::lossLimitOf($cfg) : 5;
+
+        // ---- state pill
+        if (!$on) {
+            $text['scalp_state']   = 'OFF';
+            $levels['scalp_state'] = 'muted';
+        } elseif ($liveBlocked) {
+            $text['scalp_state']   = 'BLOCKED in live mode (allow_live_engines is off)';
+            $levels['scalp_state'] = 'danger';
+        } elseif ($paused) {
+            $text['scalp_state']   = 'PAUSED - waiting for you to resume';
+            $levels['scalp_state'] = 'warn';
+        } elseif (empty($cfg['enabled'])) {
+            $text['scalp_state']   = 'engine selected, bot disabled';
+            $levels['scalp_state'] = 'warn';
+        } else {
+            $text['scalp_state']   = 'RUNNING';
+            $levels['scalp_state'] = 'ok';
+        }
+
+        $text['scalp_streak']   = $streak . ' of ' . $limit . ' consecutive losses';
+        $levels['scalp_streak'] = $streak === 0 ? 'ok' : ($streak >= $limit ? 'danger' : 'warn');
+        $text['scalp_pause_reason'] = $pauseReason;
+        $raw['scalp_paused']  = $paused;
+        $raw['scalp_streak']  = $streak;
+        $raw['scalp_limit']   = $limit;
+
+        // ---- the §2 verdict. Computed here rather than in Scalper so the panel never needs an
+        //      exchange object just to render a page.
+        $gross = 0.0;
+        $fees = 0.0;
+        $net = 0.0;
+        $trades = 0;
+        $wins = 0;
+        try {
+            foreach ($db->scalpPositions(null, $mode, 'CLOSED') as $r) {
+                $trades++;
+                $gross += self::f($r['gross_usdt'] ?? 0.0);
+                $fees  += self::f($r['fees_usdt'] ?? 0.0);
+                $n      = self::f($r['pnl_usdt'] ?? 0.0);
+                $net   += $n;
+                if ($n > 0.0) {
+                    $wins++;
+                }
+            }
+        } catch (Throwable $e) {
+            // an older database without the columns: the verdict is simply empty
+        }
+        $be = $have ? Scalper::breakEvenWinRate($cfg) : null;
+        $winRate = $trades > 0 ? $wins / $trades * 100.0 : null;
+
+        $text['scalp_gross']   = self::signed($gross, 4) . ' ' . $quote;
+        $levels['scalp_gross'] = self::pnlLevel($gross);
+        $text['scalp_fees']    = '-' . Util::money(abs($fees), 4) . ' ' . $quote;
+        $levels['scalp_fees']  = $fees > 0.0 ? 'warn' : 'muted';
+        $text['scalp_net']     = self::signed($net, 4) . ' ' . $quote;
+        $levels['scalp_net']   = self::pnlLevel($net);
+        $text['scalp_trades']  = $trades . ' closed trade' . ($trades === 1 ? '' : 's');
+        $text['scalp_win_rate'] = $winRate === null
+            ? 'no closed trades yet'
+            : number_format($winRate, 1) . '% of ' . $trades
+              . ($be === null ? '' : ' (break-even needs ' . number_format($be, 1) . '%)');
+        $levels['scalp_win_rate'] = ($winRate === null || $be === null) ? 'muted'
+            : ($winRate >= $be ? 'ok' : 'warn');
+
+        // The verdict sentence. This is the answer to "is it making money or losing money", and
+        // it refuses to give one until there is enough evidence to mean anything.
+        if ($trades === 0) {
+            $verdict = 'No closed trades yet, so there is nothing to conclude.';
+            $vLevel  = 'muted';
+        } elseif ($trades < self::SCALP_MIN_SAMPLE) {
+            $verdict = $trades . ' closed trades is far too few to conclude anything - '
+                     . self::SCALP_MIN_SAMPLE . ' is the point where the number starts to mean '
+                     . 'something. So far: net ' . self::signed($net, 4) . ' ' . $quote . '.';
+            $vLevel  = 'muted';
+        } elseif ($net > 0.0) {
+            $verdict = 'Net POSITIVE: ' . self::signed($net, 4) . ' ' . $quote . ' over ' . $trades
+                     . ' trades, after ' . Util::money($fees, 4) . ' ' . $quote . ' of fees.';
+            $vLevel  = 'ok';
+        } elseif ($gross > 0.0) {
+            $verdict = 'Net NEGATIVE, but gross is positive: the entries have a real edge of '
+                     . self::signed($gross, 4) . ' ' . $quote . ' and fees of '
+                     . Util::money($fees, 4) . ' ' . $quote . ' ate it. That is a FEE problem - '
+                     . 'a wider take-profit or a lower fee tier is what would change it, not a '
+                     . 'different signal.';
+            $vLevel  = 'warn';
+        } else {
+            $verdict = 'Net NEGATIVE and gross is negative too (' . self::signed($gross, 4) . ' '
+                     . $quote . ' before fees): there is no directional edge here at all, so no '
+                     . 'fee tier and no position size would make this profitable. '
+                     . 'This is the honest answer the demo run was for.';
+            $vLevel  = 'danger';
+        }
+        $text['scalp_verdict']   = $verdict;
+        $levels['scalp_verdict'] = $vLevel;
+        $raw['scalp_gross']  = round($gross, 8);
+        $raw['scalp_fees']   = round($fees, 8);
+        $raw['scalp_net']    = round($net, 8);
+        $raw['scalp_trades'] = $trades;
+
+        // ---- last run
+        $lastRun = null;
+        try {
+            $lastRun = $db->lastScalpRun($mode);
+        } catch (Throwable $e) {
+            $lastRun = null;
+        }
+        if (is_array($lastRun)) {
+            $text['scalp_last_run'] = self::ago(isset($lastRun['started_at']) ? (string) $lastRun['started_at'] : null, $now)
+                . ' - ' . (int) ($lastRun['polls'] ?? 0) . ' polls, ' . (int) ($lastRun['entries'] ?? 0) . ' in, '
+                . (int) ($lastRun['exits'] ?? 0) . ' out';
+            $levels['scalp_last_run'] = 'ok';
+        } else {
+            $text['scalp_last_run']   = 'never run';
+            $levels['scalp_last_run'] = 'muted';
+        }
+        $pollSec = self::f($cfg['scalp_poll_sec'] ?? 3, 3.0);
+        $runSec  = self::f($cfg['scalp_run_seconds'] ?? 50, 50.0);
+        $text['scalp_cadence'] = $pollSec > 0
+            ? ((int) floor($runSec / $pollSec)) . ' decision points per minute (' . Util::money($runSec, 0)
+              . ' s loop, every ' . Util::money($pollSec, 0) . ' s)'
+            : '-';
+        $text['scalp_polls'] = is_array($lastRun) ? (string) (int) ($lastRun['polls'] ?? 0) : '0';
+
+        // ---- entries this hour against the runaway cap (§6 `scalp_max_trades_per_hour`).
+        //      Shown as "n of cap", never as a bare count: the cap is the only thing that says
+        //      whether the engine is still free to trade or is sitting out the rest of the hour.
+        $hourCap     = (int) self::f($cfg['scalp_max_trades_per_hour'] ?? 60, 60.0);
+        $entriesHour = 0;
+        try {
+            $entriesHour = (int) $db->scalpEntriesSince(Util::nowIso($now - 3600), $mode);
+        } catch (Throwable $e) {
+            $entriesHour = 0;
+        }
+        $text['scalp_entries_hour'] = $hourCap > 0
+            ? $entriesHour . ' of ' . $hourCap . ' entries this hour'
+            : $entriesHour . ' entries this hour (no cap)';
+        $levels['scalp_entries_hour'] = ($hourCap > 0 && $entriesHour >= $hourCap) ? 'warn' : 'ok';
+        $raw['scalp_entries_hour'] = $entriesHour;
+        $raw['scalp_hour_cap']     = $hourCap;
+
+        // ---- last seen price per symbol, for the unrealised column. Database only: the tick
+        //      writes `symbol_metrics` every pass and the movers board carries `last` for every
+        //      ranked pair, so the panel never needs a network call to value an open position.
+        //      `symbol_metrics` is the fresher of the two (per tick, not per board refresh), so
+        //      it wins; the board fills in the symbols the watchlist does not carry.
+        $prices = [];
+        try {
+            foreach ($db->moversRows(200, false) as $mr) {
+                $msym = strtoupper(trim((string) ($mr['symbol'] ?? '')));
+                $mlast = self::f($mr['last'] ?? 0.0);
+                if ($msym !== '' && $mlast > 0.0) {
+                    $prices[$msym] = $mlast;
+                }
+            }
+        } catch (Throwable $e) {
+            // no board yet: the unrealised column simply reads '-'
+        }
+        try {
+            $metrics = $db->getStateJson('symbol_metrics', []);
+            if (is_array($metrics)) {
+                foreach ($metrics as $msym => $mrow) {
+                    $u = strtoupper(trim((string) $msym));
+                    $p = is_array($mrow) ? self::f($mrow['price'] ?? 0.0) : 0.0;
+                    if ($u !== '' && $p > 0.0) {
+                        $prices[$u] = $p;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // same: a missing price is reported as unknown, never as 0 %
+        }
+
+        // ---- open positions
+        $openRows = [];
+        try {
+            $openRows = $db->openScalpPositions($mode);
+        } catch (Throwable $e) {
+            $openRows = [];
+        }
+        $orows = [];
+        $openPayload = [];
+        foreach ($openRows as $r) {
+            $sym  = strtoupper((string) ($r['symbol'] ?? ''));
+            $eff  = self::f($r['entry_eff'] ?? 0.0);
+            $op   = isset($r['opened_at']) ? Util::isoToTs((string) $r['opened_at']) : null;
+            $age  = $op === null ? 0 : max(0, $now - $op);
+            // Unrealised against `entry_eff`, exactly as Scalper::exitDecision() measures the
+            // target: `entry_eff` already carries the BUY fee, so a percentage against the raw
+            // fill would read better than the round trip can actually deliver. null (not 0.0)
+            // when no price is known - "unknown" and "flat" are different statements.
+            $mark   = isset($prices[$sym]) ? (float) $prices[$sym] : 0.0;
+            $unreal = ($eff > 0.0 && $mark > 0.0) ? ($mark / $eff - 1.0) * 100.0 : null;
+            $orows[] = ['cells' => [
+                ['t' => $sym, 'c' => 'mono'],
+                ['t' => Util::money(self::f($r['qty'] ?? 0.0), 6), 'c' => 'num'],
+                ['t' => Util::money($eff, 8), 'c' => 'num'],
+                ['t' => Util::money(self::f($r['entry_quote'] ?? 0.0), 2), 'c' => 'num'],
+                // seconds, not "2 min": a scalp lives and dies inside scalp_max_hold_sec, and a
+                // rounded-up minute hides exactly the part of its life that matters (§9).
+                ['t' => $age . ' s', 'c' => 'num'],
+                ['t' => $unreal === null ? '-' : self::pct($unreal, 3, true),
+                 'c' => 'num lvl-' . ($unreal === null ? 'muted' : self::pnlLevel($unreal))],
+                ['t' => (string) ($r['entry_reason'] ?? ''), 'c' => 'tags'],
+            ]];
+            $openPayload[] = [
+                'symbol' => $sym, 'qty' => self::f($r['qty'] ?? 0.0), 'entry_eff' => $eff,
+                'entry_quote' => self::f($r['entry_quote'] ?? 0.0), 'age_s' => $age,
+                'mark' => $mark > 0.0 ? $mark : null,
+                'unrealised_pct' => $unreal === null ? null : round($unreal, 4),
+            ];
+        }
+        $tables['scalp_open'] = ['rows' => $orows, 'cols' => 7,
+            'empty' => $on ? 'No open scalp positions' : 'The scalp engine is not the active engine'];
+
+        // ---- per-symbol scoreboard (§7): the card that answers "which one makes money"
+        $syms = [];
+        try {
+            foreach ($db->moversUniverse() as $sy) {
+                $syms[$sy] = true;
+            }
+            foreach ($db->scalpSymbols($mode) as $sy) {
+                $syms[$sy] = true;
+            }
+        } catch (Throwable $e) {
+            $syms = [];
+        }
+        $board = [];
+        foreach (array_keys($syms) as $sy) {
+            try {
+                if (!$have) {
+                    break;
+                }
+                $l = Scalper::symbolLedger($db, $cfg, $sy, $mode);
+            } catch (Throwable $e) {
+                continue;
+            }
+            $l['net_pct'] = $l['budget'] > 0.0 ? round($l['net'] / $l['budget'] * 100.0, 4) : null;
+            $board[] = $l;
+        }
+        usort($board, static function (array $a, array $b): int {
+            if ($a['net'] !== $b['net']) {
+                return $b['net'] <=> $a['net'];
+            }
+            if ($a['trades'] !== $b['trades']) {
+                return $b['trades'] <=> $a['trades'];
+            }
+            return strcmp($a['symbol'], $b['symbol']);
+        });
+        $brows = [];
+        foreach ($board as $l) {
+            $brows[] = ['class' => $l['trades'] === 0 && $l['open'] === 0 ? 'row-muted' : '', 'cells' => [
+                ['t' => $l['symbol'], 'c' => 'mono'],
+                ['t' => Util::money($l['budget'], 2), 'c' => 'num'],
+                ['t' => Util::money($l['deployed'], 2), 'c' => 'num'],
+                ['t' => Util::money($l['available'], 2), 'c' => 'num'],
+                ['t' => (string) $l['trades'], 'c' => 'num'],
+                // the sample size is part of the number, never a separate column the eye skips
+                ['t' => $l['win_rate'] === null ? '-' : number_format($l['win_rate'], 1) . '% of ' . $l['trades'], 'c' => 'num'],
+                ['t' => self::signed($l['gross'], 4), 'c' => 'num lvl-' . self::pnlLevel($l['gross'])],
+                ['t' => '-' . Util::money(abs($l['fees']), 4), 'c' => 'num'],
+                ['t' => self::signed($l['net'], 4), 'c' => 'num lvl-' . self::pnlLevel($l['net'])],
+                ['t' => $l['net_pct'] === null ? '-' : self::pct($l['net_pct'], 2, true), 'c' => 'num lvl-' . self::pnlLevel($l['net'])],
+            ]];
+        }
+        $tables['scalp_board'] = ['rows' => $brows, 'cols' => 10,
+            'empty' => 'No symbols yet - the movers board fills the universe on the next tick'];
+
+        // ---- movers board (§9): the "top coins with fluctuations and many traders" table
+        $moversRows = [];
+        $moversAge  = null;
+        try {
+            $moversRows = $db->moversRows(10, false);
+            $moversAge  = $db->moversAge();
+        } catch (Throwable $e) {
+            $moversRows = [];
+        }
+        $mrows = [];
+        $mPayload = [];
+        foreach ($moversRows as $r) {
+            $sym      = strtoupper((string) ($r['symbol'] ?? ''));
+            $eligible = !empty($r['eligible']);
+            $inUni    = !empty($r['in_universe']);
+            $gates    = isset($r['gates_list']) && is_array($r['gates_list']) ? $r['gates_list'] : [];
+            $gateText = implode(', ', array_map('strval', $gates));
+            $mrows[] = ['class' => $eligible ? '' : 'row-muted', 'cells' => [
+                ['t' => (string) (int) ($r['rank'] ?? 0), 'c' => 'num'],
+                ['t' => $sym, 'c' => 'mono'],
+                ['t' => Util::money(self::f($r['last'] ?? 0.0), 6), 'c' => 'num'],
+                ['t' => self::pct(self::f($r['change_pct'] ?? 0.0), 2, true), 'c' => 'num lvl-' . self::pnlLevel(self::f($r['change_pct'] ?? 0.0))],
+                ['t' => self::pct(self::f($r['range_pct'] ?? 0.0), 2), 'c' => 'num'],
+                ['t' => number_format((float) (int) ($r['trade_count'] ?? 0)), 'c' => 'num'],
+                ['t' => self::volume(self::f($r['quote_vol'] ?? 0.0)), 'c' => 'num'],
+                ['t' => self::pct(self::f($r['spread_pct'] ?? 0.0), 3), 'c' => 'num'],
+                ['t' => Util::money(self::f($r['required_size'] ?? 0.0), 2), 'c' => 'num'],
+                ['t' => Util::money(self::f($r['score'] ?? 0.0), 4), 'c' => 'num'],
+                ['t' => $inUni ? 'trading' : ($eligible ? 'eligible' : 'gated'),
+                 'c' => 'tags ' . ($inUni ? 'lvl-ok' : ($eligible ? 'lvl-info' : 'lvl-warn'))],
+                ['t' => $gateText === '' ? '-' : $gateText, 'c' => 'tags'],
+            ]];
+            $mPayload[] = [
+                'rank' => (int) ($r['rank'] ?? 0), 'symbol' => $sym,
+                'last' => self::f($r['last'] ?? 0.0), 'change_pct' => self::f($r['change_pct'] ?? 0.0),
+                'range_pct' => self::f($r['range_pct'] ?? 0.0), 'trade_count' => (int) ($r['trade_count'] ?? 0),
+                'quote_vol' => self::f($r['quote_vol'] ?? 0.0), 'spread_pct' => self::f($r['spread_pct'] ?? 0.0),
+                'required_size' => self::f($r['required_size'] ?? 0.0), 'score' => self::f($r['score'] ?? 0.0),
+                'in_universe' => $inUni, 'eligible' => $eligible, 'gates' => array_values($gates),
+            ];
+        }
+        $tables['movers'] = ['rows' => $mrows, 'cols' => 12,
+            'empty' => 'No board yet - the tick refreshes it every scalp_universe_refresh_min minutes'];
+
+        $refreshMin = (int) self::f($cfg['scalp_universe_refresh_min'] ?? 10, 10.0);
+        $text['movers_age']   = $moversAge === null ? 'never refreshed' : self::duration($moversAge * 60) . ' ago';
+        $levels['movers_age'] = $moversAge === null ? 'muted' : 'ok';
+        $text['movers_meta']  = 'refresh every ' . $refreshMin . ' min (weight 80 per refresh); '
+                              . 'universe ' . ($haveMovers ? Movers::universeSizeOf($cfg) : 20) . ' symbols';
+        $raw['movers_rows']   = count($mrows);
+
+        return [
+            'text'   => $text,
+            'levels' => $levels,
+            'raw'    => $raw,
+            'tables' => $tables,
+            'show'   => [
+                'scalp'        => $on,
+                'scalp_paused' => $on && $paused,
+                'movers'       => $on || $mrows !== [],
+            ],
+            'scalp'  => [
+                'active'        => $on,
+                'mode'          => $mode,
+                'live_blocked'  => $liveBlocked,
+                'paused'        => $paused,
+                'pause_reason'  => $pauseReason,
+                'paused_at'     => $st('scalp_paused_at', ''),
+                'streak'        => $streak,
+                'loss_limit'    => $limit,
+                'gross'         => round($gross, 8),
+                'fees'          => round($fees, 8),
+                'net'           => round($net, 8),
+                'trades'        => $trades,
+                'wins'          => $wins,
+                'win_rate'      => $winRate === null ? null : round($winRate, 2),
+                'breakeven_win_rate' => $be,
+                'min_sample'    => self::SCALP_MIN_SAMPLE,
+                'verdict'       => $verdict,
+                'open'          => $openPayload,
+                'open_count'    => count($openPayload),
+                'max_open'      => (int) self::f($cfg['scalp_max_open'] ?? 6, 6.0),
+                'entries_hour'  => $entriesHour,
+                'hour_cap'      => $hourCap,
+                'polls_last_run' => is_array($lastRun) ? (int) ($lastRun['polls'] ?? 0) : 0,
+                'budget_per_symbol' => self::f($cfg['scalp_budget_per_symbol'] ?? 100.0, 100.0),
+                'scoreboard'    => $board,
+                'last_run'      => is_array($lastRun) ? [
+                    'started_at' => (string) ($lastRun['started_at'] ?? ''),
+                    'ended_at'   => (string) ($lastRun['ended_at'] ?? ''),
+                    'polls'      => (int) ($lastRun['polls'] ?? 0),
+                    'entries'    => (int) ($lastRun['entries'] ?? 0),
+                    'exits'      => (int) ($lastRun['exits'] ?? 0),
+                    'net_usdt'   => self::f($lastRun['net_usdt'] ?? 0.0),
+                    'note'       => (string) ($lastRun['note'] ?? ''),
+                ] : null,
+            ],
+            'movers' => [
+                'age_min'     => $moversAge,
+                'refresh_min' => $refreshMin,
+                'universe'    => $haveMovers ? Movers::universeSizeOf($cfg) : 20,
+                'rows'        => $mPayload,
             ],
         ];
     }

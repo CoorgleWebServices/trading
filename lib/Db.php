@@ -35,6 +35,16 @@ final class Db
             'stop_price' => 'f', 'take_profit_price' => 'f', 'trail_high' => 'f',
             'trailing_armed' => 'i', 'score' => 'i', 'entry_reason' => 's', 'exit_reason' => 's',
             'opened_at' => 's', 'closed_at' => 's',
+            // DESIGN-SCALP.md §8: the fee split per closed position. `pnl_usdt` stays the
+            // authoritative NET result; these two say how much of it the exchange took, which
+            // is the whole §2 verdict (gross edge vs fees vs net). Added by ALTER TABLE on an
+            // existing database, so a row written before they existed reads 0.
+            'gross_usdt' => 'f', 'fees_usdt' => 'f',
+            // Which engine opened this position. Defaults to 'signal' on every pre-existing row
+            // and on every writer that omits it, so the signal engine is unchanged; the scalp
+            // engine writes 'scalp' and openPosition() skips those rows (it returns THE one
+            // position the signal engine manages, and scalp runs many at once).
+            'engine' => 's',
         ],
         'orders' => [
             'client_id' => 's', 'position_id' => 'i', 'mode' => 's', 'symbol' => 's',
@@ -84,6 +94,17 @@ final class Db
             'symbol' => 's', 'ts' => 's', 'price' => 'f', 'change_pct' => 'f', 'quote_vol' => 'f',
             'spread_pct' => 'f', 'atr_pct' => 'f', 'step_value' => 'f', 'min_notional' => 'f',
             'required_size' => 'f', 'score' => 'f', 'eligible' => 'i', 'gates' => 's',
+        ],
+        'movers' => [
+            'symbol' => 's', 'ts' => 's', 'last' => 'f', 'change_pct' => 'f', 'range_pct' => 'f',
+            'trade_count' => 'i', 'quote_vol' => 'f', 'spread_pct' => 'f', 'step_value' => 'f',
+            'required_size' => 'f', 'score' => 'f', 'rank' => 'i', 'in_universe' => 'i',
+            'eligible' => 'i', 'gates' => 's',
+        ],
+        'scalp_runs' => [
+            'id' => 'i', 'started_at' => 's', 'ended_at' => 's', 'mode' => 's',
+            'polls' => 'i', 'entries' => 'i', 'exits' => 'i',
+            'gross_usdt' => 'f', 'fees_usdt' => 'f', 'net_usdt' => 'f', 'note' => 's',
         ],
         'observations' => [
             'id' => 'i', 'ts' => 's', 'mode' => 's', 'engine' => 's', 'symbol' => 's',
@@ -260,8 +281,79 @@ CREATE INDEX IF NOT EXISTS idx_obs_open ON observations(outcome, mode);
 CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(mode, ts);
 CREATE INDEX IF NOT EXISTS idx_obs_position ON observations(position_id);
 CREATE INDEX IF NOT EXISTS idx_obs_cycle ON observations(cycle_id);
+CREATE TABLE IF NOT EXISTS movers (
+  symbol TEXT PRIMARY KEY, ts TEXT NOT NULL, last REAL, change_pct REAL, range_pct REAL,
+  trade_count INTEGER, quote_vol REAL, spread_pct REAL, step_value REAL, required_size REAL,
+  score REAL, rank INTEGER, in_universe INTEGER NOT NULL DEFAULT 0,
+  eligible INTEGER NOT NULL DEFAULT 0, gates TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_movers_score ON movers(score);
+CREATE INDEX IF NOT EXISTS idx_movers_universe ON movers(in_universe, rank);
+CREATE TABLE IF NOT EXISTS scalp_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, ended_at TEXT,
+  mode TEXT NOT NULL, polls INTEGER DEFAULT 0, entries INTEGER DEFAULT 0, exits INTEGER DEFAULT 0,
+  gross_usdt REAL DEFAULT 0, fees_usdt REAL DEFAULT 0, net_usdt REAL DEFAULT 0, note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scalp_runs_started ON scalp_runs(mode, started_at);
 SQL;
         $this->pdo->exec($sql);
+
+        // DESIGN-SCALP.md §8: the per-closed-position fee split. ADDITIVE ONLY - one guarded
+        // ALTER TABLE per missing column, never a rebuild: `positions` is the table the whole
+        // survival layer, the equity curve and the trade history read, and dropping and
+        // recreating it to add a column would risk every row in it. Existing rows read 0.
+        $this->addColumnIfMissing('positions', 'gross_usdt', 'REAL NOT NULL DEFAULT 0');
+        $this->addColumnIfMissing('positions', 'fees_usdt', 'REAL NOT NULL DEFAULT 0');
+        // Which engine owns a position. The DEFAULT is what makes this safe to add under a live
+        // signal position: every row that existed before, and every INSERT that does not mention
+        // the column, reads 'signal', so openPosition() keeps returning exactly what it did.
+        $this->addColumnIfMissing('positions', 'engine', "TEXT NOT NULL DEFAULT 'signal'");
+    }
+
+    /**
+     * Add one column to an existing table when it is not there already, and do nothing at all
+     * when it is. Idempotent, so migrate() can run on every open.
+     *
+     * $table, $column and $decl are compile-time literals from this file only - never anything
+     * a caller or the panel supplied - because SQLite cannot bind an identifier.
+     *
+     * @param string $decl the column's SQL type and constraints, e.g. 'REAL NOT NULL DEFAULT 0'
+     * @return bool true when the column was added by this call
+     */
+    private function addColumnIfMissing(string $table, string $column, string $decl): bool
+    {
+        if ($this->hasColumn($table, $column)) {
+            return false;
+        }
+        $this->pdo->exec('ALTER TABLE ' . $table . ' ADD COLUMN ' . $column . ' ' . $decl);
+        return true;
+    }
+
+    /**
+     * True when $table has a column called $column.
+     *
+     * Deliberately `PRAGMA table_info(...)` and not the `pragma_table_info()` table-valued
+     * function: the latter needs SQLite 3.16+, and this has to work on whatever sqlite the
+     * shared host happens to ship. The identifier is quoted and comes from this file only.
+     * An unreadable pragma answers "the column is there", which makes the caller skip the
+     * ALTER rather than attempt one that would throw.
+     */
+    public function hasColumn(string $table, string $column): bool
+    {
+        try {
+            $rows = $this->pdo->query('PRAGMA table_info("' . str_replace('"', '', $table) . '")');
+            if ($rows === false) {
+                return true;
+            }
+            foreach ($rows->fetchAll() as $r) {
+                if (is_array($r) && isset($r['name']) && (string) $r['name'] === $column) {
+                    return true;
+                }
+            }
+        } catch (Throwable $e) {
+            return true;
+        }
+        return false;
     }
 
     /* ------------------------------------------------------------ internals */
@@ -437,9 +529,269 @@ SQL;
 
     /* ------------------------------------------------------------ positions */
 
+    /**
+     * THE open position the signal engine manages, or null.
+     *
+     * Scalp rows are excluded on purpose. The scalp engine holds up to `scalp_max_open`
+     * positions at once in this same table (DESIGN-SCALP.md §8), and this method's contract is
+     * "the one position", which the whole signal path - exit checks, closePosition(), the
+     * survival layer's `hasOpenPosition` - is built on. Without the filter, turning the scalp
+     * engine on would hand a scalp position to the signal engine's exit logic, which would
+     * manage and close it under its own stop and target. `COALESCE` so a row written before the
+     * `engine` column existed still reads as the signal engine's.
+     */
     public function openPosition(): ?array
     {
-        return $this->fetchOne('positions', "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1");
+        return $this->fetchOne(
+            'positions',
+            "SELECT * FROM positions WHERE status = 'OPEN' AND COALESCE(engine, 'signal') <> 'scalp'
+             ORDER BY id DESC LIMIT 1"
+        );
+    }
+
+    /* --------------------------------------------------------- scalp engine */
+
+    /**
+     * Every OPEN scalp position in $mode, oldest first (so the loop manages the longest-held
+     * one first and `scalp_max_hold_sec` cannot be starved by newer entries).
+     *
+     * @return array positions rows
+     */
+    public function openScalpPositions(?string $mode = null): array
+    {
+        $params = [];
+        $sql    = "SELECT * FROM positions WHERE status = 'OPEN' AND engine = 'scalp'"
+                . self::modeClause($mode, $params) . ' ORDER BY id ASC';
+        return $this->fetchAll('positions', $sql, $params);
+    }
+
+    /**
+     * Closed scalp positions for one symbol in $mode — the raw material for
+     * Scalper::symbolLedger(). Returns the rows, not a total: the ledger is DERIVED on every
+     * read (DESIGN-SCALP.md §7) so it can never drift out of step with the trades it describes.
+     *
+     * @return array positions rows
+     */
+    public function scalpPositions(?string $symbol = null, ?string $mode = null, ?string $status = null): array
+    {
+        $params = [];
+        $sql    = "SELECT * FROM positions WHERE engine = 'scalp'";
+        if ($symbol !== null && trim($symbol) !== '') {
+            $sql .= ' AND symbol = ?';
+            $params[] = strtoupper(trim($symbol));
+        }
+        if ($status !== null && trim($status) !== '') {
+            $sql .= ' AND status = ?';
+            $params[] = strtoupper(trim($status));
+        }
+        $sql .= self::modeClause($mode, $params) . ' ORDER BY id ASC';
+        return $this->fetchAll('positions', $sql, $params);
+    }
+
+    /**
+     * Distinct symbols that have ever carried a scalp position in $mode. Used by the scoreboard
+     * so a symbol that has dropped out of the universe still shows the money it made or lost.
+     *
+     * @return array list of uppercase symbols
+     */
+    public function scalpSymbols(?string $mode = null): array
+    {
+        $params = [];
+        $sql    = "SELECT DISTINCT symbol FROM positions WHERE engine = 'scalp'"
+                . self::modeClause($mode, $params) . ' ORDER BY symbol ASC';
+        $st = $this->pdo->prepare($sql);
+        $st->execute($params);
+        $out = [];
+        foreach ($st->fetchAll() as $r) {
+            if (is_array($r) && isset($r['symbol'])) {
+                $out[] = strtoupper(trim((string) $r['symbol']));
+            }
+        }
+        return $out;
+    }
+
+    /** Scalp entries opened at or after $sinceIso, in $mode — the hourly runaway cap (§6). */
+    public function scalpEntriesSince(string $sinceIso, ?string $mode = null): int
+    {
+        $params = [$sinceIso];
+        $sql    = "SELECT COUNT(*) FROM positions WHERE engine = 'scalp' AND opened_at >= ?"
+                . self::modeClause($mode, $params);
+        return (int) $this->scalar($sql, $params);
+    }
+
+    /**
+     * Replace the movers board wholesale (DESIGN-SCALP.md §3/§8).
+     *
+     * Same contract as replaceScanner(): one transaction, DELETE then INSERT, so a reader never
+     * sees a half-refreshed board, and a failure leaves the previous board intact rather than an
+     * empty table. `gates` is JSON-encoded here when the caller passed an array.
+     *
+     * @param array $rows rows shaped like Movers::rank() output
+     * @return int rows stored
+     */
+    public function replaceMovers(array $rows): int
+    {
+        $now   = Util::nowIso();
+        $clean = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $symbol = strtoupper(trim((string) ($row['symbol'] ?? '')));
+            if ($symbol === '') {
+                continue;
+            }
+            $row['symbol']      = $symbol;
+            $row['ts']          = (isset($row['ts']) && $row['ts'] !== '') ? (string) $row['ts'] : $now;
+            $row['eligible']    = empty($row['eligible']) ? 0 : 1;
+            $row['in_universe'] = empty($row['in_universe']) ? 0 : 1;
+            if (isset($row['gates'])) {
+                if (is_array($row['gates'])) {
+                    $json = json_encode(array_values($row['gates']), JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+                    $row['gates'] = $json === false ? '[]' : $json;
+                } else {
+                    $row['gates'] = (string) $row['gates'];
+                }
+            }
+            $clean[$symbol] = $row;
+        }
+
+        $owns = !$this->pdo->inTransaction();
+        if ($owns) {
+            $this->pdo->beginTransaction();
+        }
+        try {
+            $this->pdo->exec('DELETE FROM movers');
+            foreach ($clean as $row) {
+                $this->insertRow('movers', $row);
+            }
+            if ($owns) {
+                $this->pdo->commit();
+            }
+        } catch (Throwable $e) {
+            if ($owns && $this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+        return count($clean);
+    }
+
+    /**
+     * Movers rows, best first. Ordered by the stored `rank` (which Movers::rank() assigned in
+     * its own total order) rather than by score, so the panel shows exactly the ranking the
+     * engine used - a gated row scores 0 and must not tie its way above an eligible one.
+     * `gates` stays the stored JSON; `gates_list` carries it decoded.
+     *
+     * @param bool $universeOnly only the rows actually being traded
+     */
+    public function moversRows(int $limit = 10, bool $universeOnly = false): array
+    {
+        $sql = 'SELECT * FROM movers WHERE 1 = 1';
+        if ($universeOnly) {
+            $sql .= ' AND in_universe = 1';
+        }
+        $sql .= ' ORDER BY rank ASC, symbol ASC LIMIT ?';
+        $lim  = $limit > 0 ? $limit : 10;
+        $rows = $this->fetchAll('movers', $sql, [$lim]);
+        foreach ($rows as $i => $r) {
+            $rows[$i]['gates_list'] = self::decodeGates($r['gates'] ?? null);
+        }
+        return $rows;
+    }
+
+    /**
+     * **MINUTES** since the movers board was last written, or null when it never was.
+     *
+     * Note the unit, because scannerAge() a few methods down returns SECONDS. That is
+     * deliberate rather than an oversight: the board's own refresh interval is configured in
+     * minutes (`scalp_universe_refresh_min`, default 10), so minutes is the unit every caller
+     * wants to compare it against, while the scanner's hourly cadence is reported in seconds.
+     * A caller that needs seconds must not assume; it should read this line.
+     */
+    public function moversAge(): ?int
+    {
+        $ts = $this->scalar('SELECT MAX(ts) FROM movers');
+        if ($ts === null || trim((string) $ts) === '') {
+            return null;
+        }
+        $t = Util::isoToTs((string) $ts);
+        return $t === null ? null : (int) max(0, (int) round((time() - $t) / 60));
+    }
+
+    /** @return array list of uppercase symbols currently in the traded universe, best first */
+    public function moversUniverse(): array
+    {
+        $st = $this->pdo->prepare('SELECT symbol FROM movers WHERE in_universe = 1 ORDER BY rank ASC, symbol ASC');
+        $st->execute();
+        $out = [];
+        foreach ($st->fetchAll() as $r) {
+            if (is_array($r) && isset($r['symbol'])) {
+                $out[] = strtoupper(trim((string) $r['symbol']));
+            }
+        }
+        return $out;
+    }
+
+    /** @param mixed $raw */
+    private static function decodeGates($raw): array
+    {
+        if (is_array($raw)) {
+            return array_values($raw);
+        }
+        $s = trim((string) $raw);
+        if ($s === '') {
+            return [];
+        }
+        $d = json_decode($s, true);
+        return is_array($d) ? array_values($d) : [];
+    }
+
+    /**
+     * Open a scalp run row and return its id (DESIGN-SCALP.md §8). The raw insert: it defaults
+     * `started_at` and `mode` only. `scalpRunStart()` wraps it and additionally defaults and
+     * sanitises every counter and money column; prefer that one unless you are passing a row
+     * you have already normalised.
+     *
+     * `mode` is defaulted because the column is NOT NULL with no SQL default, so an omitted
+     * mode would fail the INSERT rather than record an unattributed run.
+     */
+    public function insertScalpRun(array $row): int
+    {
+        if (!isset($row['started_at']) || trim((string) $row['started_at']) === '') {
+            $row['started_at'] = Util::nowIso();
+        }
+        if (!isset($row['mode'])) {
+            $row['mode'] = '';
+        }
+        return $this->insertRow('scalp_runs', $row);
+    }
+
+    /**
+     * Write fields onto a scalp run row. The raw update: only `scalp_runs` columns are kept
+     * (insertRow/updateRow whitelist them) but nothing is defaulted or range-checked.
+     * `scalpRunEnd()` wraps it, stamps `ended_at`, keeps a non-finite number out of the row and
+     * refuses to rewrite `id` or `started_at`.
+     */
+    public function updateScalpRun(int $id, array $fields): void
+    {
+        $this->updateRow('scalp_runs', 'id', $id, $fields);
+    }
+
+    /** @return array the most recent scalp runs, newest first */
+    public function scalpRuns(int $limit = 20, ?string $mode = null): array
+    {
+        $params = [];
+        $sql    = 'SELECT * FROM scalp_runs WHERE 1 = 1' . self::modeClause($mode, $params)
+                . ' ORDER BY id DESC LIMIT ?';
+        $params[] = $limit > 0 ? $limit : 20;
+        return $this->fetchAll('scalp_runs', $sql, $params);
+    }
+
+    public function lastScalpRun(?string $mode = null): ?array
+    {
+        $rows = $this->scalpRuns(1, $mode);
+        return $rows === [] ? null : $rows[0];
     }
 
     public function position(int $id): ?array
@@ -774,6 +1126,10 @@ SQL;
         $this->pdo->prepare('DELETE FROM logs WHERE ts < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM login_attempts WHERE last_at IS NOT NULL AND last_at < ?')->execute([$cutoff]);
         $this->pdo->prepare('DELETE FROM observations WHERE ts < ?')->execute([$obsCutoff]);
+        // One scalp_runs row per cron tick is ~1440 a day (DESIGN-SCALP.md §4), so the run log
+        // is tail data on the same horizon as the other tails. The per-symbol scoreboard is
+        // derived from `positions`, never from these rows, so pruning them loses no P&L.
+        $this->pdo->prepare('DELETE FROM scalp_runs WHERE started_at < ?')->execute([$cutoff]);
 
         $in     = implode(', ', array_fill(0, count(self::ENGINE_LIVE_STATUSES), '?'));
         $params = array_merge([$cutoff], self::ENGINE_LIVE_STATUSES);
@@ -1197,6 +1553,239 @@ SQL;
         }
         $age = time() - $t;
         return $age < 0 ? 0 : $age;
+    }
+
+    /* ------------------------------------------------ scalp scoreboard (§7) */
+    /*
+     * The rest of the movers / scalp_runs storage lives in the "scalp engine" section above.
+     * What is here is the part DESIGN-SCALP.md §7 is strict about: the per-symbol scoreboard,
+     * which is DERIVED from `positions` and never stored as a running total.
+     */
+
+    /**
+     * Movers rows ordered the way Movers::compareRows orders them: eligible first, then score,
+     * then trade count, then 24 h quote volume, then symbol.
+     *
+     * This is the sibling of moversRows(), and the difference matters:
+     *   moversRows()  orders by the STORED `rank` and can filter to the traded universe - what
+     *                 the engine is actually doing.
+     *   moversTop()   re-derives the ranking order from the stored metrics and can filter to the
+     *                 rows that passed every gate - what the board WOULD trade. It is also the
+     *                 safe one when `rank` may be NULL (the §8 schema allows it), because
+     *                 `ORDER BY rank ASC` puts NULLs FIRST in SQLite, which would put a rankless
+     *                 row at the head of the board.
+     *
+     * A gated row scores 0, so `eligible DESC` leads: without it a rejected coin ties its way
+     * above an eligible one that also happens to score 0.
+     *
+     * `gates` stays the stored JSON string; `gates_list` carries it decoded.
+     *
+     * @param bool $eligibleOnly true returns only rows that passed every gate
+     */
+    public function moversTop(int $limit = 10, bool $eligibleOnly = false): array
+    {
+        $sql = 'SELECT * FROM movers WHERE 1 = 1';
+        if ($eligibleOnly) {
+            $sql .= ' AND eligible = 1';
+        }
+        $sql .= ' ORDER BY eligible DESC, score DESC, trade_count DESC, quote_vol DESC, symbol ASC LIMIT ?';
+        $rows = $this->fetchAll('movers', $sql, [$limit > 0 ? $limit : 10]);
+        foreach ($rows as $i => $r) {
+            $rows[$i]['gates_list'] = self::decodeGates(isset($r['gates']) ? $r['gates'] : null);
+        }
+        return $rows;
+    }
+
+    /**
+     * Open a scalp run and return its id, with every field defaulted and sanitised:
+     * `started_at` now, `mode` '', the counters 0 and the money columns finite. A run that dies
+     * mid-loop therefore still leaves a row with a start time and no `ended_at`, which is how
+     * the panel tells "running" from "finished".
+     *
+     * Thin wrapper over insertScalpRun() so there is exactly ONE insert path into `scalp_runs`.
+     *
+     * @param array $row mode, plus optional started_at, polls, entries, exits,
+     *                   gross_usdt, fees_usdt, net_usdt, note
+     */
+    public function scalpRunStart(array $row): int
+    {
+        $row['mode'] = isset($row['mode']) ? (string) $row['mode'] : '';
+        foreach (['polls', 'entries', 'exits'] as $col) {
+            $row[$col] = (isset($row[$col]) && is_numeric($row[$col])) ? (int) $row[$col] : 0;
+        }
+        foreach (['gross_usdt', 'fees_usdt', 'net_usdt'] as $col) {
+            $row[$col] = self::finite(isset($row[$col]) ? $row[$col] : 0.0);
+        }
+        unset($row['id']);
+        return $this->insertScalpRun($row);
+    }
+
+    /**
+     * Close a scalp run: write the counters and the §2 gross / fees / net split, stamping
+     * `ended_at` with now unless $fields names one.
+     *
+     * `id` and `started_at` are stripped: a summary array can be handed over whole without
+     * rewriting which run it is or when it began.
+     *
+     * @param array $fields polls, entries, exits, gross_usdt, fees_usdt, net_usdt, note, ended_at
+     */
+    public function scalpRunEnd(int $id, array $fields): void
+    {
+        if ($id <= 0) {
+            return;
+        }
+        if (!isset($fields['ended_at']) || trim((string) $fields['ended_at']) === '') {
+            $fields['ended_at'] = Util::nowIso();
+        } else {
+            $fields['ended_at'] = (string) $fields['ended_at'];
+        }
+        foreach (['polls', 'entries', 'exits'] as $col) {
+            if (array_key_exists($col, $fields)) {
+                $fields[$col] = is_numeric($fields[$col]) ? (int) $fields[$col] : 0;
+            }
+        }
+        foreach (['gross_usdt', 'fees_usdt', 'net_usdt'] as $col) {
+            if (array_key_exists($col, $fields)) {
+                $fields[$col] = self::finite($fields[$col]);
+            }
+        }
+        unset($fields['id'], $fields['started_at']);
+        $this->updateScalpRun($id, $fields);
+    }
+
+    /**
+     * Per-symbol scoreboard, DERIVED from `positions` (DESIGN-SCALP.md §7). This is the answer
+     * to the user's actual question - *which coin is making money* - and it is computed on every
+     * read, never stored: a running total would be a second source of truth that drifts the
+     * first time a close is booked twice or a row is edited by hand. A derivation cannot drift,
+     * because there is nothing to drift from.
+     *
+     * Returned as [SYMBOL => [...]], ordered by `net` descending then symbol, which is the
+     * scoreboard order the panel renders:
+     *
+     *   trades    completed round trips: CLOSED positions carrying a pnl. The SAMPLE SIZE that
+     *             has to sit beside every rate, per §2 - a 100 % win rate on two trades is noise.
+     *   wins      trades with pnl > 0            losses  trades with pnl < 0
+     *             (a dead-flat trade counts in `trades` and in neither, as Db::stats() does)
+     *   gross     SUM(gross_usdt) - P&L BEFORE fees: "is there any directional edge at all?"
+     *   fees      SUM(fees_usdt)  - what it cost to find out
+     *   net       SUM(pnl_usdt)   - the answer, and the same number the survival layer caps on
+     *   open      positions still on the book (OPEN and STUCK)
+     *   deployed  SUM(entry_quote) of those, i.e. the capital this symbol currently has at work
+     *
+     * `net` comes from `pnl_usdt` rather than `gross - fees` on purpose: `pnl_usdt` is what the
+     * rest of the system already treats as realised P&L, so the scoreboard cannot quietly
+     * disagree with the equity curve or the daily cap. For a position that recorded the split
+     * the three reconcile; a position written before `gross_usdt`/`fees_usdt` existed
+     * contributes 0 to `gross` and `fees` while still contributing its `net` - which SHOWS the
+     * gap instead of inventing a gross that was never measured. Never present `gross` as an
+     * edge without `trades` beside it.
+     *
+     * STUCK counts as deployed, not as closed: its capital really is still committed (DESIGN.md
+     * §10 blocks entries on a STUCK position exactly like an OPEN one), so letting a symbol's
+     * budget spend it again would double-count the money.
+     *
+     * @param string|null $mode   configured mode, or null/'' for every mode
+     * @param string|null $engine which engine's positions to count; defaults to the scalp
+     *                            engine, '' / null widens it to every engine in that mode
+     * @return array [SYMBOL => ['trades'=>int,'wins'=>int,'losses'=>int,'gross'=>float,
+     *                           'fees'=>float,'net'=>float,'open'=>int,'deployed'=>float]]
+     */
+    public function scalpSymbolStats(?string $mode = null, ?string $engine = 'scalp'): array
+    {
+        // COALESCE so a row written before the `engine` column existed still reads as the
+        // signal engine's rather than matching every filter.
+        $engineSql = '';
+        $engineBind = null;
+        if ($engine !== null && trim($engine) !== '') {
+            $engineSql  = " AND COALESCE(engine, 'signal') = ?";
+            $engineBind = trim($engine);
+        }
+
+        $out = [];
+
+        $params = [];
+        $sql    = "SELECT symbol, COUNT(*) AS trades,
+                    COALESCE(SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN pnl_usdt < 0 THEN 1 ELSE 0 END), 0) AS losses,
+                    COALESCE(SUM(gross_usdt), 0) AS gross,
+                    COALESCE(SUM(fees_usdt), 0)  AS fees,
+                    COALESCE(SUM(pnl_usdt), 0)   AS net
+             FROM positions WHERE status = 'CLOSED' AND pnl_usdt IS NOT NULL"
+                . self::modeClause($mode, $params);
+        if ($engineBind !== null) {
+            $sql .= $engineSql;
+            $params[] = $engineBind;
+        }
+        $sql .= ' GROUP BY symbol';
+        $st = $this->pdo->prepare($sql);
+        $st->execute($params);
+        foreach ($st->fetchAll() as $r) {
+            $symbol = strtoupper(trim((string) ($r['symbol'] ?? '')));
+            if ($symbol === '') {
+                continue;
+            }
+            $out[$symbol] = [
+                'trades'   => (int) ($r['trades'] ?? 0),
+                'wins'     => (int) ($r['wins'] ?? 0),
+                'losses'   => (int) ($r['losses'] ?? 0),
+                'gross'    => self::finite(isset($r['gross']) ? $r['gross'] : 0.0),
+                'fees'     => self::finite(isset($r['fees']) ? $r['fees'] : 0.0),
+                'net'      => self::finite(isset($r['net']) ? $r['net'] : 0.0),
+                'open'     => 0,
+                'deployed' => 0.0,
+            ];
+        }
+
+        $oParams = [];
+        $openSql = "SELECT symbol, COUNT(*) AS open_n, COALESCE(SUM(entry_quote), 0) AS deployed
+             FROM positions WHERE status IN ('OPEN', 'STUCK')"
+                . self::modeClause($mode, $oParams);
+        if ($engineBind !== null) {
+            $openSql .= $engineSql;
+            $oParams[] = $engineBind;
+        }
+        $openSql .= ' GROUP BY symbol';
+        $ost = $this->pdo->prepare($openSql);
+        $ost->execute($oParams);
+        foreach ($ost->fetchAll() as $r) {
+            $symbol = strtoupper(trim((string) ($r['symbol'] ?? '')));
+            if ($symbol === '') {
+                continue;
+            }
+            if (!isset($out[$symbol])) {
+                $out[$symbol] = [
+                    'trades' => 0, 'wins' => 0, 'losses' => 0,
+                    'gross'  => 0.0, 'fees' => 0.0, 'net' => 0.0,
+                    'open'   => 0, 'deployed' => 0.0,
+                ];
+            }
+            $out[$symbol]['open']     = (int) ($r['open_n'] ?? 0);
+            $out[$symbol]['deployed'] = self::finite(isset($r['deployed']) ? $r['deployed'] : 0.0);
+        }
+
+        // Scoreboard order: best net first, ties broken by symbol so the board is reproducible.
+        $nets = [];
+        foreach ($out as $symbol => $row) {
+            $nets[$symbol] = (float) $row['net'];
+        }
+        uksort($out, static function (string $a, string $b) use ($nets): int {
+            if ($nets[$a] !== $nets[$b]) {
+                return $nets[$b] <=> $nets[$a];
+            }
+            return strcmp($a, $b);
+        });
+        return $out;
+    }
+
+    /** A finite float, or 0.0. Keeps a NULL / NaN / INF out of a stored or reported number. */
+    private static function finite($v): float
+    {
+        if (!is_numeric($v)) {
+            return 0.0;
+        }
+        $f = (float) $v;
+        return is_finite($f) ? $f : 0.0;
     }
 
     /* --------------------------------------------------------- observations */

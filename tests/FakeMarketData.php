@@ -168,6 +168,12 @@ final class FakeMarketData implements MarketDataInterface
     private $extraInfo = [];
     /** @var array|null scripted /ticker/24hr rows; null uses the built-in fixture */
     private $tickers = null;
+    /** @var array SYMBOL => ['mids' => float[], 'spread' => float] scripted tick path */
+    private $paths = [];
+    /** @var int shared cursor into every scripted path */
+    private $cursor = 0;
+    /** @var int bookTickerAll() calls - the ONE call the scalp loop makes per poll */
+    private $bookAllCalls = 0;
 
     /**
      * @param array    $klines       symbol => interval => fixture name | absolute path | array of raw or parsed rows
@@ -303,6 +309,149 @@ final class FakeMarketData implements MarketDataInterface
     public function resetCalls(): void
     {
         $this->calls = [];
+        $this->bookAllCalls = 0;
+    }
+
+    /* -------------------------------------------- scripted tick path (scalp) */
+
+    /**
+     * Script a deterministic TICK PATH for one symbol (docs/DESIGN-SCALP.md §10 `scalp-loop`).
+     *
+     * The scalp engine polls a book every `scalp_poll_sec` and keeps a ring buffer of mids, so
+     * driving its real loop needs a price SERIES, not the single quote `setPrice()` scripts.
+     * A path is that series: one mid per poll, with the book derived from it at a fixed spread.
+     *
+     *     $md->setPath('DOGEUSDT', [1.00, 0.999, 0.998, 0.9985, 0.999], 0.02);
+     *
+     * The cursor is SHARED by every path, so several symbols advance together and one poll of
+     * the loop maps to exactly one `stepPath()`. It is advanced by the test's injected sleeper,
+     * never by the clock, so the loop runs instantly and nothing ever sleeps:
+     *
+     *     $t = 1000.0;
+     *     $clock   = function () use (&$t) { return $t; };
+     *     $sleeper = function ($sec) use (&$t, $md) { $t += (float) $sec; $md->stepPath(); };
+     *     (new Scalper($cfg, $db, $ex, $info, $clock, $sleeper))->run(['DOGEUSDT']);
+     *
+     * Past its last entry a path HOLDS its final price rather than wrapping or throwing: a loop
+     * whose `scalp_run_seconds` outlasts the script must keep managing open positions, and a
+     * price that silently jumped back to the start of the series would fake a round trip.
+     *
+     * @param float[] $mids     one mid price per poll, chronological
+     * @param float   $spreadPct total spread as a percent of mid (0.02 = 0.02 %, inside the
+     *                           default `scalp_max_spread_pct` of 0.05)
+     */
+    public function setPath(string $symbol, array $mids, float $spreadPct = 0.02): void
+    {
+        $clean = [];
+        foreach ($mids as $m) {
+            if (!is_numeric($m)) {
+                throw new RuntimeException('setPath: non-numeric mid for ' . $symbol);
+            }
+            $v = (float) $m;
+            if (!is_finite($v) || $v <= 0.0) {
+                throw new RuntimeException('setPath: mid must be finite and positive for ' . $symbol);
+            }
+            $clean[] = $v;
+        }
+        if ($clean === []) {
+            throw new RuntimeException('setPath: empty path for ' . $symbol);
+        }
+        $this->paths[strtoupper(trim($symbol))] = [
+            'mids'   => $clean,
+            'spread' => max(0.0, $spreadPct),
+        ];
+    }
+
+    /** Drop every scripted path (back to setPrice()/fixture pricing). */
+    public function clearPaths(): void
+    {
+        $this->paths = [];
+        $this->cursor = 0;
+    }
+
+    /** Advance the shared path cursor by $n polls. @return int the new cursor */
+    public function stepPath(int $n = 1): int
+    {
+        $this->cursor = max(0, $this->cursor + $n);
+        return $this->cursor;
+    }
+
+    /** Put the cursor back to a known poll (0 = the first scripted price). */
+    public function setPathCursor(int $i): int
+    {
+        $this->cursor = max(0, $i);
+        return $this->cursor;
+    }
+
+    public function pathCursor(): int
+    {
+        return $this->cursor;
+    }
+
+    /** Length of the longest scripted path, i.e. how many polls the script covers. */
+    public function pathLength(): int
+    {
+        $n = 0;
+        foreach ($this->paths as $p) {
+            $n = max($n, count($p['mids']));
+        }
+        return $n;
+    }
+
+    /** True once the cursor has run past the last scripted poll (prices then hold). */
+    public function pathExhausted(): bool
+    {
+        $n = $this->pathLength();
+        return $n === 0 || $this->cursor >= $n;
+    }
+
+    /** The scripted mid for one symbol at the current cursor, or null when it has no path. */
+    public function pathMid(string $symbol): ?float
+    {
+        $u = strtoupper(trim($symbol));
+        if (!isset($this->paths[$u])) {
+            return null;
+        }
+        $mids = $this->paths[$u]['mids'];
+        $i    = min($this->cursor, count($mids) - 1);
+        return (float) $mids[$i];
+    }
+
+    /**
+     * `GET /api/v3/ticker/bookTicker` with NO symbol: bid and ask for every scripted symbol in
+     * ONE call, which is the call DESIGN-SCALP.md §4 budgets one of per poll. Counted separately
+     * (`bookAllCalls()`) so a test can assert the loop really made one call per poll rather than
+     * one per symbol.
+     *
+     * @return array [SYMBOL => ['bid' => float, 'ask' => float]]
+     */
+    public function bookTickerAll(): array
+    {
+        $this->bookAllCalls++;
+        $this->hit('bookTickerAll');
+        $out = [];
+        foreach (array_keys($this->paths) as $sym) {
+            $out[$sym] = $this->pathBook((string) $sym);
+        }
+        foreach ($this->prices as $sym => $p) {
+            if (!isset($out[$sym])) {
+                $out[(string) $sym] = ['bid' => (float) $p['bid'], 'ask' => (float) $p['ask']];
+            }
+        }
+        return $out;
+    }
+
+    public function bookAllCalls(): int
+    {
+        return $this->bookAllCalls;
+    }
+
+    /** Bid/ask derived from a symbol's scripted path at the current cursor. */
+    private function pathBook(string $symbol): array
+    {
+        $mid  = (float) $this->pathMid($symbol);
+        $half = $mid * ($this->paths[strtoupper(trim($symbol))]['spread'] / 100.0) / 2.0;
+        return ['bid' => $mid - $half, 'ask' => $mid + $half];
     }
 
 
@@ -456,6 +605,11 @@ final class FakeMarketData implements MarketDataInterface
         $out = [];
         foreach ($symbols as $s) {
             $s = strtoupper((string) $s);
+            // a scripted tick path wins over a single scripted quote: it IS the live price
+            if (isset($this->paths[$s])) {
+                $out[$s] = (float) $this->pathMid($s);
+                continue;
+            }
             if (isset($this->prices[$s])) {
                 $out[$s] = (float) $this->prices[$s]['last'];
                 continue;
@@ -472,6 +626,9 @@ final class FakeMarketData implements MarketDataInterface
     {
         $this->hit('bookTicker');
         $symbol = strtoupper($symbol);
+        if (isset($this->paths[$symbol])) {
+            return $this->pathBook($symbol);
+        }
         if (isset($this->prices[$symbol])) {
             return ['bid' => (float) $this->prices[$symbol]['bid'], 'ask' => (float) $this->prices[$symbol]['ask']];
         }
@@ -760,6 +917,23 @@ final class FakePaperExchange implements ExchangeInterface
     {
         $this->matchOrders();
         return $this->md->bookTicker($symbol);
+    }
+
+    /**
+     * `GET /api/v3/ticker/bookTicker` with no symbol, forwarded to the scripted market data.
+     * Scalper::books() discovers it with method_exists() exactly as it discovers the real
+     * client's, so this is the path the fast loop takes: ONE call per poll for every symbol
+     * (DESIGN-SCALP.md §4). An exchange whose market data has none simply never offers it.
+     *
+     * @return array [SYMBOL => ['bid' => float, 'ask' => float]]
+     */
+    public function bookTickerAll(): array
+    {
+        $this->matchOrders();
+        if (!method_exists($this->md, 'bookTickerAll')) {
+            return [];
+        }
+        return $this->md->bookTickerAll();
     }
 
     public function symbolInfo(array $symbols): array

@@ -408,6 +408,56 @@ final class Binance
         ];
     }
 
+    /**
+     * GET /api/v3/ticker/bookTicker with NO symbol — best bid and ask for EVERY symbol on the
+     * exchange in one request. This is the call that prices the scalp engine's whole universe
+     * on every poll (docs/DESIGN-SCALP.md §4), so it has to stay cheap and it has to survive a
+     * malformed row without taking the loop down.
+     *
+     * **WEIGHT: assumed 4.** Binance publishes this endpoint's weight as "adjusted based on the
+     * number of requested symbols", and the value for the no-symbol form is the one that matters
+     * here. **This could not be confirmed against the live Binance spot documentation from the
+     * build sandbox (no outbound access to Binance), so the conservative figure the design asks
+     * for — 4 — is what the budget is built on.** Last published values seen were 2 for a single
+     * symbol and 4 with the parameter omitted. At the default `scalp_poll_sec` of 3 that is
+     * 20 polls/minute = 80 weight/minute against the 6000/minute request-weight limit, i.e. ~1.3 %
+     * of the budget, so the universe can grow a long way before this needs re-architecting.
+     * If the real weight ever turns out to be higher, re-check it HERE: every scalp poll pays it.
+     *
+     * Unlike ticker24h() this is deliberately NOT given a symbol filter: one unfiltered call is
+     * cheaper than filtering, and the caller picks its universe out of the returned map.
+     *
+     * Rows with a non-positive bid or ask are SKIPPED rather than returned as zeros: a symbol
+     * with an empty side of the book has no tradeable price, and handing a caller `bid = 0.0`
+     * invites a division by zero or an entry at a price that does not exist.
+     *
+     * @return array [SYMBOL => ['bid' => float, 'ask' => float]], uppercase symbols
+     */
+    public function bookTickerAll(): array
+    {
+        $r = $this->request('GET', '/api/v3/ticker/bookTicker', [], false, true, false);
+        if (isset($r['symbol'])) {
+            $r = [$r];          // a single-object answer (never expected here, but cheap to accept)
+        }
+        $out = [];
+        foreach ($r as $row) {
+            if (!is_array($row) || !isset($row['symbol'])) {
+                continue;
+            }
+            $symbol = strtoupper(trim((string) $row['symbol']));
+            if ($symbol === '') {
+                continue;
+            }
+            $bid = self::numField($row, 'bidPrice');
+            $ask = self::numField($row, 'askPrice');
+            if ($bid <= 0.0 || $ask <= 0.0) {
+                continue;       // one side of the book is empty: no tradeable price
+            }
+            $out[$symbol] = ['bid' => $bid, 'ask' => $ask];
+        }
+        return $out;
+    }
+
     /** @return array [symbol => float] */
     public function prices(array $symbols): array
     {
@@ -502,10 +552,14 @@ final class Binance
      * bookTicker weight to compute spreads:
      *
      *     ['symbol'=>string, 'last'=>float, 'bid'=>float, 'ask'=>float,
-     *      'change_pct'=>float, 'quote_vol'=>float, 'high'=>float, 'low'=>float]
+     *      'change_pct'=>float, 'quote_vol'=>float, 'high'=>float, 'low'=>float,
+     *      'count'=>int, 'weighted_avg'=>float]
      *
      * `change_pct` is the 24 h price change in percent, `quote_vol` the 24 h volume in the
-     * quote asset (USDT), which is the liquidity measure the scanner filters on.
+     * quote asset (USDT), which is the liquidity measure the scanner filters on. `count` is the
+     * number of trades in the window (the movers board's "many traders" term, DESIGN-SCALP.md §3)
+     * and `weighted_avg` the volume-weighted average price; both are additive and no existing
+     * consumer has to change.
      *
      * Like exchangeInfo()/prices(), an explicit symbol list that trips `-1121 invalid symbol`
      * is retried per symbol so one typo costs one symbol instead of the whole batch.
@@ -560,20 +614,34 @@ final class Binance
     /**
      * Normalise one raw /api/v3/ticker/24hr row to the scanner shape.
      *
+     * `count` and `weighted_avg` are ADDITIONS for the movers board (docs/DESIGN-SCALP.md §3);
+     * every key that was here before is unchanged, so `Scanner` and every existing consumer see
+     * exactly what they saw before.
+     *
+     *   `count`        the number of trades in the 24 h window, as an **int**. This is the user's
+     *                  "too many traders" signal — the thing the movers board ranks on — and it
+     *                  used to be thrown away by this very method. Ranked alongside the price
+     *                  range because a big range on nine trades is not a market, it is a gap.
+     *   `weighted_avg` `weightedAvgPrice`, the volume-weighted average over the window: where the
+     *                  volume actually traded, which `last` alone cannot say.
+     *
      * @param array $t raw row
-     * @return array{symbol:string,last:float,bid:float,ask:float,change_pct:float,quote_vol:float,high:float,low:float}
+     * @return array{symbol:string,last:float,bid:float,ask:float,change_pct:float,quote_vol:float,
+     *               high:float,low:float,count:int,weighted_avg:float}
      */
     public static function normalizeTicker24h(array $t): array
     {
         return [
-            'symbol'     => (string) ($t['symbol'] ?? ''),
-            'last'       => self::numField($t, 'lastPrice'),
-            'bid'        => self::numField($t, 'bidPrice'),
-            'ask'        => self::numField($t, 'askPrice'),
-            'change_pct' => self::numField($t, 'priceChangePercent'),
-            'quote_vol'  => self::numField($t, 'quoteVolume'),
-            'high'       => self::numField($t, 'highPrice'),
-            'low'        => self::numField($t, 'lowPrice'),
+            'symbol'       => (string) ($t['symbol'] ?? ''),
+            'last'         => self::numField($t, 'lastPrice'),
+            'bid'          => self::numField($t, 'bidPrice'),
+            'ask'          => self::numField($t, 'askPrice'),
+            'change_pct'   => self::numField($t, 'priceChangePercent'),
+            'quote_vol'    => self::numField($t, 'quoteVolume'),
+            'high'         => self::numField($t, 'highPrice'),
+            'low'          => self::numField($t, 'lowPrice'),
+            'count'        => self::intField($t, 'count'),
+            'weighted_avg' => self::numField($t, 'weightedAvgPrice'),
         ];
     }
 
@@ -585,6 +653,22 @@ final class Binance
         }
         $v = (float) $row[$key];
         return is_finite($v) ? $v : 0.0;
+    }
+
+    /**
+     * Non-negative int from a raw API row. A trade count is a count: negative is nonsense and a
+     * non-finite float would turn into an unpredictable int on cast, so both become 0.
+     */
+    private static function intField(array $row, string $key): int
+    {
+        if (!isset($row[$key]) || !is_numeric($row[$key])) {
+            return 0;
+        }
+        $v = (float) $row[$key];
+        if (!is_finite($v) || $v <= 0.0) {
+            return 0;
+        }
+        return (int) $v;
     }
 
 

@@ -34,7 +34,7 @@ final class Risk
     const ADAPT_WIN_HIGH = 60.0;
     const ADAPT_EXPECTANCY_LOW = -0.005;
     /** Engines (DESIGN-ENGINES.md §2); anything else is treated as 'signal'. */
-    const ENGINES = ['signal', 'grid', 'pmm'];
+    const ENGINES = ['signal', 'grid', 'pmm', 'scalp'];
     /** Hard ceiling on simultaneously open engine orders (engine_max_orders). */
     const ENGINE_MAX_ORDERS_CAP = 20;
     /** Grid rung count bounds. */
@@ -596,6 +596,30 @@ final class Risk
             'learn_recompute_hours'       => ['i', 1, 8760],
             'learn_window_days'           => ['i', 1, 3650],
             'bnb_min_balance'             => ['f', 0.0, 100000.0],
+            // scalp engine (DESIGN-SCALP.md §6). The bounds are the engine's own hard limits,
+            // so a value accepted here is one Scalper and Movers will actually honour rather
+            // than silently clamp - except where the clamp IS the safety rule, which is the
+            // case for run_seconds (the cron tick must end) and max_open.
+            'scalp_universe_size'          => ['i', 1, 30],
+            'scalp_order_usdt'             => ['f', 1.0, 10000.0],
+            'scalp_budget_per_symbol'      => ['f', 0.0, 1000000.0],
+            // 1..20 concurrent positions. Scalper::MAX_OPEN_CAP is a wider HARD ceiling of 30
+            // that protects the loop from a hand-edited config.json; this is the bound a save
+            // through the panel is held to, so the two are deliberately not the same number.
+            'scalp_max_open'               => ['i', 1, 20],
+            'scalp_tp_pct'                 => ['f', 0.01, 20.0],
+            'scalp_sl_pct'                 => ['f', 0.01, 20.0],
+            'scalp_max_hold_sec'           => ['i', 1, 86400],
+            'scalp_dip_pct'                => ['f', 0.0, 20.0],
+            'scalp_window'                 => ['i', 3, 200],             // Scalper::MIN_WINDOW / MAX_WINDOW
+            'scalp_poll_sec'               => ['f', 1.0, 30.0],          // Scalper::MIN_POLL_SEC / MAX_POLL_SEC
+            'scalp_run_seconds'            => ['i', 1, 55],              // Scalper::MAX_RUN_SECONDS
+            'scalp_max_consecutive_losses' => ['i', 2, 20],
+            'scalp_max_trades_per_hour'    => ['i', 1, 100000],
+            'scalp_min_quote_vol'          => ['f', 0.0, 1000000000000.0],
+            'scalp_min_trade_count'        => ['i', 0, 1000000000],
+            'scalp_max_spread_pct'         => ['f', 0.001, 5.0],
+            'scalp_universe_refresh_min'   => ['i', 1, 1440],
         ];
         foreach ($numeric as $key => $spec) {
             if (!array_key_exists($key, $in)) {
@@ -957,7 +981,212 @@ final class Risk
             self::checkSleeveBudgets($cfg, $quote, $errors, $warnings);
         }
 
+        self::validateScalp($in, $cfg, $quote, $errors, $warnings);
+
         return [$cfg, $errors, $warnings];
+    }
+
+    /* ----------------------------------------------------------- scalp (§6) */
+
+    /**
+     * Validate the scalp engine's non-scalar settings and state the fee arithmetic out loud
+     * (DESIGN-SCALP.md §6).
+     *
+     * The break-even check is a **WARNING, not an error**. The user may deliberately want to
+     * measure a sub-break-even target - that is a legitimate experiment and the whole reason
+     * this engine exists - but they must not be able to configure a guaranteed loss without
+     * being told the number. Silence here would be the single most expensive thing this
+     * function could do.
+     */
+    private static function validateScalp(array $in, array &$cfg, string $quote, array &$errors, array &$warnings): void
+    {
+        // ---- scalp_exclude: a list of symbols, same rules as scanner_exclude
+        if (array_key_exists('scalp_exclude', $in)) {
+            $list = $in['scalp_exclude'];
+            if (is_string($list)) {
+                $parts = preg_split('/[\s,;]+/', $list);
+                $list  = $parts === false ? [] : $parts;
+            }
+            if (!is_array($list)) {
+                $errors[] = 'scalp_exclude must be a list of symbols';
+            } else {
+                $clean = [];
+                $bad   = [];
+                foreach ($list as $sym) {
+                    if (!is_scalar($sym)) {
+                        continue;
+                    }
+                    $sym = strtoupper(trim((string) $sym));
+                    if ($sym === '') {
+                        continue;
+                    }
+                    if (preg_match('/^[A-Z0-9]{3,20}$/', $sym) === 1) {
+                        $clean[$sym] = true;
+                    } else {
+                        $bad[] = $sym;
+                    }
+                }
+                if ($bad !== []) {
+                    $errors[] = 'scalp_exclude: invalid symbols: ' . implode(', ', array_slice($bad, 0, 10));
+                } elseif (count($clean) > 200) {
+                    $errors[] = 'scalp_exclude: at most 200 symbols';
+                } else {
+                    $cfg['scalp_exclude'] = array_keys($clean);
+                }
+            }
+        }
+
+        // ---- scalp_budgets: a MAP of symbol to cap (§7). Accepts the JSON string the panel
+        //      posts, or an already-decoded map. An unparseable value is an error, not an
+        //      empty map: silently dropping every override would put every symbol back on the
+        //      default budget without saying so.
+        if (array_key_exists('scalp_budgets', $in)) {
+            $raw = $in['scalp_budgets'];
+            if (is_string($raw)) {
+                $t = trim($raw);
+                if ($t === '') {
+                    $cfg['scalp_budgets'] = [];
+                    $raw = null;
+                } else {
+                    $decoded = json_decode($t, true);
+                    if (!is_array($decoded)) {
+                        $errors[] = 'scalp_budgets must be JSON like {"BTCUSDT":200,"DOGEUSDT":50}';
+                        $raw = null;
+                    } else {
+                        $raw = $decoded;
+                    }
+                }
+            }
+            if (is_array($raw)) {
+                $clean = [];
+                $bad   = [];
+                foreach ($raw as $sym => $cap) {
+                    $sym = strtoupper(trim((string) $sym));
+                    if ($sym === '') {
+                        continue;
+                    }
+                    if (preg_match('/^[A-Z0-9]{3,20}$/', $sym) !== 1) {
+                        $bad[] = $sym;
+                        continue;
+                    }
+                    if (!is_numeric($cap) || is_bool($cap)) {
+                        $bad[] = $sym;
+                        continue;
+                    }
+                    $f = (float) $cap;
+                    if (!is_finite($f) || $f < 0.0 || $f > 1000000.0) {
+                        $bad[] = $sym;
+                        continue;
+                    }
+                    $clean[$sym] = $f;
+                }
+                if ($bad !== []) {
+                    $errors[] = 'scalp_budgets: invalid entries: ' . implode(', ', array_slice($bad, 0, 10))
+                              . ' (each value must be a number between 0 and 1000000)';
+                } elseif (count($clean) > 60) {
+                    $errors[] = 'scalp_budgets: at most 60 symbols';
+                } else {
+                    $cfg['scalp_budgets'] = $clean;
+                }
+            } elseif ($raw !== null) {
+                $errors[] = 'scalp_budgets must be a map of symbol to budget';
+            }
+        }
+
+        // ---- the break-even warning (§6). This is the number the user is really asking about
+        //      when they ask whether the thing makes money, so it is stated out loud and never
+        //      softened.
+        //
+        //      DELIBERATELY A WARNING, NEVER AN ERROR. §6 is explicit: the user may want to
+        //      measure a sub-break-even target on demo, which is a legitimate experiment and
+        //      the entire reason this engine exists. Rejecting the save would stop the
+        //      measurement; saying nothing would let them configure a guaranteed loss without
+        //      ever seeing the number. So it saves, and it says the number.
+        //
+        //      Two break-evens, both named, because they are different numbers and the
+        //      difference is exactly where the money goes:
+        //        * the ROUND TRIP costs `2 x fee_pct` of price (§2's 0.2 % at VIP0);
+        //        * but the target is measured on the BID against `entry_eff`, which already
+        //          carries the BUY fee (the commission came out of the base asset, so the same
+        //          money bought fewer coins). Against that reference the sell still owes
+        //          `fee_pct`, so a target at or below `fee_pct` loses on EVERY win.
+        $tp  = self::f($cfg, 'scalp_tp_pct', 0.25);
+        $sl  = self::f($cfg, 'scalp_sl_pct', 0.20);
+        $fee = self::f($cfg, 'fee_pct', 0.1);
+        if ($tp > 0.0 && $fee > 0.0) {
+            $roundTrip = 2.0 * $fee;
+            if ($tp <= $fee + 1e-12) {
+                $warnings[] = 'scalp_tp_pct (' . self::fmtBound($tp) . '%) is not above the '
+                    . self::fmtBound($fee) . '% fee still owed on the sell, so EVERY winning trade '
+                    . 'still closes at a loss - no win rate can save it. Break-even measured the '
+                    . 'way this engine measures it (on the bid, against entry_eff, which already '
+                    . 'carries the buy fee) is ' . self::fmtBound($fee) . '%; the round trip costs '
+                    . '2 x fee_pct = ' . self::fmtBound($roundTrip) . '% of price. Saved anyway: '
+                    . 'run it on demo and read the Gross / Fees / Net card, which is what it is for.';
+            } elseif ($tp < $roundTrip - 1e-12) {
+                $warnings[] = 'scalp_tp_pct (' . self::fmtBound($tp) . '%) is below the round-trip '
+                    . 'fee cost of 2 x fee_pct = ' . self::fmtBound($roundTrip) . '%. Measured on the '
+                    . 'bid against entry_eff (which already carries the buy fee) break-even is '
+                    . self::fmtBound($fee) . '%, so each win clears only about +'
+                    . self::fmtBound($tp - $fee) . '% before slippage. This is a WARNING, not an '
+                    . 'error - measuring a sub-break-even target on demo is the point - but expect '
+                    . 'the Gross / Fees / Net card to show a positive gross with a negative net.';
+            }
+            $tpNet = $tp - $fee;
+            $slNet = $sl + $fee;
+            if ($tpNet > 0.0 && $tpNet + $slNet > 0.0) {
+                $be = $slNet / ($tpNet + $slNet) * 100.0;
+                $warnings[] = 'scalp: at tp ' . self::fmtBound($tp) . '% / sl ' . self::fmtBound($sl)
+                    . '% / fee ' . self::fmtBound($fee) . '% per side, a win nets about +'
+                    . self::fmtBound($tpNet) . '% and a loss about -' . self::fmtBound($slNet)
+                    . '%, so you need a ' . number_format($be, 1) . '% win rate just to break even '
+                    . 'before slippage. Run it on demo and read the Gross / Fees / Net panel '
+                    . 'before trusting it with real money.';
+            }
+        }
+
+        // ---- the per-symbol allocation, measured against the FREE QUOTE actually in the
+        //      account (§7), exactly like checkSleeveBudgets() does for the sleeves.
+        //      A WARNING, not an error: §7 is explicit that not every symbol is deployed at
+        //      once, so a ceiling above the balance is a normal, deliberate configuration -
+        //      but the user asked "which coin makes money" with a budget per coin, and they
+        //      must be told when those budgets cannot all be funded at the same time.
+        $size = self::i($cfg, 'scalp_universe_size', 20);
+        $per  = self::f($cfg, 'scalp_budget_per_symbol', 100.0);
+        if ($size > 0) {
+            $map     = isset($cfg['scalp_budgets']) && is_array($cfg['scalp_budgets']) ? $cfg['scalp_budgets'] : [];
+            $named   = 0;
+            $namedSum = 0.0;
+            foreach ($map as $cap) {
+                if (is_numeric($cap)) {
+                    $namedSum += (float) $cap;
+                    $named++;
+                }
+            }
+            // the universe holds `scalp_universe_size` symbols; the ones without an override
+            // fall back to `scalp_budget_per_symbol`
+            $total = $namedSum + (float) max(0, $size - $named) * max(0.0, $per);
+            $free  = self::lastTotalQuote();
+            if ($total > 0.0 && $free > 0.0 && $total > $free + 1e-9) {
+                $warnings[] = 'scalp: the per-symbol budgets allocate ' . self::fmtBound($total) . ' '
+                    . $quote . ' across ' . $size . ' symbols (' . $named . ' override(s) plus '
+                    . max(0, $size - $named) . ' x ' . self::fmtBound($per) . '), more than the '
+                    . self::fmtBound($free) . ' ' . $quote . ' the account holds. Each cap is a '
+                    . 'per-symbol CEILING, so this is allowed - not every symbol is deployed at '
+                    . 'once - but they cannot all be funded together, and a symbol will stop with '
+                    . 'reason insufficient_quote rather than symbol_budget when the balance runs out.';
+            }
+        }
+
+        // ---- a scalp order has to clear the smallest minNotional on the exchange (5 USDT on
+        //      most USDT pairs, 1 on DOGEUSDT) or Movers gates every symbol `too_small` and the
+        //      engine runs with an empty universe while looking perfectly healthy.
+        $order = self::f($cfg, 'scalp_order_usdt', 6.0);
+        if ($order > 0.0 && $order < 5.5 && $quote === 'USDT') {
+            $warnings[] = 'scalp_order_usdt is ' . self::fmtBound($order) . ' USDT. Most USDT pairs '
+                . 'have a 5 USDT minimum and need headroom above it, so at this size the movers '
+                . 'board will gate most symbols `too_small` and only a few cheap pairs will trade.';
+        }
     }
 
     /* --------------------------------------------------- portfolio sleeves */

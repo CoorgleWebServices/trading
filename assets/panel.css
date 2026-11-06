@@ -363,3 +363,28 @@ form.inline.assign .assign-select {
 }
 .ok-tag  { color: var(--ok, #2c7a57);  border-color: var(--ok, #2c7a57);  background: rgba(44,122,87,.10); }
 .bad-tag { color: var(--bad, #b03434); border-color: var(--bad, #b03434); background: rgba(176,52,52,.10); }
+
+/* ---- scalp engine, movers board and the per-symbol scoreboard (docs/DESIGN-SCALP.md §9)
+   Every rule here is a CLASS. The CSP forbids inline style attributes and inline scripts, so
+   index.php emits neither: the pause banner and the two cards are shown and hidden with the
+   `hidden` attribute server-side and by assets/panel.js on refresh, never with a style="".
+
+   The verdict table (§2 gross / fees / net) is deliberately the loudest thing on the card: it
+   is the answer the whole engine exists to produce, and the sample size sits beside it so a
+   handful of green trades can never read as a result. */
+.danger-card { border-color: var(--danger); background: linear-gradient(180deg, rgba(255, 92, 92, .10), var(--card) 60%); }
+.danger-card h2 { color: var(--danger); }
+.danger-card form.inline { margin-top: 8px; }
+
+.scalp-card h2, .movers-card h2 { gap: .4rem; flex-wrap: wrap; }
+.scalp-card h3, .movers-card h3 { margin: 16px 0 6px; font-size: .95rem; letter-spacing: .03em; text-transform: uppercase; color: var(--accent); }
+
+/* the §2 verdict block: three money rows plus the sample size, never net on its own */
+table.tbl.verdict { max-width: 760px; }
+table.tbl.verdict th { width: 14rem; font-weight: 600; white-space: nowrap; }
+table.tbl.verdict td.num { font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; }
+table.tbl.verdict tr:nth-child(3) > th, table.tbl.verdict tr:nth-child(3) > td { border-top: 2px solid var(--line); font-size: 1.05em; }
+
+/* the scoreboard is wide: let it scroll rather than squeeze the numbers into two lines */
+.scalp-card table.tbl td.num, .movers-card table.tbl td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.scalp-card .table-wrap, .movers-card .table-wrap { overflow-x: auto; }

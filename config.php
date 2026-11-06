@@ -121,7 +121,79 @@ function trader_config_defaults(): array
         'learn_recompute_hours'       => 168,
         'learn_window_days'           => 90,
         'bnb_min_balance'             => 1.0,
+
+        // --- scalp engine (docs/DESIGN-SCALP.md §6): fast, many-symbol micro-trading. Same
+        //     reason as the engine and portfolio keys - a config.json written before the scalp
+        //     engine existed still comes back from trader_config() complete and typed.
+        //
+        //     The one key worth reading twice is `scalp_tp_pct`. With `fee_pct` at 0.1 the
+        //     target is measured on the bid against entry_eff, which already carries the BUY
+        //     fee, so 0.25 nets about +0.15 % on a win while 0.20 loses about -0.30 % - a
+        //     break-even win rate near 67 %. Risk::validateConfig() says so explicitly rather
+        //     than letting the arithmetic stay buried here.
+        'scalp_universe_size'         => 20,
+        'scalp_order_usdt'            => 6.0,
+        'scalp_budget_per_symbol'     => 100.0,
+        // Per-symbol overrides, e.g. {"BTCUSDT":200,"DOGEUSDT":50}. A MAP, not a list, so
+        // trader_config_merge() routes it through trader_config_budgets() instead of
+        // trader_config_cast(), which would flatten the keys away.
+        'scalp_budgets'               => [],
+        'scalp_max_open'              => 6,
+        'scalp_tp_pct'                => 0.25,
+        'scalp_sl_pct'                => 0.20,
+        'scalp_max_hold_sec'          => 120,
+        'scalp_dip_pct'               => 0.15,
+        'scalp_window'                => 20,
+        'scalp_poll_sec'              => 3,
+        'scalp_run_seconds'           => 50,
+        'scalp_max_consecutive_losses' => 5,
+        'scalp_max_trades_per_hour'   => 60,
+        'scalp_min_quote_vol'         => 20000000.0,
+        'scalp_min_trade_count'       => 50000,
+        'scalp_max_spread_pct'        => 0.05,
+        'scalp_universe_refresh_min'  => 10,
+        'scalp_exclude'               => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT', 'USDPUSDT'],
     ];
+}
+
+/**
+ * Normalise `scalp_budgets` (DESIGN-SCALP.md §7) to [SYMBOL => float].
+ *
+ * It is a MAP of symbol to cap, which trader_config_cast() cannot handle - its array branch
+ * builds a LIST and would throw the symbols away, leaving every override silently ignored and
+ * every symbol back on the default budget. Accepts a decoded map, or the JSON string the panel
+ * form posts. Negative and non-numeric caps are dropped rather than coerced to 0: a cap of 0
+ * stops a symbol trading entirely, which is not what a typo should do.
+ */
+function trader_config_budgets($value, array $default): array
+{
+    if (is_string($value)) {
+        $trimmed = trim($value);
+        if ($trimmed === '') {
+            return [];
+        }
+        $decoded = json_decode($trimmed, true);
+        if (!is_array($decoded)) {
+            return $default;
+        }
+        $value = $decoded;
+    }
+    if (!is_array($value)) {
+        return $default;
+    }
+    $out = [];
+    foreach ($value as $sym => $cap) {
+        $sym = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) $sym));
+        if ($sym === '' || !is_numeric($cap)) {
+            continue;
+        }
+        $f = (float) $cap;
+        if (!is_finite($f) || $f < 0.0) {
+            continue;
+        }
+        $out[$sym] = $f;
+    }
+    return $out;
 }
 
 /**
@@ -239,6 +311,8 @@ function trader_config_merge(array $cfg): array
     foreach ($cfg as $k => $v) {
         if ($k === 'sleeves') {
             $out['sleeves'] = trader_config_sleeves($v, $out['sleeves']);
+        } elseif ($k === 'scalp_budgets') {
+            $out['scalp_budgets'] = trader_config_budgets($v, $out['scalp_budgets']);
         } elseif (array_key_exists($k, $out)) {
             $out[$k] = trader_config_cast($v, $out[$k]);
         } else {

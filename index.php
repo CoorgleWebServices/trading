@@ -359,6 +359,10 @@ function handle_action(string $action, array $cfg, Db $db): void
             handle_sleeve_action($action, $cfg, $db);
             return;
 
+        case 'resume_scalp':
+            handle_scalp_action($cfg, $db);
+            return;
+
         case 'recompute_learning':
         case 'learn_recompute':
             handle_learning_action($cfg, $db);
@@ -798,6 +802,47 @@ function handle_sleeve_action(string $action, array $cfg, Db $db): void
  * anything dangerous - and holding the tick lock for a statistics pass would only
  * cost the operator a minute of trading.
  */
+/**
+ * "Resume scalping" (DESIGN-SCALP.md §5) - POST + CSRF (checked globally before routing) and
+ * inside Bot::runLocked so it can never race a cron tick that is mid-loop.
+ *
+ * This is the whole "pause and ask me to resume" contract: the engine stops opening positions
+ * after `scalp_max_consecutive_losses` losses in a row and NEVER lifts that itself. Only this
+ * button does. Nothing else in the codebase clears `scalp_paused`.
+ */
+function handle_scalp_action(array $cfg, Db $db): void
+{
+    if (!class_exists('Scalper') || !class_exists('Bot')) {
+        Panel::flash('danger', 'lib/Scalper.php is missing - the scalp actions are unavailable.');
+        Panel::redirect('?page=dashboard');
+    }
+    if (trim((string) $db->getState('scalp_paused', '')) !== '1') {
+        Panel::flash('warn', 'The scalp engine is not paused, so there is nothing to resume.');
+        Panel::redirect('?page=dashboard');
+    }
+    try {
+        $res = Bot::runLocked(static function () use ($cfg, $db): array {
+            // The exchange is only needed for the constructor; resume() touches state alone and
+            // places no order, so a paper exchange is enough even in demo or live mode.
+            $ex = Exchange::factory($cfg, $db);
+            $sc = new Scalper($cfg, $db, $ex);
+            $streak = $sc->lossStreak();
+            $sc->resume();
+            return ['status' => 'ok', 'summary' => (string) $streak, 'ms' => 0];
+        });
+        if ((string) ($res['status'] ?? '') === 'busy') {
+            Panel::flash('warn', 'A tick is running right now - try Resume again in a few seconds.');
+        } else {
+            Panel::flash('ok', 'Scalping resumed. The losing streak was reset to 0 and entries are '
+                . 'allowed again from the next tick. The global kill switches (equity floor, '
+                . 'drawdown, daily and weekly caps) are unchanged and still apply.');
+        }
+    } catch (Throwable $e) {
+        Panel::flash('danger', 'Resume failed: ' . $e->getMessage());
+    }
+    Panel::redirect('?page=dashboard');
+}
+
 function handle_learning_action(array $cfg, Db $db): void
 {
     if (!class_exists('Learn')) {
@@ -973,6 +1018,12 @@ function settings_keys(): array
         'portfolio_enabled', 'sleeve_reserve_pct', 'sleeve_max_drawdown_pct',
         'scanner_enabled', 'scanner_refresh_min', 'scanner_min_quote_vol', 'scanner_max_spread_pct',
         'scanner_min_atr_pct', 'scanner_max_atr_pct', 'scanner_top_n', 'scanner_exclude',
+        // scalp engine (DESIGN-SCALP.md §6)
+        'scalp_universe_size', 'scalp_order_usdt', 'scalp_budget_per_symbol', 'scalp_budgets',
+        'scalp_max_open', 'scalp_tp_pct', 'scalp_sl_pct', 'scalp_max_hold_sec', 'scalp_dip_pct',
+        'scalp_window', 'scalp_poll_sec', 'scalp_run_seconds', 'scalp_max_consecutive_losses',
+        'scalp_max_trades_per_hour', 'scalp_min_quote_vol', 'scalp_min_trade_count',
+        'scalp_max_spread_pct', 'scalp_universe_refresh_min', 'scalp_exclude',
         // learning + the BNB fee discount (DESIGN-LEARNING.md §5, §7)
         'learning_enabled', 'learning_apply', 'learn_min_samples', 'learn_recompute_hours', 'learn_window_days',
         'bnb_min_balance'];
@@ -1004,6 +1055,25 @@ function panel_portfolio_defaults(): array
         'scanner_max_atr_pct'     => 4.0,
         'scanner_top_n'           => 10,
         'scanner_exclude'         => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT'],
+        'scalp_universe_size'     => 20,
+        'scalp_order_usdt'        => 6.0,
+        'scalp_budget_per_symbol' => 100.0,
+        'scalp_budgets'           => [],
+        'scalp_max_open'          => 6,
+        'scalp_tp_pct'            => 0.25,
+        'scalp_sl_pct'            => 0.20,
+        'scalp_max_hold_sec'      => 120,
+        'scalp_dip_pct'           => 0.15,
+        'scalp_window'            => 20,
+        'scalp_poll_sec'          => 3,
+        'scalp_run_seconds'       => 50,
+        'scalp_max_consecutive_losses' => 5,
+        'scalp_max_trades_per_hour'    => 60,
+        'scalp_min_quote_vol'     => 20000000.0,
+        'scalp_min_trade_count'   => 50000,
+        'scalp_max_spread_pct'    => 0.05,
+        'scalp_universe_refresh_min'   => 10,
+        'scalp_exclude'           => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT', 'USDPUSDT'],
         'sleeves'                 => [
             'signal' => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['SOLUSDT', 'ETHUSDT']],
             'grid'   => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['DOGEUSDT']],
@@ -1154,6 +1224,7 @@ function settings_portfolio_fallback(array $in, array $cfg, array $newCfg): arra
                 $newCfg[$key] = (int) Util::clamp(panel_num($raw, 10.0), 1.0, 100.0);
                 break;
             case 'scanner_exclude':
+            case 'scalp_exclude':
                 $list = [];
                 foreach (preg_split('/[\s,;]+/', (string) $raw) as $sym) {
                     $sym = strtoupper(trim((string) $sym));
@@ -1163,6 +1234,69 @@ function settings_portfolio_fallback(array $in, array $cfg, array $newCfg): arra
                 }
                 $newCfg[$key] = $list;
                 break;
+
+            // ---- scalp engine (DESIGN-SCALP.md §6). The bounds here match
+            //      Risk::validateConfig()'s, which has the last word; clamping first just means
+            //      a slipped decimal point comes back as a clamped value and a warning rather
+            //      than as an error that throws the whole form away.
+            case 'scalp_universe_size':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 20.0), 1.0, 30.0);
+                break;
+            case 'scalp_order_usdt':
+                $newCfg[$key] = Util::clamp(panel_num($raw, 6.0), 1.0, 10000.0);
+                break;
+            case 'scalp_budget_per_symbol':
+                $newCfg[$key] = Util::clamp(panel_num($raw, 100.0), 0.0, 1000000.0);
+                break;
+            case 'scalp_budgets':
+                // The form posts JSON. It is passed straight through so Risk::validateConfig()
+                // can REPORT an unparseable value: quietly replacing it with an empty map would
+                // put every symbol back on the default budget without saying so.
+                $newCfg[$key] = $raw;
+                break;
+            case 'scalp_max_open':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 6.0), 1.0, 30.0);
+                break;
+            case 'scalp_tp_pct':
+                $newCfg[$key] = Util::clamp(panel_num($raw, 0.25), 0.01, 20.0);
+                break;
+            case 'scalp_sl_pct':
+                $newCfg[$key] = Util::clamp(panel_num($raw, 0.20), 0.01, 20.0);
+                break;
+            case 'scalp_max_hold_sec':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 120.0), 1.0, 86400.0);
+                break;
+            case 'scalp_dip_pct':
+                $newCfg[$key] = Util::clamp(panel_num($raw, 0.15), 0.0, 20.0);
+                break;
+            case 'scalp_window':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 20.0), 3.0, 200.0);
+                break;
+            case 'scalp_poll_sec':
+                $newCfg[$key] = Util::clamp(panel_num($raw, 3.0), 1.0, 30.0);
+                break;
+            case 'scalp_run_seconds':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 50.0), 1.0, 55.0);
+                break;
+            case 'scalp_max_consecutive_losses':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 5.0), 2.0, 20.0);
+                break;
+            case 'scalp_max_trades_per_hour':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 60.0), 1.0, 100000.0);
+                break;
+            case 'scalp_min_quote_vol':
+                $newCfg[$key] = max(0.0, panel_num($raw, 20000000.0));
+                break;
+            case 'scalp_min_trade_count':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 50000.0), 0.0, 1000000000.0);
+                break;
+            case 'scalp_max_spread_pct':
+                $newCfg[$key] = Util::clamp(panel_num($raw, 0.05), 0.001, 5.0);
+                break;
+            case 'scalp_universe_refresh_min':
+                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 10.0), 1.0, 1440.0);
+                break;
+
             default:
                 break;
         }
@@ -1768,6 +1902,7 @@ function page_diagnostics(array $cfg): string
         'Market making (pmm)'  => [['lib/EnginePmm.php','lib/EngineOrders.php','lib/Bot.php'], 'lib/Bot.php', 'EnginePmm'],
         'Portfolio sleeves'    => [['lib/Sleeve.php','index.php'], 'index.php', 'portfolio_enabled'],
         'Volatility scanner'   => [['lib/Scanner.php','lib/Bot.php'], 'lib/Bot.php', 'Scanner'],
+        'Scalp engine'         => [['lib/Scalper.php','lib/Movers.php','cron.php'], 'cron.php', 'Scalper'],
         'Learning / Insights'  => [['lib/Learn.php','index.php'], 'index.php', 'insights'],
         'BNB fee discount'     => [['lib/Binance.php'], 'lib/Binance.php', 'bnbBurn'],
     ];
@@ -1966,6 +2101,10 @@ function page_dashboard(array $cfg, array $s): string
         . '</tr></thead><tbody data-table="symbols" data-cols="11">' . Panel::tableRows($s['tables']['symbols']) . '</tbody></table></div>'
         . '<p class="muted small">Required size = (minNotional × 1.15 + stepSize × price) / (1 − fee): the quote amount a buy needs so the later sell still passes the NOTIONAL filter. '
         . 'Symbols whose required size exceeds the trade size are skipped. ATR / spread columns fill in when the tick publishes per-symbol metrics.</p></section>';
+
+    // ---- scalp engine (DESIGN-SCALP.md §9): the pause banner first, then the verdict card,
+    //      the per-symbol scoreboard, the open positions and the movers board.
+    $h .= panel_scalp_dashboard($s, $quote);
 
     // ---- scanner (DESIGN-PORTFOLIO.md §7)
     $h .= panel_scanner_dashboard($s, !empty($s['show']['scanner']));
@@ -2202,6 +2341,128 @@ function panel_sleeve_form(string $action, string $engine, string $label, string
 }
 
 /**
+ * Scalp engine blocks (DESIGN-SCALP.md §9): the pause banner, the Gross / Fees / Net verdict,
+ * the per-symbol scoreboard, the open positions and the movers board.
+ *
+ * No inline script, no inline handler and no style attribute anywhere in here - the CSP forbids
+ * all three and tests/run.php asserts it.
+ *
+ * The verdict block is the point of the whole engine, so it is deliberately the loudest thing
+ * on the card and it always carries the trade count. §2: never show net alone.
+ */
+function panel_scalp_dashboard(array $s, string $quote): string
+{
+    $e    = 'Panel::e';
+    $show = isset($s['show']) && is_array($s['show']) ? $s['show'] : [];
+    $txt  = isset($s['text']) && is_array($s['text']) ? $s['text'] : [];
+    $lvl  = isset($s['levels']) && is_array($s['levels']) ? $s['levels'] : [];
+    $on   = !empty($show['scalp']);
+    $h    = '';
+
+    // ---- the pause banner. The user asked to be ASKED, so this is a banner with a button, not
+    //      a line in a log they would have to go looking for.
+    $hidB = !empty($show['scalp_paused']) ? '' : ' hidden';
+    $h .= '<section class="card danger-card" data-show="scalp_paused"' . $hidB . '>';
+    $h .= '<h2>Scalping is paused</h2>';
+    $h .= '<p><span data-field="scalp_pause_reason">' . $e((string) ($txt['scalp_pause_reason'] ?? '')) . '</span></p>';
+    $h .= '<p class="muted small">Open positions are still being managed to their exit - only new '
+        . 'entries are held. Resuming resets the losing streak to 0. The global kill switches '
+        . '(equity floor, drawdown, daily and weekly caps) are separate and still apply.</p>';
+    $h .= '<form method="post" action="index.php" class="inline">' . Panel::csrfField()
+        . '<input type="hidden" name="action" value="resume_scalp">'
+        . '<button type="submit" class="btn btn-warn">Resume scalping</button></form>';
+    $h .= '</section>';
+
+    // ---- the verdict card
+    $hid = $on ? '' : ' hidden';
+    $h .= '<section class="card scalp-card" data-show="scalp"' . $hid . '>';
+    $h .= '<h2>Scalp engine '
+        . Panel::pill((string) ($txt['scalp_state'] ?? '-'), (string) ($lvl['scalp_state'] ?? 'muted'), 'scalp_state')
+        . ' ' . Panel::pill((string) ($txt['scalp_streak'] ?? '-'), (string) ($lvl['scalp_streak'] ?? 'muted'), 'scalp_streak')
+        . '</h2>';
+
+    $h .= '<div class="table-wrap"><table class="tbl compact verdict"><tbody>';
+    $h .= '<tr><th>Gross P&amp;L (before fees)</th><td class="num ' . $e('lvl-' . (string) ($lvl['scalp_gross'] ?? 'muted'))
+        . '" data-field="scalp_gross">' . $e((string) ($txt['scalp_gross'] ?? '-')) . '</td>'
+        . '<td class="muted small">is there ANY directional edge?</td></tr>';
+    $h .= '<tr><th>Fees paid</th><td class="num ' . $e('lvl-' . (string) ($lvl['scalp_fees'] ?? 'muted'))
+        . '" data-field="scalp_fees">' . $e((string) ($txt['scalp_fees'] ?? '-')) . '</td>'
+        . '<td class="muted small">what it cost to find out</td></tr>';
+    $h .= '<tr><th>Net P&amp;L</th><td class="num ' . $e('lvl-' . (string) ($lvl['scalp_net'] ?? 'muted'))
+        . '" data-field="scalp_net">' . $e((string) ($txt['scalp_net'] ?? '-')) . '</td>'
+        . '<td class="muted small">the answer</td></tr>';
+    $h .= '<tr><th>Sample</th><td class="num" data-field="scalp_trades">' . $e((string) ($txt['scalp_trades'] ?? '-')) . '</td>'
+        . '<td class="muted small">a few green trades prove nothing</td></tr>';
+    $h .= '<tr><th>Win rate</th><td class="num ' . $e('lvl-' . (string) ($lvl['scalp_win_rate'] ?? 'muted'))
+        . '" data-field="scalp_win_rate">' . $e((string) ($txt['scalp_win_rate'] ?? '-')) . '</td>'
+        . '<td class="muted small">a target measured against entry_eff still owes the sell fee</td></tr>';
+    $h .= '</tbody></table></div>';
+
+    $h .= '<p class="' . $e('lvl-' . (string) ($lvl['scalp_verdict'] ?? 'muted')) . '" data-field="scalp_verdict">'
+        . $e((string) ($txt['scalp_verdict'] ?? '')) . '</p>';
+    // Throughput: the entries this hour against the runaway cap, and the polls the last loop
+    // actually managed. The user asked for "multiple trades every minute or second", so both
+    // numbers belong on the card: the cap is what stops it, the poll count is what it achieved.
+    $h .= '<p class="muted small">Entries: <span class="' . $e('lvl-' . (string) ($lvl['scalp_entries_hour'] ?? 'muted'))
+        . '" data-field="scalp_entries_hour">' . $e((string) ($txt['scalp_entries_hour'] ?? '-')) . '</span>. '
+        . 'Polls in the last run: <span data-field="scalp_polls">' . $e((string) ($txt['scalp_polls'] ?? '0')) . '</span>. '
+        . 'Last run: <span data-field="scalp_last_run">' . $e((string) ($txt['scalp_last_run'] ?? '')) . '</span>. '
+        . 'Cadence: <span data-field="scalp_cadence">' . $e((string) ($txt['scalp_cadence'] ?? '')) . '</span>. '
+        . 'Gross minus fees equals net exactly, per closed trade and in total - if they ever disagree, '
+        . 'the accounting is wrong and the verdict should not be trusted.</p>';
+
+    // ---- per-symbol scoreboard
+    $h .= '<h3>Per-symbol scoreboard</h3>';
+    $h .= '<div class="table-wrap"><table class="tbl"><thead><tr>'
+        . '<th>Symbol</th><th>Budget</th><th>Deployed</th><th>Available</th><th>Trades</th><th>Win rate</th>'
+        . '<th>Gross ' . $e($quote) . '</th><th>Fees</th><th>Net ' . $e($quote) . '</th><th>Net % of budget</th>'
+        . '</tr></thead><tbody data-table="scalp_board" data-cols="10">'
+        . Panel::tableRows(isset($s['tables']['scalp_board']) && is_array($s['tables']['scalp_board']) ? $s['tables']['scalp_board'] : [])
+        . '</tbody></table></div>';
+    $h .= '<p class="muted small">Every symbol spends only its own pot: available = budget + realised net − deployed, '
+        . 'clamped at zero. A symbol that loses its budget stops trading on its own while the others carry on. '
+        . 'Set the default and the per-symbol overrides in Settings → Scalp engine. '
+        . 'Sorting by net is NOT a recommendation - with a handful of trades per symbol the order is mostly luck.</p>';
+
+    // ---- open positions
+    $h .= '<h3>Open scalp positions</h3>';
+    $h .= '<div class="table-wrap"><table class="tbl compact"><thead><tr>'
+        . '<th>Symbol</th><th>Qty</th><th>Entry eff.</th><th>Cost ' . $e($quote) . '</th>'
+        . '<th>Age (s)</th><th>Unrealised</th><th>Reason</th>'
+        . '</tr></thead><tbody data-table="scalp_open" data-cols="7">'
+        . Panel::tableRows(isset($s['tables']['scalp_open']) && is_array($s['tables']['scalp_open']) ? $s['tables']['scalp_open'] : [])
+        . '</tbody></table></div>';
+    $h .= '<p class="muted small">Age is in SECONDS because that is the scale this engine works on - '
+        . 'a position is timed out at scalp_max_hold_sec whether it is up or down. Unrealised is measured '
+        . 'against entry_eff (the dust-excluded basis that already carries the buy fee) from the last price '
+        . 'the tick or the movers board recorded, so it is a few seconds stale and still owes the sell fee; '
+        . 'it reads &quot;-&quot; when no price is known rather than pretending the position is flat.</p>';
+    $h .= '</section>';
+
+    // ---- movers board: the "top coins with fluctuations and many traders" table
+    $hidM = !empty($show['movers']) ? '' : ' hidden';
+    $h .= '<section class="card movers-card" data-show="movers"' . $hidM . '>';
+    $h .= '<h2>Movers - top 10 by fluctuation and traders '
+        . Panel::pill((string) ($txt['movers_age'] ?? '-'), (string) ($lvl['movers_age'] ?? 'muted'), 'movers_age') . '</h2>';
+    $h .= '<div class="table-wrap"><table class="tbl"><thead><tr>'
+        . '<th>#</th><th>Symbol</th><th>Last</th><th>24 h change</th><th>24 h range</th><th>24 h trades</th>'
+        . '<th>24 h quote vol</th><th>Spread</th><th>Required size</th><th>Score</th><th>State</th><th>Gates</th>'
+        . '</tr></thead><tbody data-table="movers" data-cols="12">'
+        . Panel::tableRows(isset($s['tables']['movers']) && is_array($s['tables']['movers']) ? $s['tables']['movers'] : [])
+        . '</tbody></table></div>';
+    $h .= '<p class="muted small">score = 0.45 × range rank + 0.35 × trade-count rank + 0.20 × liquidity rank − spread penalty, '
+        . 'each rank taken across the eligible set so no one term wins on units alone. '
+        . '<strong>Range, not 24 h change</strong>: a coin that rose 3 % and stayed there has nothing left to scalp, '
+        . 'while one that swung 3 % up and back has had dozens of round trips. '
+        . '<strong>Trade count, not volume</strong>: one whale moving 50 M is not "many traders". '
+        . 'A gated row is kept, not dropped, so the gate can explain the rejection. '
+        . '<span data-field="movers_meta">' . $e((string) ($txt['movers_meta'] ?? '')) . '</span>.</p>';
+    $h .= '</section>';
+
+    return $h;
+}
+
+/**
  * Volatility scanner card (DESIGN-PORTFOLIO.md §5, §7): every documented column plus the
  * per-row "Assign to…" control. The scanner never reassigns anything by itself - this control
  * is the only way a suggestion is applied, and it refuses an assignment that would strand
@@ -2425,17 +2686,19 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
 
     // -- engine (DESIGN-ENGINES.md §2, §10)
     $engine = strtolower(trim((string) ($v['engine'] ?? 'signal')));
-    if (!in_array($engine, ['signal', 'grid', 'pmm'], true)) {
+    if (!in_array($engine, ['signal', 'grid', 'pmm', 'scalp'], true)) {
         $engine = 'signal';
     }
     $h .= '<fieldset><legend>Engine</legend>';
     $h .= '<div class="grid3">';
-    $h .= '<label>Engine<span class="muted help">signal trades one position at a time on the watchlist; grid and pmm quote one symbol continuously</span>'
+    $h .= '<label>Engine<span class="muted help">signal trades one position at a time on the watchlist; grid and pmm quote one symbol continuously; '
+        . 'scalp trades many symbols at once, many times a minute</span>'
         . '<select name="engine" data-engine-select>';
     foreach ([
         'signal' => 'signal - mean-reversion, market orders, one position',
         'grid'   => 'grid - ladder of resting limit orders',
         'pmm'    => 'pmm - pure market making (expected to lose at VIP0 fees)',
+        'scalp'  => 'scalp - fast micro-trades across 20-30 symbols at once (demo, to measure it)',
     ] as $k => $label) {
         $h .= '<option value="' . $e($k) . '"' . ($engine === $k ? ' selected' : '') . '>' . $e($label) . '</option>';
     }
@@ -2445,8 +2708,8 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     $h .= '</div>';
     $h .= panel_check('post_only', $v, 'Post-only quotes (LIMIT_MAKER).',
         '<span class="muted">A quote that would match immediately is rejected and simply skipped for that tick - that rejection is normal. Unticked uses LIMIT + GTC, which can take.</span>');
-    $h .= panel_check('allow_live_engines', $v, 'Allow grid / pmm to run in LIVE mode.',
-        '<span class="danger">Warning: grid and pmm refuse to place a single order in live mode while this is off '
+    $h .= panel_check('allow_live_engines', $v, 'Allow grid / pmm / scalp to run in LIVE mode.',
+        '<span class="danger">Warning: grid, pmm and scalp refuse to place a single order in live mode while this is off '
         . '(the tick reports <code>engine_live_blocked</code>). Only turn it on once you have run the engine in paper, demo or testnet '
         . 'and understand that it trades real money continuously.</span>');
 
@@ -2480,6 +2743,59 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     $pmm .= panel_input('pmm_max_base_pct', $v, 'Max base %', 'number', 'above this stop bidding; below 100 - this stop asking');
     $pmm .= '</div>';
     $h .= panel_engine_group('pmm', $engine, $pmm);
+
+    // scalp (DESIGN-SCALP.md §6)
+    $scalpTp  = (float) ($v['scalp_tp_pct'] ?? 0.25);
+    $scalpSl  = (float) ($v['scalp_sl_pct'] ?? 0.20);
+    $scalpFee = (float) ($v['fee_pct'] ?? 0.1);
+    $tpNet    = $scalpTp - $scalpFee;
+    $slNet    = $scalpSl + $scalpFee;
+    $be       = ($tpNet > 0.0 && ($tpNet + $slNet) > 0.0) ? $slNet / ($tpNet + $slNet) * 100.0 : null;
+
+    // The arithmetic, rendered inline. The user's question is "does this make money", and the
+    // honest answer starts with the win rate it would take - so it is stated here, next to the
+    // fields that set it, not buried in a doc.
+    $scalp  = '<div class="flash flash-warn"><strong>Read this before you turn it on.</strong> The target is measured on the '
+            . '<em>bid</em> against <code>entry_eff</code>, which already carries the buy fee, so at tp '
+            . $e(Util::money($scalpTp, 3)) . ' % / sl ' . $e(Util::money($scalpSl, 3)) . ' % / fee '
+            . $e(Util::money($scalpFee, 3)) . ' % per side a win nets about <strong>+' . $e(Util::money(max(0.0, $tpNet), 3))
+            . ' %</strong> and a loss about <strong>-' . $e(Util::money($slNet, 3)) . ' %</strong>'
+            . ($be === null
+                ? ', and the target cannot clear the sell fee at all - every "winning" trade still closes at a loss.'
+                : ', so you need roughly a <strong>' . $e(number_format($be, 1)) . ' % win rate just to break even</strong>, before slippage.')
+            . ' That is a high bar. The engine does not assume it is cleared: it records gross and fees separately on every '
+            . 'closed trade so the dashboard can tell you whether there is any directional edge at all, separately from what '
+            . 'the fees took. Run it on <strong>demo</strong> and read the Gross / Fees / Net block before you consider real money.</div>';
+    $scalp .= '<div class="grid3">';
+    $scalp .= panel_input('scalp_universe_size', $v, 'Symbols traded at once', 'number', '1-30; the top N eligible rows of the movers board', '1');
+    $scalp .= panel_input('scalp_order_usdt', $v, 'Quote per position', 'number', 'must clear the symbol required size (minNotional + step)');
+    $scalp .= panel_input('scalp_max_open', $v, 'Max open positions', 'number', '1-30, one per symbol', '1');
+    $scalp .= panel_input('scalp_budget_per_symbol', $v, 'Default budget per symbol', 'number', 'each symbol spends only its own pot');
+    $scalp .= panel_input('scalp_tp_pct', $v, 'Take profit %', 'number', 'on the bid, against entry_eff');
+    $scalp .= panel_input('scalp_sl_pct', $v, 'Stop %', 'number', 'on the bid, against entry_eff');
+    $scalp .= panel_input('scalp_max_hold_sec', $v, 'Max hold (s)', 'number', 'a scalp that has not resolved is capital tied up in a failed thesis', '1');
+    $scalp .= panel_input('scalp_dip_pct', $v, 'Pullback needed %', 'number', 'how far below the window high before a bounce entry');
+    $scalp .= panel_input('scalp_max_consecutive_losses', $v, 'Pause after N losses in a row', 'number', '2-20; then it waits for you to press Resume', '1');
+    $scalp .= '</div>';
+    $scalp .= '<label>Per-symbol budget overrides (JSON)'
+            . '<span class="muted help">e.g. {"BTCUSDT":200,"DOGEUSDT":50}. Anything not listed uses the default above. '
+            . 'Leave empty for no overrides.</span>'
+            . '<textarea name="scalp_budgets" rows="2">' . $e(panel_budgets_text($v)) . '</textarea></label>';
+    $scalp .= '<div class="grid3">';
+    $scalp .= panel_input('scalp_window', $v, 'Ticks held per symbol', 'number', '3-200; the entry needs a full window', '1');
+    $scalp .= panel_input('scalp_poll_sec', $v, 'Seconds between polls', 'number', '1-30; one bookTicker call for every symbol per poll');
+    $scalp .= panel_input('scalp_run_seconds', $v, 'Loop length per tick (s)', 'number', '1-55; must end inside the cron tick', '1');
+    $scalp .= panel_input('scalp_max_trades_per_hour', $v, 'Max entries per hour', 'number', 'runaway guard', '1');
+    $scalp .= panel_input('scalp_min_quote_vol', $v, 'Min 24 h quote volume', 'number', 'the liquidity floor');
+    $scalp .= panel_input('scalp_min_trade_count', $v, 'Min 24 h trade count', 'number', 'the "many traders" floor - count, not volume', '0');
+    $scalp .= panel_input('scalp_max_spread_pct', $v, 'Max spread %', 'number', 'a wide book is a loss before the price moves');
+    $scalp .= panel_input('scalp_universe_refresh_min', $v, 'Board refresh (minutes)', 'number', 'weight 80 per refresh', '1');
+    $scalp .= '</div>';
+    $scalpEx = isset($v['scalp_exclude']) && is_array($v['scalp_exclude'])
+        ? implode(', ', $v['scalp_exclude']) : (string) ($v['scalp_exclude'] ?? '');
+    $scalp .= '<label>Never rank these symbols<span class="muted help">stablecoin pairs and anything you want kept out of the universe</span>'
+            . '<textarea name="scalp_exclude" rows="2">' . $e($scalpEx) . '</textarea></label>';
+    $h .= panel_engine_group('scalp', $engine, $scalp);
     $h .= '</fieldset>';
 
     // -- portfolio & scanner (DESIGN-PORTFOLIO.md §2, §7)
@@ -2625,7 +2941,35 @@ function panel_engine_defaults(): array
         'grid_range_up_pct' => 4.0, 'grid_range_down_pct' => 6.0, 'grid_exit_liquidates' => false,
         'pmm_spread_pct' => 0.25, 'pmm_order_usdt' => 1.30, 'pmm_refresh_sec' => 60,
         'pmm_target_base_pct' => 50, 'pmm_max_base_pct' => 80,
+        'scalp_universe_size' => 20, 'scalp_order_usdt' => 6.0, 'scalp_budget_per_symbol' => 100.0,
+        'scalp_budgets' => [], 'scalp_max_open' => 6, 'scalp_tp_pct' => 0.25, 'scalp_sl_pct' => 0.20,
+        'scalp_max_hold_sec' => 120, 'scalp_dip_pct' => 0.15, 'scalp_window' => 20,
+        'scalp_poll_sec' => 3, 'scalp_run_seconds' => 50, 'scalp_max_consecutive_losses' => 5,
+        'scalp_max_trades_per_hour' => 60, 'scalp_min_quote_vol' => 20000000.0,
+        'scalp_min_trade_count' => 50000, 'scalp_max_spread_pct' => 0.05,
+        'scalp_universe_refresh_min' => 10,
+        'scalp_exclude' => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT', 'USDPUSDT'],
     ];
+}
+
+/**
+ * `scalp_budgets` as the textarea should show it: pretty JSON, or '' for an empty map.
+ *
+ * A saved config holds a decoded map; a form that failed validation holds the raw string the
+ * user typed, and THAT is what has to come back so they can see and fix their typo rather than
+ * having it silently replaced with the last good value.
+ */
+function panel_budgets_text(array $v): string
+{
+    $raw = isset($v['scalp_budgets']) ? $v['scalp_budgets'] : [];
+    if (is_string($raw)) {
+        return trim($raw);
+    }
+    if (!is_array($raw) || $raw === []) {
+        return '';
+    }
+    $json = json_encode($raw, JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+    return $json === false ? '' : $json;
 }
 
 function panel_select(string $key, array $v, string $label, array $options): string

@@ -26,6 +26,15 @@ if (is_file(__DIR__ . '/Sleeve.php')) {
 if (is_file(__DIR__ . '/Scanner.php')) {
     require_once __DIR__ . '/Scanner.php';
 }
+// the scalp engine (docs/DESIGN-SCALP.md) and its movers board are optional in exactly the
+// same way: a checkout without them runs every engine it ran before, and `engine = scalp`
+// then reports the missing file instead of fatally erroring on a class that is not there.
+if (is_file(__DIR__ . '/Movers.php')) {
+    require_once __DIR__ . '/Movers.php';
+}
+if (is_file(__DIR__ . '/Scalper.php')) {
+    require_once __DIR__ . '/Scalper.php';
+}
 
 /**
  * Internal control-flow exception used by Bot::tick(): ends the current tick
@@ -100,9 +109,9 @@ final class Bot
     private $info = [];
     /** @var float per-side fee in percent used for sizing */
     private $feePct;
-    /** @var string signal | grid | pmm */
+    /** @var string signal | grid | pmm | scalp */
     private $engine;
-    /** @var string the single symbol grid/pmm trade; '' for the signal engine */
+    /** @var string the single symbol grid/pmm trade; '' for the signal and scalp engines */
     private $engineSymbol = '';
     /** @var EngineOrders[] one per symbol|engine, built on demand */
     private $engineOrdersCache = [];
@@ -487,7 +496,15 @@ final class Bot
         if ($this->portfolio) {
             $hasInventory = $this->portfolioInventorySymbols() !== [];
         }
-        $sv = Risk::survivalCheck($this->cfg, $this->db, $bal['equity'], $open !== null || $stuck !== null || $hasInventory, $bal['exchange_has_base']);
+        // Open scalp positions are money at risk too. They live in the same `positions` table
+        // (DESIGN-SCALP.md §8) but Db::openPosition() skips them on purpose, because the signal
+        // engine's whole exit path is built on "THE one position". Counting them here is what
+        // keeps survivalCheck() returning `halt` while any are open, which is what gets them
+        // managed to an exit in the halt branch below instead of stranded. Read only when scalp
+        // is the selected engine, because it is the only engine that can actually close them:
+        // under any other engine this is [] and the call below is the one it has always been.
+        $scalpOpen = $this->engine === 'scalp' ? $this->scalpOpenRows() : [];
+        $sv = Risk::survivalCheck($this->cfg, $this->db, $bal['equity'], $open !== null || $stuck !== null || $hasInventory || $scalpOpen !== [], $bal['exchange_has_base']);
         $action = (string) ($sv['action'] ?? 'none');
         $svReason = (string) ($sv['reason'] ?? '');
         if ($action === 'halt') {
@@ -516,6 +533,17 @@ final class Bot
                     $this->notes[] = !empty($flat['ok']) ? 'inventory flattened' : 'inventory NOT flattened (see log)';
                 }
             }
+            if ($scalpOpen !== []) {
+                // The kill switch wins - no scalp ENTRY can happen, because Scalper::entryBlock()
+                // reads Risk::entryBlockReason() itself and reports `halted` - but an open
+                // position is still managed to its exit (DESIGN-SCALP.md §5: abandoning one would
+                // be worse than any losing streak, and DESIGN.md §9 wants a stop on every
+                // position). Running the loop rather than market-selling from here is deliberate:
+                // the loop keeps the per-position gross_usdt / fees_usdt bookkeeping §2's
+                // verdict depends on, which a bare sell through closeFromFill() would not.
+                $this->notes[] = count($scalpOpen) . ' open scalp position(s) still managed under the halt';
+                $this->runScalpLoop();
+            }
             if (!$already) {
                 $this->notes[] = 'KILL SWITCH ' . $reason;
                 $this->halt($reason);
@@ -530,6 +558,14 @@ final class Bot
         // ---- 5-7. portfolio mode runs every sleeve instead (DESIGN-PORTFOLIO.md §6)
         if ($this->portfolio) {
             $this->runPortfolioTick($bal, $acct, $prices);
+            return ((string) $this->db->getState('halted', '0')) === '1' ? 'halted' : 'ok';
+        }
+
+        // ---- 5-7. the scalp engine runs its own bounded loop (DESIGN-SCALP.md §4). It is
+        //      tested before the grid/pmm branch because `engine !== 'signal'` is true for it
+        //      too, and runEngineTick() would hand it a single-symbol ladder it does not have.
+        if ($this->engine === 'scalp') {
+            $this->runScalpTick();
             return ((string) $this->db->getState('halted', '0')) === '1' ? 'halted' : 'ok';
         }
 
@@ -653,6 +689,34 @@ final class Bot
         }
         if ($stuck !== null && !isset($tracked[(string) $stuck['symbol']])) {
             $tracked[(string) $stuck['symbol']] = $stuck;
+        }
+        // Scalp positions are tracked positions: they are rows in this same `positions` table
+        // (DESIGN-SCALP.md §8), merely ones Db::openPosition() skips because the signal engine
+        // manages exactly one. Leaving them out of $tracked would make the base balance of the
+        // very first filled scalp buy look like an UNTRACKED position, and reconcileBalances()
+        // would HALT the bot with `untracked_position` the moment the engine worked - the same
+        // trap the grid/pmm inventory branch below already avoids. §4 allows only one open
+        // position per symbol, but the quantities are summed anyway (by position id, so the
+        // STUCK row the lookup above may already have found is never counted twice) and a
+        // hand-edited database cannot under-report the holding and over-report the dust.
+        $trackedIds = [];
+        foreach ([$open, $stuck] as $known) {
+            if ($known !== null && isset($known['id'])) {
+                $trackedIds[(int) $known['id']] = true;
+            }
+        }
+        foreach ($this->scalpOpenRows() as $sRow) {
+            $sId  = isset($sRow['id']) ? (int) $sRow['id'] : 0;
+            $sSym = isset($sRow['symbol']) ? strtoupper(trim((string) $sRow['symbol'])) : '';
+            if ($sSym === '' || $sSym === $quote || ($sId !== 0 && isset($trackedIds[$sId]))) {
+                continue;
+            }
+            $trackedIds[$sId] = true;
+            if (isset($tracked[$sSym])) {
+                $tracked[$sSym]['qty'] = (float) $tracked[$sSym]['qty'] + max(0.0, (float) $sRow['qty']);
+                continue;
+            }
+            $tracked[$sSym] = $sRow;
         }
 
         $posValue = 0.0;
@@ -1883,6 +1947,232 @@ final class Bot
         } catch (Throwable $e) {
             Log::warn('scanner: refresh failed - ' . $e->getMessage());
         }
+    }
+
+    /* ================================================================ steps 5-7: scalp */
+
+    /**
+     * Steps 5-7 for the scalp engine (DESIGN-SCALP.md §3-§5): many symbols, tiny size, market
+     * orders, seconds rather than hours.
+     *
+     * Steps 1-4 above ran exactly as they do for every other engine and they still win over
+     * anything decided here:
+     *
+     *   * the equity-floor and drawdown KILL SWITCHES returned 'halted' before this method was
+     *     reached, so no entry is even considered;
+     *   * the daily and weekly caps, the global pause and the api pause are re-read inside
+     *     Scalper::entryBlock() through Risk::entryBlockReason(), which holds ENTRIES while
+     *     still managing every open position to its exit;
+     *   * the demo-only guard below places ZERO orders in live mode.
+     *
+     * The order is the order §3 and §4 ask for: the guard, then the movers board (at most once
+     * per `scalp_universe_refresh_min` - it is a weight-80 call and must never run inside the
+     * fast loop), then the bounded loop itself.
+     */
+    private function runScalpTick(): void
+    {
+        if (!class_exists('Scalper')) {
+            $this->noTradeReason = 'scalp_unavailable';
+            $this->notes[]       = 'lib/Scalper.php is missing';
+            Log::error('scalp: lib/Scalper.php is missing, the engine cannot run');
+            return;
+        }
+
+        // ---- 1. demo-only (DESIGN-SCALP.md §2), the same rule and the same wording as grid
+        //         and pmm: mode live without `allow_live_engines` means not one order.
+        if ($this->engineLiveBlocked('scalp')) {
+            $this->noTradeReason = 'engine_live_blocked';
+            $this->notes[]       = 'engine scalp blocked in live mode';
+            $this->obsEngine('scalp', self::OBS_ALL_SYMBOLS, 'skipped', 'engine_live_blocked', 0.0, 0.0);
+            $n = $this->cancelAllEngineOrders('engine_live_blocked');
+            if ($n > 0) {
+                $this->notes[] = $n . ' engine order(s) cancelled (live blocked)';
+            }
+            return;
+        }
+
+        // ---- 2. this engine trades with MARKET orders only and never rests anything on the
+        //         book, so a ladder left behind by grid or pmm when the user switched engines
+        //         would sit there unmanaged for as long as scalp runs. Costs one indexed SELECT
+        //         when there is nothing to cancel, which is the normal case.
+        $stale = $this->cancelAllEngineOrders('engine_switched_to_scalp');
+        if ($stale > 0) {
+            $this->notes[] = $stale . ' resting order(s) from a previous engine cancelled';
+        }
+
+        // ---- 3. the movers board (§3)
+        $this->maybeRefreshMovers();
+
+        // ---- 4. the bounded fast loop (§4)
+        $this->runScalpLoop();
+    }
+
+    /**
+     * Runs one bounded scalp loop (DESIGN-SCALP.md §4) and folds its result into this tick's
+     * report.
+     *
+     * The deadline is measured from the START OF THE TICK, not from here, so
+     * `scalp_run_seconds` bounds the WHOLE tick: the shared steps 1-4 come out of the same
+     * budget, the tick always ends inside its minute, and the `tick.lock` is free again before
+     * the next cron fires. Scalper::run() always completes at least one poll even when the
+     * budget is already spent, so a slow tick still manages its open positions rather than
+     * leaving them unattended for a minute.
+     */
+    private function runScalpLoop(): void
+    {
+        if (!class_exists('Scalper')) {
+            return;
+        }
+        $runSec = isset($this->cfg['scalp_run_seconds']) && is_numeric($this->cfg['scalp_run_seconds'])
+            ? (int) round((float) $this->cfg['scalp_run_seconds'])
+            : 50;
+        if ($runSec < 1) {
+            $runSec = 1;
+        }
+        if ($runSec > Scalper::MAX_RUN_SECONDS) {
+            $runSec = Scalper::MAX_RUN_SECONDS;
+        }
+        $start      = $this->tickStart > 0.0 ? $this->tickStart : microtime(true);
+        $deadlineMs = ($start + (float) $runSec) * 1000.0;
+
+        $r = null;
+        try {
+            $scalper = new Scalper($this->cfg, $this->db, $this->ex, $this->info);
+            // non-essential: a market-data failure inside the loop goes through the api-error
+            // ladder (and so can pause the bot) but must not turn the whole tick into an error
+            $r = $this->step('scalp_loop', function () use ($scalper, $deadlineMs) {
+                return $scalper->run($deadlineMs);
+            }, false);
+        } catch (BotAbort $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            Log::error('scalp: loop failed - ' . get_class($e) . ': ' . $e->getMessage(), [
+                'file' => basename($e->getFile()) . ':' . $e->getLine(),
+            ]);
+            $this->notes[] = 'scalp loop failed: ' . $e->getMessage();
+            if ($this->noTradeReason === '') {
+                $this->noTradeReason = 'scalp_error';
+            }
+            return;
+        }
+        if (!is_array($r)) {
+            if ($this->noTradeReason === '') {
+                $this->noTradeReason = 'scalp_error';
+            }
+            return;
+        }
+
+        $entries = isset($r['entries']) ? (int) $r['entries'] : 0;
+        $exits   = isset($r['exits']) ? (int) $r['exits'] : 0;
+        // every entry and every exit was a real market order, so the tick's order count has to
+        // know about them: it is what the panel and the hourly order guard read
+        $this->ordersThisTick += max(0, $entries) + max(0, $exits);
+
+        $refusals = isset($r['refusals']) && is_array($r['refusals']) ? $r['refusals'] : [];
+        $why = isset($refusals['*']) ? (string) $refusals['*'] : '';
+        if ($why === '') {
+            $why = isset($r['blocked']) ? (string) $r['blocked'] : '';
+        }
+        if ($why === '') {
+            $why = $entries > 0 ? 'entered' : 'idle';
+        }
+        $this->noTradeReason = 'scalp:' . $why;
+
+        $summary = isset($r['summary']) ? trim((string) $r['summary']) : '';
+        if ($summary !== '') {
+            // posSummary only, NOT also a note: buildSummary() prints the position summary and
+            // the notes in the same line, so adding both printed the whole scalp line twice in
+            // every cron response and every log entry.
+            $this->posSummary = $summary;
+        }
+        if (!empty($r['paused'])) {
+            // §5: the pause does NOT clear itself. Say so every tick until a human resumes.
+            $this->notes[] = 'scalp PAUSED after ' . (isset($r['streak']) ? (int) $r['streak'] : 0)
+                           . ' consecutive loss(es): press "Resume scalping" in the panel';
+        }
+    }
+
+    /**
+     * Refreshes the movers board when `scalp_universe_refresh_min` has elapsed (DESIGN-SCALP.md
+     * §3). `GET /api/v3/ticker/24hr` with no symbol is WEIGHT 80, so Movers::due() rate-limits
+     * it and it never runs inside the fast loop.
+     *
+     * Symbols holding an open scalp position are pinned, so a re-ranking can never take the
+     * universe out from under a position (§3, last bullet).
+     *
+     * Best effort by design: a failed refresh leaves the previous board in place and the loop
+     * trades on that. The board is a ranking, not a dependency - Scalper::universe() even falls
+     * back to the watchlist when it has never run at all.
+     */
+    private function maybeRefreshMovers(): void
+    {
+        if (!class_exists('Movers')) {
+            return;
+        }
+        try {
+            $movers = new Movers($this->cfg, $this->db, $this->ex);
+            if (!$movers->due()) {
+                return;
+            }
+            $info = $this->info;
+            $keep = $this->scalpKeepSymbols();
+            $rows = $this->step('movers', function () use ($movers, $info, $keep) {
+                return $movers->refresh($info, false, $keep);
+            }, false);
+            if (is_array($rows) && $rows !== []) {
+                $inUniverse = 0;
+                foreach ($rows as $row) {
+                    if (is_array($row) && !empty($row['in_universe'])) {
+                        $inUniverse++;
+                    }
+                }
+                $this->notes[] = 'movers ranked ' . count($rows) . ' pair(s), ' . $inUniverse . ' in universe';
+            }
+        } catch (BotAbort $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            Log::warn('movers: refresh failed - ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Scalp positions that still hold inventory in this mode, or [] when there are none.
+     *
+     * Delegated to Scalper::openPositions() so Bot and the engine agree to the row on what
+     * "still holding" means - OPEN *and* STUCK (Scalper::OPEN_STATUSES). A STUCK scalp row is
+     * precisely the one whose base balance would otherwise look untracked, so the two must not
+     * be allowed to drift apart. Falls back to the Db query when Scalper is not loaded.
+     *
+     * Never throws: this read feeds the survival layer, which must still run without it.
+     * @return array positions rows
+     */
+    private function scalpOpenRows(): array
+    {
+        try {
+            if (class_exists('Scalper')) {
+                $rows = Scalper::openPositions($this->db, $this->cfg, $this->mode);
+            } elseif (method_exists($this->db, 'openScalpPositions')) {
+                $rows = $this->db->openScalpPositions($this->mode);
+            } else {
+                return [];
+            }
+        } catch (Throwable $e) {
+            return [];
+        }
+        return is_array($rows) ? $rows : [];
+    }
+
+    /** Symbols pinned into the movers universe because they hold a position (§3). */
+    private function scalpKeepSymbols(): array
+    {
+        $out = [];
+        foreach ($this->scalpOpenRows() as $row) {
+            $sym = isset($row['symbol']) ? strtoupper(trim((string) $row['symbol'])) : '';
+            if ($sym !== '' && !in_array($sym, $out, true)) {
+                $out[] = $sym;
+            }
+        }
+        return $out;
     }
 
     /* ---------------------------------------------------------- portfolio helpers */
@@ -3551,6 +3841,15 @@ final class Bot
         }
         if ($this->engineSymbol !== '') {
             $out[$this->engineSymbol] = true;   // grid/pmm do not use the watchlist
+        }
+        // The scalp engine trades the movers board (DESIGN-SCALP.md §3), so its symbols are
+        // normally NOT on the watchlist. Without them here the tick would fetch neither their
+        // filters nor their price, and an open scalp position would be missing from equity -
+        // which understates it, and an understated equity is what trips the floor kill switch.
+        // Added whatever engine is selected: a position does not stop being real because the
+        // user switched the selector.
+        foreach ($this->scalpKeepSymbols() as $sym) {
+            $out[$sym] = true;
         }
         // portfolio mode: symbol info and prices cover the union of every sleeve's symbols
         foreach ($this->portfolioSymbols() as $sym) {
