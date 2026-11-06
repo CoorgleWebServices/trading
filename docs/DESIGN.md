@@ -120,11 +120,13 @@ trader/
 | `recv_window` | `10000` | ms |
 | `timezone` | `"UTC"` | display only |
 
-**Engine keys.** The sixteen `engine` / `grid_*` / `pmm_*` / `post_only` / `allow_live_engines`
-keys are defined in **[DESIGN-ENGINES.md §2](DESIGN-ENGINES.md#2-configuration-added-to-3-of-designmd)**,
-which is authoritative for them. They live in the same `trader_config_defaults()` table as the keys
-above, so a `config.json` written before the engines existed still comes back fully populated, and
-`Risk::validateConfig()` enforces their bounds alongside these ones.
+**Engine keys.** `engine` selects `signal` or `scalp`; `allow_live_engines` is the demo-only guard.
+The `scalp_*` keys are defined in **[DESIGN-SCALP.md §6](DESIGN-SCALP.md)**, which is authoritative
+for them. They live in the same `trader_config_defaults()` table as the keys above, so a
+`config.json` written before the scalp engine existed still comes back fully populated, and
+`Risk::validateConfig()` enforces their bounds alongside these ones. A `config.json` that still
+selects the removed `grid` or `pmm` engine is migrated to `signal` on load, and the panel says so
+rather than switching silently.
 
 ## 4. Database (`data/trader.sqlite`, created by `Db::migrate()`; WAL; busy_timeout 5000)
 

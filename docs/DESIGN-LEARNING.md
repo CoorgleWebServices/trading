@@ -1,6 +1,6 @@
 # Learning: observation capture, evidence, and bounded feedback
 
-Extends `docs/DESIGN.md`, `DESIGN-ENGINES.md` and `DESIGN-PORTFOLIO.md`, which remain
+Extends `docs/DESIGN.md` and `DESIGN-SCALP.md`, which remain
 authoritative for what they cover. Authoritative for everything below.
 
 ## 1. What "learning" means here, and what it does not
@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(mode, ts);
 `features` JSON, all numeric so bucketing is uniform:
 `rsi`, `atr_pct`, `atr1h_pct`, `bb_pos` (0 at the lower band, 1 at the upper), `vol_ratio`
 (volume / SMA20 volume), `trend_up` (1/0 from the 1h regime gate), `spread_pct`, `hour_utc`,
-`dow` (0–6), `dist_from_anchor_pct` (grid only), `step_value_pct` (dust coarseness).
+`dow` (0–6), `step_value_pct` (dust coarseness).
 
 Resolution: when a position closes or a cycle completes, the matching observation is updated with
 `outcome`, `pnl_usdt`, `exit_reason`, `held_minutes`, `resolved_at`. `skipped` rows resolve to

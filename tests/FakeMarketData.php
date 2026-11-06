@@ -56,7 +56,7 @@ final class FakeMarketData implements MarketDataInterface
     ];
 
     /**
-     * Fixture for `GET /api/v3/ticker/24hr` (docs/DESIGN-PORTFOLIO.md §5), built so the scanner
+     * Fixture for `GET /api/v3/ticker/24hr` (the removed portfolio contract), built so the scanner
      * ranking can be pinned down exactly. One entry per case the scanner has to get right:
      *
      *   liquid_volatile   SOLUSDT, DOGEUSDT, ETHUSDT - deep books, tight spreads, ATR inside the
@@ -692,7 +692,7 @@ final class FakeMarketData implements MarketDataInterface
             'tickSize'             => $s['tickSize'],
             'basePrecision'        => 8,
             'quotePrecision'       => 8,
-            // DESIGN-ENGINES.md §3: the engine filters. 0.0 multipliers mean
+            //(the removed grid/pmm contract): the engine filters. 0.0 multipliers mean
             // "PERCENT_PRICE_BY_SIDE absent", which Binance::priceAllowed() reads as "allowed".
             'bidMultiplierUp'      => 0.0,
             'bidMultiplierDown'    => 0.0,
@@ -750,7 +750,7 @@ final class FakeMarketData implements MarketDataInterface
 }
 
 /**
- * Offline exchange with a resting LIMIT-order book (docs/DESIGN-ENGINES.md §11).
+ * Offline exchange with a resting LIMIT-order book (the removed grid/pmm contract).
  *
  * `PaperExchange` lives in lib/Exchange.php, is `final` and only knows market orders, so it
  * cannot be subclassed or extended from here. This is the test double the engine groups use
@@ -1045,7 +1045,7 @@ final class FakePaperExchange implements ExchangeInterface
      * decimal strings (never exponent notation) exactly as Binance is sent them.
      *
      * A post-only order that would cross the book is rejected with -2010 "would immediately
-     * match and take", the rejection DESIGN-ENGINES.md §3 calls normal; a plain LIMIT that
+     * match and take", the rejection(the removed grid/pmm contract)calls normal; a plain LIMIT that
      * crosses fills at once. Everything else rests until the scripted book reaches it.
      */
     public function limitOrder(string $symbol, string $side, string $qtyStr, string $priceStr, array $info, string $clientId, bool $postOnly): array

@@ -178,7 +178,7 @@ final class Scalper
 
     /**
      * Blocks `Risk::entryBlockReason()` reports for the SIGNAL engine only. A continuous
-     * engine must not be stopped by them (DESIGN-ENGINES.md §9): scalp has its own
+     * engine must not be stopped by them: scalp has its own
      * hourly cap (§6) and its own loss breaker (§5) instead. Everything else Risk
      * reports - halted, disabled, paused, api_paused, the daily and weekly caps - is the
      * survival layer and still wins.

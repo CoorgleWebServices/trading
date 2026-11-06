@@ -1051,7 +1051,7 @@ SQL;
      * Realised PnL at or after $sinceIso: sum of positions.pnl_usdt of positions closed
      * then (DESIGN.md §4); null $mode = every mode. The engines' round trips live in
      * cycles.pnl_usdt — Risk adds cyclePnl() on top for the daily / weekly caps
-     * (DESIGN-ENGINES §5) so the caps govern all three engines.
+     * so the caps govern all three engines.
      */
     public function realisedPnl(string $sinceIso, ?string $mode = null): float
     {
@@ -1171,7 +1171,7 @@ SQL;
 
     /* --------------------------------------------------------------- engines */
     /*
-     * Grid / pure-market-making bookkeeping (docs/DESIGN-ENGINES.md §5).
+     * Grid / pure-market-making bookkeeping (the removed grid/pmm contract).
      *
      *   engine_orders  every limit order the engines put on the book
      *   lots           FIFO inventory produced by engine BUY fills
@@ -1294,7 +1294,7 @@ SQL;
     /**
      * Same as consumeLots(), restricted to the lots of one grid rung (oldest first).
      *
-     * A grid sell is placed against one specific lot (DESIGN-ENGINES §7.4: "for each
+     * A grid sell is placed against one specific lot ( "for each
      * lot with no live sell"), so its fill must consume THAT lot: plain FIFO would
      * burn an older, dearer lot whose own sell is still resting, leaving the engine
      * quoting more base than it holds and pricing the cycle against the wrong basis.
@@ -1446,7 +1446,7 @@ SQL;
 
     /* ------------------------------------------------- sleeves and scanner */
     /*
-     * Portfolio mode (docs/DESIGN-PORTFOLIO.md §4).
+     * Portfolio mode (the removed portfolio contract).
      *
      *   sleeve_equity  one equity sample per sleeve per tick, for the overlaid
      *                  per-sleeve sparkline and the "best method so far" line

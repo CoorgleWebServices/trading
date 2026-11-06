@@ -254,7 +254,7 @@ final class LiveExchange implements ExchangeInterface
         return Binance::normalizeOrder($raw, $info, $this->bnbPriceFor($raw, $info));
     }
 
-    // ---- limit orders (DESIGN-ENGINES.md §3)
+    // ---- limit orders (the removed grid/pmm contract)
 
     /** LIMIT (GTC) or LIMIT_MAKER when $postOnly; $qtyStr/$priceStr are pre-rounded exact strings. */
     public function limitOrder(string $symbol, string $side, string $qtyStr, string $priceStr, array $info, string $clientId, bool $postOnly): array
@@ -638,14 +638,14 @@ final class PaperExchange implements ExchangeInterface
         return $result;
     }
 
-    // ---- limit orders (DESIGN-ENGINES.md §11: a resting order fills when the book crosses it)
+    // ---- limit orders (the removed grid/pmm contract): a resting order fills when the book crosses it)
 
     /**
      * Post one LIMIT (GTC) or LIMIT_MAKER order. $qtyStr/$priceStr are the exact pre-rounded
      * decimal strings (Util::floorToStep / Util::roundToTick) the real API is sent.
      *
      * A post-only order that would cross the book is rejected with -2010 "would immediately
-     * match and take" — the rejection DESIGN-ENGINES.md §3 calls normal. A plain LIMIT that
+     * match and take" — the rejection(the removed grid/pmm contract)calls normal. A plain LIMIT that
      * crosses fills at once. Everything else rests until the book reaches it, and the funds it
      * needs are locked exactly as the exchange locks them.
      */
@@ -757,7 +757,7 @@ final class PaperExchange implements ExchangeInterface
     }
 
     /**
-     * GET /api/v3/openOrders?symbol=… normalised to the DESIGN-ENGINES.md §3 shape:
+     * GET /api/v3/openOrders?symbol=… normalised to the(the removed grid/pmm contract)shape:
      * [clientOrderId => ['order_id','symbol','side','price','orig_qty','executed_qty','status','time']].
      */
     public function openOrders(string $symbol): array

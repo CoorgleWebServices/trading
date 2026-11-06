@@ -7,7 +7,6 @@ require_once __DIR__ . '/Log.php';
 require_once __DIR__ . '/Binance.php';
 require_once __DIR__ . '/Risk.php';
 require_once __DIR__ . '/Exchange.php';
-require_once __DIR__ . '/Scanner.php';
 
 /**
  * Movers board (docs/DESIGN-SCALP.md §3).
@@ -41,6 +40,30 @@ final class Movers
     /** Symbols per exchangeInfo request when topping up missing filters. */
     const INFO_BATCH = 100;
 
+    /**
+     * Leveraged-token suffixes, matched ONLY at the end of the base asset.
+     * These and isLeveraged() moved here from lib/Scanner.php, which was removed along with
+     * portfolio mode; the movers board is the only consumer left and the rule has to live in
+     * exactly one place.
+     */
+    const LEVERAGED_SUFFIXES = ['UP', 'DOWN', 'BULL', 'BEAR'];
+
+    /**
+     * Shortest underlying a leveraged token can have. Every Binance leveraged token was
+     * `<UNDERLYING><SUFFIX>` with a real ticker in front (BTCUP, ADADOWN, XRPBULL, 1INCHUP),
+     * so requiring at least three characters of prefix keeps legitimate coins whose own name
+     * merely ends in those letters - JUP, SUP, CUP, BEAR itself - out of the rejection list.
+     */
+    const LEVERAGED_MIN_BASE = 3;
+
+    /**
+     * Real coins whose ticker merely ENDS in a leveraged-token suffix but has a long enough
+     * prefix to slip past LEVERAGED_MIN_BASE. SYRUP (Maple Finance) is `SYR` + `UP` = exactly
+     * three characters of prefix, so the length rule alone cannot save it. Binance delisted its
+     * UP/DOWN tokens in 2021 and never listed BULL/BEAR, so this list only ever grows.
+     */
+    const LEVERAGED_ALLOW = ['SYRUP'];
+
     /** Score weights (§3). They sum to 1.0 so a score is directly comparable between refreshes. */
     const W_MOVE  = 0.45;
     const W_COUNT = 0.35;
@@ -55,7 +78,7 @@ final class Movers
      * the trade put at risk.
      *
      * The reference is one order, exactly as §3 writes it, and NOT the symbol's §7 budget -
-     * even though Scanner::dustLimit() measures against a sleeve's whole budget and even though
+     * even though the old portfolio scanner measured against a sleeve's whole budget and even though
      * using the budget here would let several of the majors onto the board. At the default
      * 6 USDT order the cap is 1.8 cents, which gates DOGEUSDT (a 1-DOGE step costs ~20 cents,
      * 3.3 % of the order) and SOLUSDT and ETHUSDT with it. That is not a bug to tune away: on a
@@ -71,7 +94,7 @@ final class Movers
     /**
      * Default `scalp_exclude` (§6): the stablecoin pairs. They have gigantic trade counts and
      * gigantic volume and go nowhere, so without this they would own the top of a board built
-     * to find movement. Same list Scanner defaults to, for the same reason.
+     * to find movement. 
      */
     const DEFAULT_EXCLUDE = ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT'];
 
@@ -91,7 +114,7 @@ final class Movers
 
     /**
      * True when `scalp_universe_refresh_min` has elapsed since `movers_at`, or it never ran.
-     * Unlike Scanner::due() this is NOT gated on an enabled flag: the board is useful to look at
+     * This is NOT gated on an enabled flag: the board is useful to look at
      * even with the engine switched off, and the caller decides whether to refresh it.
      */
     public function due(): bool
@@ -186,7 +209,7 @@ final class Movers
      * Dropped outright, because they are not candidates at all: symbols that do not end in
      * `quote_asset`, symbols in `scalp_exclude`, leveraged tokens (UP/DOWN/BULL/BEAR as a
      * SUFFIX of the base asset only - `JUP` and `SYRUP` are real coins, see
-     * Scanner::isLeveraged()), and symbols whose known filters are not TRADING + spot-allowed.
+     * self::isLeveraged()), and symbols whose known filters are not TRADING + spot-allowed.
      *
      * Everything else is KEPT whether it passes or not, with its numbers and its reasons in
      * `gates` (`no_price`, `no_info`, `illiquid`, `thin_trades`, `spread_unknown`,
@@ -259,9 +282,7 @@ final class Movers
             } else {
                 $base = substr($symbol, 0, strlen($symbol) - $qLen);
             }
-            // Reuse Scanner's test rather than a second copy of the UP/DOWN/BULL/BEAR rules and
-            // its real-coin allow list: two copies would drift and one of them would be wrong.
-            if (Scanner::isLeveraged($base)) {
+            if (self::isLeveraged($base)) {
                 continue;
             }
             if ($si !== null) {
@@ -582,7 +603,7 @@ final class Movers
      * The one weight-80 call.
      *
      * A rate-limit failure (429 / 418, i.e. `retryAfter` is set) is RE-THROWN, exactly as
-     * Scanner::fetchTickers() does: that is the one failure the tick's error policy has to see,
+     * that is the one failure the tick's error policy has to see,
      * because its answer is `api_paused_until` and swallowing it would leave the caller free to
      * keep hitting an exchange that has just asked us to stop. `movers_at` is stamped before
      * the throw so the board's own guard still counts the attempt.
@@ -642,13 +663,49 @@ final class Movers
         return $info;
     }
 
+    /**
+     * Leveraged token test. The suffix must be exactly that - a SUFFIX of the BASE asset with a
+     * plausible underlying in front of it. `BTCUP`, `ADADOWN`, `XRPBULL`, `ETHBEAR` are tokens;
+     * `JUP`, `SUP`, `BEAR`, `UP` and any coin that merely CONTAINS those letters are not.
+     *
+     * These products are leveraged baskets that rebalance daily and decay, so scalping one bets
+     * on a wrapper's funding mechanics rather than on the coin. They are dropped outright, not
+     * gated. Moved here from lib/Scanner.php, which went with portfolio mode; the movers board
+     * is the only consumer left and the rule has to live in exactly one place.
+     */
+    public static function isLeveraged(string $base): bool
+    {
+        $b  = strtoupper(trim($base));
+        $lb = strlen($b);
+        if ($lb === 0) {
+            return false;
+        }
+        if (in_array($b, self::LEVERAGED_ALLOW, true)) {
+            return false;                                   // known-real coin, never a token
+        }
+        foreach (self::LEVERAGED_SUFFIXES as $suffix) {
+            $ls = strlen($suffix);
+            if ($lb <= $ls) {
+                continue;                                   // the coin IS the word (UP, BEAR)
+            }
+            if (substr($b, $lb - $ls) !== $suffix) {
+                continue;                                   // suffix only, never "contains"
+            }
+            if ($lb - $ls < self::LEVERAGED_MIN_BASE) {
+                continue;                                   // JUP, SUP: underlying too short to be real
+            }
+            return true;
+        }
+        return false;
+    }
+
     // -------------------------------------------------------------- config
 
     /**
      * `scalp_exclude` as an uppercase lookup map (a list, or a comma/space separated string).
      *
-     * When the key is ABSENT the default is the stablecoin pairs, exactly as §6 says and as
-     * Scanner::excludeMap() does. Returning [] for an absent key instead would put USDCUSDT and
+     * When the key is ABSENT the default is the stablecoin pairs, exactly as §6 says.
+     * Returning [] for an absent key instead would put USDCUSDT and
      * FDUSDUSDT - enormous trade counts, enormous volume, a range of nothing - straight onto a
      * board whose whole purpose is finding things that move. An explicitly EMPTY list is still
      * honoured as "exclude nothing", which is what a test that wants the raw ranking needs.

@@ -9,23 +9,6 @@ require_once __DIR__ . '/Exchange.php';
 require_once __DIR__ . '/Indicators.php';
 require_once __DIR__ . '/Strategy.php';
 require_once __DIR__ . '/Risk.php';
-require_once __DIR__ . '/EngineOrders.php';
-// the two engine implementations are optional at load time: a signal-engine install
-// (or a partial deployment) must still be able to run a tick.
-if (is_file(__DIR__ . '/EngineGrid.php')) {
-    require_once __DIR__ . '/EngineGrid.php';
-}
-if (is_file(__DIR__ . '/EnginePmm.php')) {
-    require_once __DIR__ . '/EnginePmm.php';
-}
-// portfolio mode (docs/DESIGN-PORTFOLIO.md) is equally optional: a single-engine install
-// never loads these and takes exactly the code path it took before they existed.
-if (is_file(__DIR__ . '/Sleeve.php')) {
-    require_once __DIR__ . '/Sleeve.php';
-}
-if (is_file(__DIR__ . '/Scanner.php')) {
-    require_once __DIR__ . '/Scanner.php';
-}
 // the scalp engine (docs/DESIGN-SCALP.md) and its movers board are optional in exactly the
 // same way: a checkout without them runs every engine it ran before, and `engine = scalp`
 // then reports the missing file instead of fatally erroring on a class that is not there.
@@ -67,9 +50,8 @@ final class Bot
     const KLINES_15M          = 320;
     const KLINES_1H           = 260;
     const RECONCILE_MISSING_RATIO = 0.9;
-    /** Block reasons that must take an engine's whole ladder off the book (DESIGN-ENGINES.md §9). */
-    const ENGINE_CAPITAL_BLOCKS = ['halted', 'disabled', 'api_paused', 'daily_cap', 'weekly_cap'];
-    /** Portfolio mode: a tick stops starting new sleeves after this many ms (DESIGN-PORTFOLIO.md §6). */
+    /** Block reasons that must take an engine's whole ladder off the book (the removed grid/pmm contract). */
+    /** A tick stops starting slow optional work after this many ms. */
     const TICK_TIME_BUDGET_MS = 40000;
 
     /**
@@ -111,12 +93,8 @@ final class Bot
     private $feePct;
     /** @var string signal | grid | pmm | scalp */
     private $engine;
-    /** @var string the single symbol grid/pmm trade; '' for the signal and scalp engines */
-    private $engineSymbol = '';
     /** @var EngineOrders[] one per symbol|engine, built on demand */
     private $engineOrdersCache = [];
-    /** @var bool portfolio mode (DESIGN-PORTFOLIO.md); false ⇒ the single-engine tick, unchanged */
-    private $portfolio = false;
 
     // ---- per-tick scratch
     /** @var int */
@@ -135,11 +113,7 @@ final class Bot
     private $posSummary = '';
     /** @var string[] */
     private $notes = [];
-    /** @var float bid of the engine symbol this tick (0.0 when unknown) */
-    private $engineBid = 0.0;
-    /** @var float ask of the engine symbol this tick (0.0 when unknown) */
-    private $engineAsk = 0.0;
-    /** @var array symbol => ['bid'=>float,'ask'=>float] read this tick (portfolio mode) */
+    /** @var array symbol => ['bid'=>float,'ask'=>float] read this tick */
     private $books = [];
     /** @var float microtime(true) at the start of the current tick */
     private $tickStart = 0.0;
@@ -161,12 +135,8 @@ final class Bot
         $this->mode       = $ex->mode();
         $this->feePct     = max(0.0, (float) $this->cfg['fee_pct']);
         $this->engine     = Risk::engineName($this->cfg);
-        $this->portfolio  = class_exists('Sleeve') && Sleeve::portfolioEnabled($this->cfg);
-        // in portfolio mode the sleeves own the symbols, so the single `engine_symbol`
+        // the single `engine_symbol`
         // is not part of the picture at all
-        if (!$this->portfolio && Risk::isContinuousEngine($this->engine)) {
-            $this->engineSymbol = strtoupper(trim((string) $this->cfg['engine_symbol']));
-        }
     }
 
     /** Minimal defaults so a partial config (tests) still works; the real defaults live in config.php. */
@@ -212,8 +182,6 @@ final class Bot
         $this->quoteFree        = null;
         $this->posSummary       = '';
         $this->notes            = [];
-        $this->engineBid        = 0.0;
-        $this->engineAsk        = 0.0;
         $this->books            = [];
         $this->obsPending       = [];
         $this->obsLotsBefore    = [];
@@ -269,7 +237,6 @@ final class Bot
                 }
                 $this->obsFlush('', null, $status === 'ok' ? '' : 'tick_' . $status);
                 $this->obsResolvePositions();
-                $this->obsResolveCycles();
             }
         } catch (Throwable $e) {
             // observation capture is never allowed to affect the trading result
@@ -470,9 +437,6 @@ final class Bot
         }
         $this->mergeSymbolMetrics($pxPatch);
         $this->applyFeeFromAccount($acct);
-        // the engine's equity counts its base at the bid, so the book is read before the snapshot
-        $this->loadEngineBook();
-        $this->loadPortfolioBooks();
         $bal = $this->analyseBalances($acct, $prices);
         $this->reconcileBalances($acct, $bal);
         $bal = $this->analyseBalances($acct, $prices);   // positions may have changed
@@ -501,10 +465,6 @@ final class Bot
         // ---- 4. survival layer
         // read the halted flag BEFORE the check: survivalCheck() writes halted=1 itself on a fresh breach
         $already = ((string) $this->db->getState('halted', '0')) === '1';
-        $hasInventory = $this->engineActive() && $this->engineInventoryQty() > 0.0;
-        if ($this->portfolio) {
-            $hasInventory = $this->portfolioInventorySymbols() !== [];
-        }
         // Open scalp positions are money at risk too. They live in the same `positions` table
         // (DESIGN-SCALP.md §8) but Db::openPosition() skips them on purpose, because the signal
         // engine's whole exit path is built on "THE one position". Counting them here is what
@@ -513,7 +473,7 @@ final class Bot
         // is the selected engine, because it is the only engine that can actually close them:
         // under any other engine this is [] and the call below is the one it has always been.
         $scalpOpen = $this->engine === 'scalp' ? $this->scalpOpenRows() : [];
-        $sv = Risk::survivalCheck($this->cfg, $this->db, $bal['equity'], $open !== null || $stuck !== null || $hasInventory || $scalpOpen !== [], $bal['exchange_has_base']);
+        $sv = Risk::survivalCheck($this->cfg, $this->db, $bal['equity'], $open !== null || $stuck !== null || $scalpOpen !== [], $bal['exchange_has_base']);
         $action = (string) ($sv['action'] ?? 'none');
         $svReason = (string) ($sv['reason'] ?? '');
         if ($action === 'halt') {
@@ -528,19 +488,6 @@ final class Bot
                 $this->notes[] = $closed !== null ? 'position closed' : 'position NOT closed (see log)';
             } elseif ($stuck !== null) {
                 $this->retryStuck($stuck, $acct);
-            }
-            if ($hasInventory) {
-                if ($this->portfolio) {
-                    foreach ($this->portfolioInventorySymbols() as $invSym) {
-                        $flat = $this->flattenInventory($invSym);
-                        $this->notes[] = !empty($flat['ok'])
-                            ? 'inventory flattened ' . $invSym
-                            : 'inventory NOT flattened ' . $invSym . ' (see log)';
-                    }
-                } else {
-                    $flat = $this->flattenInventory();
-                    $this->notes[] = !empty($flat['ok']) ? 'inventory flattened' : 'inventory NOT flattened (see log)';
-                }
             }
             if ($scalpOpen !== []) {
                 // The kill switch wins - no scalp ENTRY can happen, because Scalper::entryBlock()
@@ -568,14 +515,12 @@ final class Bot
         }
 
         // DESIGN-SCALP.md §4: "an open position is ALWAYS managed even when entries are paused".
-        // The portfolio branch below, and the grid/pmm/signal branches after it, all return
-        // before the scalp branch, so without this a position left open by turning
-        // `portfolio_enabled` on - or by switching `engine` away from scalp - would sit with no
-        // take-profit, no stop and no max-hold until the user noticed. Exits only: the sleeves
-        // (or the selected engine) own the free quote here, so no new scalp entry may be opened
-        // against it. The halt branch above already ran the loop and returned, so this cannot
-        // run twice in one tick.
-        if ($this->portfolio || $this->engine !== 'scalp') {
+        // The signal branch below returns before the scalp branch, so without this a position
+        // left open by switching `engine` away from scalp would sit with no take-profit, no stop
+        // and no max-hold until the user noticed. Exits only: the selected engine owns the free
+        // quote here, so no new scalp entry may be opened against it. The halt branch above
+        // already ran the loop and returned, so this cannot run twice in one tick.
+        if ($this->engine !== 'scalp') {
             $scalpStranded = $this->scalpOpenRows();
             if ($scalpStranded !== [] && ($this->engine !== 'scalp' || $this->scalpExitsOnlyAvailable())) {
                 $this->notes[] = count($scalpStranded) . ' open scalp position(s) managed (exits only)';
@@ -587,23 +532,9 @@ final class Bot
             }
         }
 
-        // ---- 5-7. portfolio mode runs every sleeve instead (DESIGN-PORTFOLIO.md §6)
-        if ($this->portfolio) {
-            $this->runPortfolioTick($bal, $acct, $prices);
-            return ((string) $this->db->getState('halted', '0')) === '1' ? 'halted' : 'ok';
-        }
-
-        // ---- 5-7. the scalp engine runs its own bounded loop (DESIGN-SCALP.md §4). It is
-        //      tested before the grid/pmm branch because `engine !== 'signal'` is true for it
-        //      too, and runEngineTick() would hand it a single-symbol ladder it does not have.
+        // ---- 5-7. the scalp engine runs its own bounded loop (DESIGN-SCALP.md §4)
         if ($this->engine === 'scalp') {
             $this->runScalpTick();
-            return ((string) $this->db->getState('halted', '0')) === '1' ? 'halted' : 'ok';
-        }
-
-        // ---- 5-7. grid / pmm run their own path (DESIGN-ENGINES.md §9)
-        if ($this->engine !== 'signal') {
-            $this->runEngineTick($bal);
             return ((string) $this->db->getState('halted', '0')) === '1' ? 'halted' : 'ok';
         }
 
@@ -760,21 +691,6 @@ final class Bot
         foreach (array_keys($tracked) as $sym) {
             if (!in_array($sym, $symbols, true)) {
                 $symbols[] = $sym;   // a position off the watchlist must still count towards equity
-            }
-        }
-        // grid/pmm trade one symbol that need not be on the watchlist; its base — free AND locked
-        // in resting orders — is inventory, not a loss, so it is valued at the bid and counted.
-        // In portfolio mode the same is true of every symbol a grid/pmm SLEEVE owns, and every
-        // sleeve symbol has to be valued so the global kill switch sees the whole account.
-        $engineSyms = $this->inventorySymbols();
-        foreach ($this->portfolioSymbols() as $pSym) {
-            if (!in_array($pSym, $symbols, true)) {
-                $symbols[] = $pSym;
-            }
-        }
-        foreach (array_keys($engineSyms) as $eSym) {
-            if (!in_array($eSym, $symbols, true)) {
-                $symbols[] = $eSym;
             }
         }
         foreach ($symbols as $sym) {
@@ -1054,8 +970,8 @@ final class Bot
     /* ================================================================ step 6: entries */
 
     /**
-     * Step 6. $symbols and $available are the portfolio-mode restrictions (DESIGN-PORTFOLIO.md
-     * §6): the sleeve's own symbols, and the quote it may still commit. Both default to the
+     * Step 6. $symbols and $available optionally restrict the candidates and the quote that may
+     * be committed; both default to the
      * single-engine behaviour — the whole watchlist and the whole free quote balance — so the
      * call made when `portfolio_enabled` is false is byte-for-byte the old one.
      */
@@ -1266,724 +1182,93 @@ final class Bot
         ]);
     }
 
-    /* ================================================================ engines (DESIGN-ENGINES.md §9) */
+    /* ================================================================ engines (the removed grid/pmm contract) */
 
     /**
-     * Cancels every resting engine order, whatever engine placed it. Safe to call when no
-     * engine is active: without a live row in `engine_orders` it touches neither the
-     * exchange nor the config, so the signal engine pays one indexed SELECT and nothing else.
+     * Cancels every resting order left in `engine_orders`, whatever placed it.
+     *
+     * KEPT ON PURPOSE after the grid and pmm engines were removed. Those engines rested limit
+     * orders on the exchange, and an order resting on Binance does not care that the code that
+     * placed it is gone: without this there would be no way left to take one off the book, and
+     * a ladder from a last grid run would sit there indefinitely holding real balance. So this
+     * no longer goes through EngineOrders (deleted with them) - it reads the open rows directly,
+     * cancels each one at the exchange and marks it CANCELED.
+     *
+     * Safe and nearly free when there is nothing to do: with no open row it touches neither the
+     * exchange nor the config and costs one indexed SELECT, which is the normal case now.
      *
      * @return int number of orders that left the book
      */
     public function cancelAllEngineOrders(string $reason): int
     {
-        $symbols = $this->liveEngineSymbols();
-        if ($symbols === []) {
+        try {
+            $open = $this->db->engineOrders(['NEW', 'PARTIALLY_FILLED'], $this->mode);
+        } catch (Throwable $e) {
+            return 0;
+        }
+        if ($open === []) {
             return 0;
         }
         $n = 0;
-        foreach ($symbols as $sym) {
+        foreach ($open as $row) {
+            $sym = strtoupper(trim((string) ($row['symbol'] ?? '')));
+            $cid = (string) ($row['client_id'] ?? '');
+            if ($sym === '' || $cid === '') {
+                continue;
+            }
             try {
-                $orders = $this->engineOrdersFor($sym, $this->engineOf($sym));
-                if ($orders === null) {
+                $this->ex->cancelOrder($sym, $cid);
+                $n++;
+            } catch (BinanceException $e) {
+                // -2011 UNKNOWN_ORDER means it is already off the book (filled, expired or
+                // cancelled by hand): that is success for our purposes, so record it as such
+                // rather than leaving a row that looks live forever.
+                if ($e->binanceCode !== -2011) {
+                    $this->handleApiError($e, 'engine_cancel_all:' . $sym);
                     continue;
                 }
-                $n += (int) $orders->cancelAll($sym, $reason);
-            } catch (BinanceException $e) {
-                $this->handleApiError($e, 'engine_cancel_all:' . $sym);
             } catch (Throwable $e) {
-                Log::error('engine cancelAll ' . $sym . ' failed: ' . $e->getMessage(), ['reason' => $reason]);
+                Log::error('engine cancel ' . $sym . ' failed: ' . $e->getMessage(), ['reason' => $reason, 'client_id' => $cid]);
+                continue;
             }
+            try {
+                $this->db->updateEngineOrder($cid, [
+                    'status' => 'CANCELED', 'updated_at' => $this->nowIso(),
+                ]);
+            } catch (Throwable $e) {
+                // the order is off the book either way; the row is bookkeeping
+            }
+        }
+        if ($n > 0) {
+            Log::warn('cancelled ' . $n . ' leftover engine order(s)', ['reason' => $reason]);
         }
         return $n;
     }
 
     /**
-     * Takes the resting orders off the book so $symbol can be flattened. In portfolio mode
-     * only that symbol's own sleeve is touched: flattening one sleeve must never strip
-     * another sleeve's quotes off the book (DESIGN-PORTFOLIO.md §3 - sleeves are isolated).
-     * Single-engine mode keeps the account-wide cancel it has always done.
+     * True when the same refusal was already recorded for this engine and symbol less than
+     * OBS_ENGINE_SKIP_REPEAT_MIN ago. A block is re-reported every single tick for as long as
+     * it lasts; without this the control group would be almost entirely duplicates.
      */
-    private function cancelForFlatten(string $symbol, string $engine, string $reason): int
+    private function obsSkipRepeats(string $engine, string $symbol, string $reason): bool
     {
-        if (!$this->portfolio) {
-            return $this->cancelAllEngineOrders($reason);
-        }
-        $orders = $this->engineOrdersFor($symbol, $engine);
-        if ($orders === null) {
-            return 0;
-        }
         try {
-            return (int) $orders->cancelAll($symbol, $reason);
-        } catch (BinanceException $e) {
-            $this->handleApiError($e, 'engine_cancel_all:' . $symbol);
+            $filter = ['mode' => $this->mode, 'engine' => $engine, 'limit' => 1];
+            if ($symbol !== '') {
+                $filter['symbol'] = $symbol;
+            }
+            $last = $this->db->observations($filter);
         } catch (Throwable $e) {
-            Log::error('flatten cancelAll ' . $symbol . ' failed: ' . $e->getMessage(), ['reason' => $reason]);
-        }
-        return 0;
-    }
-
-    /**
-     * Panel action "Re-anchor grid": re-centres the ladder on the current mid and clears the
-     * pause a range exit left behind. Safe to call with any engine selected.
-     */
-    public function reanchorGrid(): void
-    {
-        $sym = $this->actionSymbol();
-        if ($sym === '') {
-            Log::warn('reanchor: no engine symbol configured');
-            return;
-        }
-        try {
-            $mid = $this->engineMid($sym);
-            if ($mid <= 0.0) {
-                Log::warn('reanchor: no book price for ' . $sym);
-                return;
-            }
-            $grid = $this->makeGrid($sym, null, $this->portfolio ? 'grid' : '');
-            if ($grid !== null) {
-                $grid->reanchor($mid);
-            } else {
-                $this->db->setState('grid_anchor', $mid);
-                $this->db->setState('grid_anchor_at', $this->nowIso());
-                $this->db->setState('grid_symbol', $sym);
-            }
-            $wasGridPause = (string) $this->db->getState('grid_paused_reason', '') === 'grid_range_exit';
-            $this->db->setState('grid_paused_reason', '');
-            if ($wasGridPause || (string) $this->db->getState('pause_reason', '') === 'grid_range_exit') {
-                $this->db->setState('paused_until', '');
-                $this->db->setState('pause_reason', '');
-            }
-            Log::info('reanchor: grid re-anchored on ' . $sym . ' at ' . Util::money($mid, 8));
-        } catch (BinanceException $e) {
-            $this->handleApiError($e, 'reanchor:' . $sym);
-        } catch (Throwable $e) {
-            Log::error('reanchor failed: ' . $e->getMessage(), ['symbol' => $sym]);
-        }
-    }
-
-    /**
-     * Panel action "Flatten inventory": cancels the resting orders and market-sells the whole
-     * engine inventory of the engine symbol. Safe to call when no engine is active (it then
-     * reports that there is nothing to sell). The sell is booked through EngineOrders, so the
-     * lots are consumed FIFO and the cycles are written exactly like an engine sell.
-     *
-     * $symbol names the sleeve symbol to flatten (portfolio mode); empty keeps the historical
-     * behaviour of flattening whatever the single engine holds.
-     *
-     * @return array{ok:bool, message:string, symbol:string, qty:float, quote:float, cancelled:int}
-     */
-    public function flattenInventory(string $symbol = ''): array
-    {
-        $sym = $symbol !== '' ? strtoupper(trim($symbol)) : $this->actionSymbol();
-        $out = ['ok' => false, 'message' => '', 'symbol' => $sym, 'qty' => 0.0, 'quote' => 0.0, 'cancelled' => 0];
-        if ($sym === '') {
-            $out['message'] = 'No engine symbol configured.';
-            return $out;
-        }
-        // The demo-only rule (DESIGN-ENGINES.md §1) is about ORDERS, not about ticks: while
-        // grid/pmm are blocked in live mode the bot must not place a single one, and this
-        // action ends in a real market SELL. Cancelling is still allowed below - it only ever
-        // takes risk off. Selling leftover inventory stays reachable: switch the engine back
-        // to `signal` (or turn allow_live_engines on) and flatten from there.
-        $flatEngine = $this->engineOf($sym);
-        if ($flatEngine !== 'signal' && $this->engineLiveBlocked($flatEngine, $sym)) {
-            $out['cancelled'] = $this->cancelForFlatten($sym, $flatEngine, 'engine_live_blocked');
-            $out['message']   = 'The ' . $flatEngine . ' engine is blocked in live mode (allow_live_engines is off),'
-                              . ' so nothing was sold. Switch the engine back to "signal" to flatten the inventory.';
-            return $out;
-        }
-        $out['cancelled'] = $this->cancelForFlatten($sym, $flatEngine, 'flatten_inventory');
-        try {
-            $info = $this->infoFor($sym);
-            $bid  = $this->bidOf($sym) > 0.0 ? $this->bidOf($sym) : (float) ($this->ex->bookTicker($sym)['bid'] ?? 0.0);
-            if ($bid <= 0.0) {
-                $out['message'] = 'No bid price for ' . $sym . '.';
-                return $out;
-            }
-            $acct     = $this->ex->account();
-            $balances = isset($acct['balances']) && is_array($acct['balances']) ? $acct['balances'] : [];
-            $base     = (string) ($info['base'] ?? '');
-            $baseFree = ($base !== '' && isset($balances[$base])) ? (float) ($balances[$base]['free'] ?? 0.0) : 0.0;
-            $step     = (string) ($info['stepSize'] ?? '0.00000001');
-            $inv      = $this->engineInventoryQty($sym);
-            $qtyStr   = Util::floorToStep(min($inv, $baseFree), $step);
-            $qty      = (float) $qtyStr;
-            if ($qty <= 0.0) {
-                $out['message'] = 'No engine inventory to sell.';
-                return $out;
-            }
-            $minNotional = (float) ($info['minNotional'] ?? 0.0);
-            if ($minNotional > 0.0 && $qty * $bid < $minNotional) {
-                $out['qty']     = $qty;
-                $out['message'] = 'Inventory is below the minimum notional (dust); nothing sold.';
-                Log::warn('flatten: inventory below minNotional, left in the wallet', [
-                    'symbol' => $sym, 'qty' => $qty, 'bid' => $bid, 'min_notional' => $minNotional,
-                ]);
-                return $out;
-            }
-            $cid = $this->newEngineClientId('SELL', $sym);
-            if ($cid === null) {
-                $out['message'] = 'Could not allocate a client id for the sell.';
-                return $out;
-            }
-            // the inventory may have been bought by another engine (the user switched engines);
-            // book the sell against the engine that owns the lots, or nothing is consumed
-            $lotEngine = $this->inventoryEngine($sym);
-            $this->db->insertEngineOrder([
-                'client_id'  => $cid,
-                'mode'       => $this->mode,
-                'engine'     => $lotEngine,
-                'symbol'     => $sym,
-                'side'       => 'SELL',
-                'status'     => 'SENDING',
-                'price'      => $bid,
-                'qty'        => $qty,
-                'quote'      => $qty * $bid,
-                'purpose'    => 'flatten',
-                'created_at' => $this->nowIso(),
-            ]);
-            $r = $this->ex->marketSell($sym, $qtyStr, $info, $cid);
-            $filled = (float) ($r['qty'] ?? 0.0);
-            $orders = $this->engineOrdersBookingAs($sym, $lotEngine);
-            if ($orders !== null) {
-                $orders->bookFill(['client_id' => $cid], $r, $filled > 0.0 ? 'FILLED' : 'EXPIRED');
-            } else {
-                $this->db->updateEngineOrder($cid, ['status' => $filled > 0.0 ? 'FILLED' : 'EXPIRED', 'updated_at' => $this->nowIso()]);
-            }
-            if ($filled <= 0.0) {
-                $out['message'] = 'The sell executed nothing; the inventory is untouched.';
-                Log::warn('flatten: sell executed nothing', ['symbol' => $sym, 'requested_qty' => $qtyStr]);
-                return $out;
-            }
-            $out['ok']      = true;
-            $out['qty']     = $filled;
-            $out['quote']   = (float) ($r['quote'] ?? 0.0);
-            $out['message'] = 'Sold ' . Util::money($filled, 8) . ' ' . ($base !== '' ? $base : $sym)
-                            . ' for ' . Util::money($out['quote']) . ' ' . $this->cfg['quote_asset'] . '.';
-            Log::warn('flatten: engine inventory sold', [
-                'symbol' => $sym, 'qty' => $filled, 'quote' => $out['quote'], 'client_id' => $cid,
-            ]);
-            return $out;
-        } catch (BinanceException $e) {
-            $this->handleApiError($e, 'flatten:' . $sym);
-            $out['message'] = 'Sell failed: ' . $e->getMessage();
-            return $out;
-        } catch (Throwable $e) {
-            Log::error('flatten failed: ' . $e->getMessage(), ['symbol' => $sym]);
-            $out['message'] = 'Sell failed: ' . $e->getMessage();
-            return $out;
-        }
-    }
-
-    /**
-     * The grid / pmm branch of the tick, run instead of steps 5-7 (DESIGN-ENGINES.md §9):
-     * live-mode guard, order synchronisation, capital pause, engine tick.
-     */
-    private function runEngineTick(array $bal): void
-    {
-        // ---- 1. demo-only rule: grid/pmm never place a single order in live mode
-        if ($this->engineLiveBlocked()) {
-            $this->noTradeReason = 'engine_live_blocked';
-            $this->notes[]       = 'engine ' . $this->engine . ' blocked in live mode';
-            $this->obsEngine($this->engine, $this->engineSymbol, 'skipped', 'engine_live_blocked', 0.0, 0.0);
-            // cancelling is not placing: a ladder left resting by an earlier allow_live_engines
-            // run has to come off the book here, because nothing else takes it off and no sync
-            // runs to book its fills. Without a live row this is one indexed SELECT and no call.
-            $n = $this->cancelAllEngineOrders('engine_live_blocked');
-            if ($n > 0) {
-                $this->notes[] = $n . ' engine order(s) cancelled (live blocked)';
-            }
-            return;
-        }
-        $sym = $this->engineSymbol;
-        if ($sym === '') {
-            $this->noTradeReason = 'engine_no_symbol';
-            return;
-        }
-        $orders = $this->engineOrdersFor($sym);
-        if ($orders === null) {
-            $this->noTradeReason = 'engine_no_symbol_info';
-            return;
-        }
-
-        // ---- 2. reconcile the resting orders and book every new fill
-        $this->obsLotBaseline($sym, $this->engine);
-        $sum = $this->step('engine_sync:' . $sym, function () use ($orders, $sym): array {
-            return $orders->sync($sym);
-        }, false);
-        if (is_array($sum)) {
-            $nFilled = isset($sum['filled']) && is_array($sum['filled']) ? count($sum['filled']) : 0;
-            if ($nFilled > 0) {
-                $this->notes[] = $nFilled . ' engine fill(s) booked';
-            }
-        }
-
-        // ---- 3. a capital pause stops the quoting and takes the ladder off the book
-        $block = (string) Risk::entryBlockReason($this->cfg, $this->db, $bal['quote_free'], $bal['equity'], $this->engine);
-        if ($block !== '' && self::isCapitalBlock($block)) {
-            $this->noTradeReason = $block;
-            $this->obsEngine($this->engine, $sym, 'skipped', $block, $this->engineBid, $this->engineAsk);
-            $n = $this->cancelAllEngineOrders($block);
-            if ($n > 0) {
-                $this->notes[] = 'engine paused (' . $block . '): ' . $n . ' order(s) cancelled';
-            }
-            return;
-        }
-        if ($block !== '') {
-            // not a capital reason (a short quote balance): the engine keeps running, because it
-            // still has to manage the inventory it already holds - sells and re-quotes go on.
-            $this->notes[] = 'engine: ' . $block;
-        }
-
-        // ---- 4. the engine itself
-        $bid = $this->engineBid;
-        $ask = $this->engineAsk;
-        if ($bid <= 0.0 || $ask <= 0.0) {
-            $this->noTradeReason = 'engine_no_book';
-            $this->obsEngine($this->engine, $sym, 'skipped', 'engine_no_book', 0.0, 0.0);
-            Log::warn('engine: no book price, tick skipped', ['symbol' => $sym]);
-            return;
-        }
-        $baseFree = isset($bal['bases'][$sym]['free']) ? (float) $bal['bases'][$sym]['free'] : 0.0;
-        $engine   = $this->engine;
-        $lotsBefore = $this->obsLotsSampled($sym, $engine);
-        $r = $this->step('engine_tick:' . $sym, function () use ($engine, $sym, $orders, $bid, $ask, $baseFree, $bal) {
-            if ($engine === 'grid') {
-                $g = $this->makeGrid($sym, $orders);
-                return $g === null ? null : $g->tick($bid, $ask, (float) $bal['quote_free']);
-            }
-            $p = $this->makePmm($sym, $orders);
-            return $p === null ? null : $p->tick($bid, $ask, $baseFree, (float) $bal['quote_free']);
-        }, false);
-        if (!is_array($r)) {
-            if ($this->noTradeReason === '') {
-                $this->noTradeReason = 'engine_unavailable';
-            }
-            return;
-        }
-        $action = (string) ($r['action'] ?? '');
-        $detail = (string) ($r['detail'] ?? '');
-        $this->obsEngineAction($engine, $sym, $action, $lotsBefore, $bid, $ask);
-        $this->noTradeReason = $engine . ':' . ($action !== '' ? $action : 'idle');
-        if ($detail !== '') {
-            $this->notes[] = $engine . ' ' . ($action !== '' ? $action : 'idle') . ' ' . $detail;
-        }
-        $this->posSummary = $engine . ' ' . $sym
-            . ' orders=' . count($this->db->openEngineOrders($sym, $this->mode))
-            . ' inv=' . Util::money($this->engineInventoryQty($sym), 8)
-            . ' bid=' . Util::money($bid, 8);
-    }
-
-    /* ================================================================ portfolio (DESIGN-PORTFOLIO.md §6) */
-
-    /**
-     * The portfolio branch of the tick, run instead of steps 5-7 when `portfolio_enabled`.
-     * Steps 1-4 (time, symbol info, reconcile, balances, total equity, the GLOBAL survival
-     * check and its kill switch) have already run above, unchanged and on the whole account.
-     *
-     * Here: the scanner at most once per tick, then every enabled sleeve in a rotating order
-     * persisted in `sleeve_cursor`, each restricted to its own symbols and its own available
-     * budget, each with its own drawdown pause, and the loop stopping early when the tick has
-     * used up TICK_TIME_BUDGET_MS.
-     */
-    private function runPortfolioTick(array $bal, array $acct, array $prices): void
-    {
-        // ---- 2. volatility scanner: one refresh per tick at most, and never in the second
-        //         half of the time budget - the sleeves are what actually trades
-        $this->maybeRunScanner();
-
-        // ---- 3. the sleeves, rotating so a long tick cannot starve the same sleeve twice
-        $order = [];
-        foreach (Sleeve::all($this->cfg) as $engine => $sleeve) {
-            if (!empty($sleeve['enabled'])) {
-                $order[] = (string) $engine;
-            }
-        }
-        // An open signal position outlives its sleeve's `enabled` flag and its symbol list.
-        // DESIGN.md §3 makes `enabled` a master switch for NEW ENTRIES only - "exits are always
-        // managed" - so a disabled, removed or emptied signal sleeve must never strand a position
-        // with no stop, no take-profit, no trailing and no max-hold. `runSignalSleeve()` is the
-        // only other caller of `managePosition()`, and `runSleeve()` returns early on an empty
-        // symbol list, so that case has to be covered here too. Step 5 runs here; entries stay off.
-        $signalRuns = in_array('signal', $order, true) && Sleeve::symbols($this->cfg, 'signal') !== [];
-        if (!$signalRuns) {
-            $openPos = $this->db->openPosition();
-            $stuckPos = $openPos === null ? $this->positionWhere(self::STUCK_WHERE, []) : null;
-            if ($openPos !== null) {
-                $this->managePosition($openPos, $acct);
-            } elseif ($stuckPos !== null) {
-                $this->retryStuck($stuckPos, $acct);
-            }
-        }
-
-        $n = count($order);
-        if ($n === 0) {
-            $this->noTradeReason = 'portfolio_no_sleeve';
-            return;
-        }
-        $cursor = (int) $this->db->getState('sleeve_cursor', '0');
-        if ($cursor < 0) {
-            $cursor = 0;
-        }
-        $cursor  = $cursor % $n;
-        $budget  = $this->tickBudgetMs();
-        $parts   = [];
-        $skipped = [];
-        $done    = 0;
-        for ($i = 0; $i < $n; $i++) {
-            $engine = $order[($cursor + $i) % $n];
-            // at least one sleeve always runs, otherwise a slow tick would starve every sleeve
-            if ($i > 0 && $this->elapsedMs() >= $budget) {
-                $skipped[] = $engine;
-                continue;
-            }
-            $before              = $this->noTradeReason;
-            $this->noTradeReason = '';
-            try {
-                $this->runSleeve($engine, $bal, $acct, $prices);
-            } catch (BotAbort $e) {
-                // The aborting sleeve has had its turn. Leaving the cursor where it is would give
-                // a sleeve that aborts every tick (a delisted symbol, a repeated order rejection)
-                // the first slot for ever, and the sleeves behind it would never run again -
-                // their ladders never synced, their fills never booked (DESIGN-PORTFOLIO.md §6.3).
-                try {
-                    $this->db->setState('sleeve_cursor', $this->nextSleeveCursor($cursor, $done + 1, $n));
-                } catch (Throwable $inner) {
-                    // best effort: never replace the abort with a storage error
-                }
-                throw $e;
-            } catch (Throwable $e) {
-                Log::error('sleeve ' . $engine . ' failed: ' . get_class($e) . ': ' . $e->getMessage(), [
-                    'file' => basename($e->getFile()) . ':' . $e->getLine(),
-                ]);
-                $this->noTradeReason = 'sleeve_error';
-            }
-            $parts[] = $engine . '=' . ($this->noTradeReason !== '' ? $this->noTradeReason : 'idle');
-            if ($this->noTradeReason === '' && $before !== '') {
-                $this->noTradeReason = $before;
-            }
-            $done++;
-        }
-        $this->db->setState('sleeve_cursor', $this->nextSleeveCursor($cursor, $done, $n));
-
-        $reason = 'portfolio:' . implode(' ', $parts);
-        if ($skipped !== []) {
-            $reason .= ' skipped:' . implode('+', $skipped) . '(time_budget)';
-            $this->notes[] = 'time budget ' . $budget . ' ms exceeded, sleeve(s) skipped: ' . implode(', ', $skipped);
-            Log::warn('portfolio: tick time budget exceeded, sleeves skipped', [
-                'skipped' => $skipped, 'elapsed_ms' => (int) round($this->elapsedMs()), 'budget_ms' => $budget,
-            ]);
-        }
-        $this->noTradeReason = $reason;
-    }
-
-    /**
-     * The sleeve the next tick starts at: the first one this tick did not reach, and when every
-     * sleeve ran, one past the current start so the order keeps rotating. $done counts the sleeves
-     * this tick used up - a sleeve that aborted the tick counts as used up too.
-     */
-    private function nextSleeveCursor(int $cursor, int $done, int $n): int
-    {
-        if ($n <= 0) {
-            return 0;
-        }
-        return $done >= $n ? ($cursor + 1) % $n : ($cursor + $done) % $n;
-    }
-
-    /**
-     * One sleeve: the demo-only guard, its live picture, its drawdown pause, its engine
-     * restricted to its own symbols and available budget, and its equity sample.
-     */
-    private function runSleeve(string $engine, array $bal, array $acct, array $prices): void
-    {
-        $symbols = Sleeve::symbols($this->cfg, $engine);
-        if ($symbols === []) {
-            $this->noTradeReason = 'sleeve_no_symbols';
-            return;
-        }
-
-        // grid/pmm never place an order in live mode without allow_live_engines; a ladder left
-        // resting by an earlier run still has to come off the book (cancelling is not placing)
-        if (Risk::isContinuousEngine($engine) && $this->engineLiveBlocked($engine, $symbols[0])) {
-            $this->noTradeReason = 'engine_live_blocked';
-            $this->notes[]       = 'sleeve ' . $engine . ' blocked in live mode';
-            $n = 0;
-            foreach ($symbols as $sym) {
-                $orders = $this->engineOrdersFor($sym, $engine);
-                if ($orders !== null) {
-                    try {
-                        $n += (int) $orders->cancelAll($sym, 'engine_live_blocked');
-                    } catch (BinanceException $e) {
-                        $this->handleApiError($e, 'engine_cancel_all:' . $sym);
-                    }
-                }
-            }
-            if ($n > 0) {
-                $this->notes[] = $n . ' order(s) cancelled (live blocked)';
-            }
-            return;
-        }
-
-        // fills since the last tick are booked BEFORE the sleeve reads its own picture:
-        // `Sleeve::state()` values inventory from the wallet snapshot but costs it from `lots`,
-        // so an unbooked sell would understate `available`, the drawdown pause and the equity
-        // sample by the whole sale proceeds (DESIGN-PORTFOLIO.md §3).
-        if (Risk::isContinuousEngine($engine)) {
-            $this->syncSleeveOrders($engine, $symbols[0]);
-        }
-
-        $state = Sleeve::state($this->cfg, $this->db, $engine, $acct, $this->sleevePrices($prices, $symbols));
-        // the operator's own pause (panel `pause_sleeve`, state value 'manual') and the automatic
-        // drawdown pause are separate conditions: either one stops NEW exposure, and the drawdown
-        // check must still run (and log) so it never overwrites or clears the manual flag.
-        $manual = (string) $this->db->getState('sleeve_paused_' . $engine, '') === 'manual';
-        $drawdn = $this->sleeveDrawdownPaused($engine, $state);
-        if ($manual) {
-            $this->notes[] = 'sleeve ' . $engine . ' paused (manual)';
-        }
-        $paused    = $manual || $drawdn;
-        $available = $paused ? 0.0 : (float) $state['available'];
-
-        if ($engine === 'signal') {
-            $this->runSignalSleeve($bal, $acct, $symbols, $available, $paused);
-        } else {
-            if (count($symbols) > 1) {
-                // the validator refuses this; a hand-edited config.json can still produce it
-                Log::warn('sleeve ' . $engine . ' is a single-symbol engine: only ' . $symbols[0] . ' is traded', [
-                    'symbols' => $symbols,
-                ]);
-            }
-            $this->runEngineSleeve($engine, $symbols[0], $available, $bal);
-        }
-
-        try {
-            $this->db->insertSleeveEquity([
-                'mode'            => $this->mode,
-                'engine'          => $engine,
-                'equity'          => (float) $state['equity'],
-                'budget'          => (float) $state['budget'],
-                'realised'        => (float) $state['realised'],
-                'unrealised'      => (float) $state['unrealised'],
-                'inventory_value' => (float) $state['inventory_value'],
-                'reserved'        => (float) $state['reserved'],
-                'ts'              => $this->nowIso(),
-            ]);
-        } catch (Throwable $e) {
-            // the per-sleeve equity series is panel telemetry: never fail a tick for it
-        }
-    }
-
-    /**
-     * Per-sleeve drawdown pause (DESIGN-PORTFOLIO.md §6.4): a sleeve whose equity has fallen to
-     * `budget × (1 − sleeve_max_drawdown_pct/100)` stops opening new exposure while the other
-     * sleeves keep trading. The pause is a live condition recorded in `sleeve_paused_<engine>`
-     * for the panel; it lifts by itself when the sleeve's equity recovers.
-     */
-    private function sleeveDrawdownPaused(string $engine, array $state): bool
-    {
-        $key    = 'sleeve_paused_' . $engine;
-        $was    = (string) $this->db->getState($key, '');
-        // a manual pause is the operator's, not ours: never overwrite it and never clear it here
-        $manual = $was === 'manual';
-        $budget = (float) $state['budget'];
-        $dd     = Risk::sleeveMaxDrawdownPct($this->cfg);
-        if ($budget <= 0.0 || $dd <= 0.0) {
-            if ($was !== '' && !$manual) {
-                $this->db->setState($key, '');
-            }
             return false;
         }
-        $limit = $budget * (1.0 - $dd / 100.0);
-        if ((float) $state['equity'] <= $limit) {
-            if ($was === '' && !$manual) {
-                $this->db->setState($key, $this->nowIso());
-                Log::warn('sleeve ' . $engine . ' paused: equity ' . Util::money((float) $state['equity'])
-                    . ' is at or below ' . Util::money($limit) . ' (' . Util::money($dd, 2) . '% of its budget)', [
-                    'engine' => $engine, 'budget' => $budget, 'equity' => $state['equity'],
-                ]);
-            }
-            $this->notes[] = 'sleeve ' . $engine . ' drawdown-paused';
-            return true;
+        if ($last === []) {
+            return false;
         }
-        if ($was !== '' && !$manual) {
-            $this->db->setState($key, '');
-            Log::info('sleeve ' . $engine . ' drawdown pause cleared', ['equity' => $state['equity'], 'limit' => $limit]);
+        $row = $last[0];
+        if ((string) $row['decision'] !== 'skipped' || (string) $row['skip_reason'] !== $reason) {
+            return false;
         }
-        return false;
-    }
-
-    /** The signal sleeve: steps 5 and 6 restricted to the sleeve's symbols and budget. */
-    private function runSignalSleeve(array $bal, array $acct, array $symbols, float $available, bool $paused): void
-    {
-        // ---- 5. position management. Exits are ALWAYS managed, drawdown pause or not.
-        $open  = $this->db->openPosition();
-        $stuck = $open === null ? $this->positionWhere(self::STUCK_WHERE, []) : null;
-        if ($open !== null) {
-            $this->managePosition($open, $acct);
-        } elseif ($stuck !== null) {
-            $this->retryStuck($stuck, $acct);
-        }
-
-        // ---- 6. entries
-        $open  = $this->db->openPosition();
-        $stuck = $open === null ? $this->positionWhere(self::STUCK_WHERE, []) : null;
-        if ($open !== null || $stuck !== null) {
-            if ($this->noTradeReason === '') {
-                $this->noTradeReason = $open !== null ? 'position_open' : 'position_stuck';
-            }
-            return;
-        }
-        if ($this->ordersThisTick > 0) {
-            if ($this->noTradeReason === '') {
-                $this->noTradeReason = 'order_sent_this_tick';
-            }
-            return;
-        }
-        if ($paused) {
-            $this->noTradeReason = 'sleeve_drawdown';
-            return;
-        }
-        $this->evaluateEntries($bal['quote_free'], $bal['equity'], $symbols, $available);
-    }
-
-    /**
-     * Books every fill of a continuous sleeve's symbol into `lots`/`cycles`. Run by
-     * `runSleeve()` before `Sleeve::state()`, so the sleeve's `available`, its drawdown
-     * pause and its equity sample all see this tick's fills. Never throws: a failed sync
-     * is a non-essential step.
-     */
-    private function syncSleeveOrders(string $engine, string $symbol): void
-    {
-        $orders = $this->engineOrdersFor($symbol, $engine);
-        if ($orders === null) {
-            return;     // runEngineSleeve() reports engine_no_symbol_info
-        }
-        $this->obsLotBaseline($symbol, $engine);
-        $sum = $this->step('engine_sync:' . $symbol, function () use ($orders, $symbol): array {
-            return $orders->sync($symbol);
-        }, false);
-        if (is_array($sum)) {
-            $nFilled = isset($sum['filled']) && is_array($sum['filled']) ? count($sum['filled']) : 0;
-            if ($nFilled > 0) {
-                $this->notes[] = $engine . ': ' . $nFilled . ' fill(s) booked';
-            }
-        }
-    }
-
-    /**
-     * A grid / pmm sleeve: the same sequence as the single-engine branch (capital pause,
-     * engine tick; the sync already ran in `runSleeve()`), but bound to the sleeve's symbol
-     * and to a quote budget that is the smaller of the wallet's free quote and the sleeve's
-     * `available`.
-     */
-    private function runEngineSleeve(string $engine, string $symbol, float $available, array $bal): void
-    {
-        $orders = $this->engineOrdersFor($symbol, $engine);
-        if ($orders === null) {
-            $this->noTradeReason = 'engine_no_symbol_info';
-            return;
-        }
-
-        $block = (string) Risk::entryBlockReason($this->cfg, $this->db, $bal['quote_free'], $bal['equity'], $engine);
-        if ($block !== '' && self::isCapitalBlock($block)) {
-            $this->noTradeReason = $block;
-            $this->obsEngine($engine, $symbol, 'skipped', $block, 0.0, 0.0);
-            try {
-                $n = (int) $orders->cancelAll($symbol, $block);
-            } catch (BinanceException $e) {
-                $this->handleApiError($e, 'engine_cancel_all:' . $symbol);
-                $n = 0;
-            }
-            if ($n > 0) {
-                $this->notes[] = 'sleeve ' . $engine . ' paused (' . $block . '): ' . $n . ' order(s) cancelled';
-            }
-            return;
-        }
-        if ($block !== '') {
-            $this->notes[] = 'sleeve ' . $engine . ': ' . $block;
-        }
-
-        $book = isset($this->books[$symbol]) ? $this->books[$symbol] : ['bid' => 0.0, 'ask' => 0.0];
-        $bid  = (float) $book['bid'];
-        $ask  = (float) $book['ask'];
-        if ($bid <= 0.0 || $ask <= 0.0) {
-            $this->noTradeReason = 'engine_no_book';
-            $this->obsEngine($engine, $symbol, 'skipped', 'engine_no_book', 0.0, 0.0);
-            Log::warn('sleeve ' . $engine . ': no book price, skipped', ['symbol' => $symbol]);
-            return;
-        }
-
-        // the budget rule of DESIGN-PORTFOLIO.md §3: an engine may never commit more quote than
-        // its sleeve still has available, and never more than the wallet actually holds.
-        // The engine sizes against $quote and EngineOrders::place() refuses anything above it,
-        // so a mis-sized quote can never spend another sleeve's capital.
-        $quote    = min((float) $bal['quote_free'], max(0.0, $available));
-        $orders->setAvailableQuote($quote);
-        $baseFree   = isset($bal['bases'][$symbol]['free']) ? (float) $bal['bases'][$symbol]['free'] : 0.0;
-        $lotsBefore = $this->obsLotsSampled($symbol, $engine);
-        $r = $this->step('engine_tick:' . $symbol, function () use ($engine, $symbol, $orders, $bid, $ask, $baseFree, $quote) {
-            if ($engine === 'grid') {
-                $g = $this->makeGrid($symbol, $orders, $engine);
-                return $g === null ? null : $g->tick($bid, $ask, $quote);
-            }
-            $p = $this->makePmm($symbol, $orders, $engine);
-            return $p === null ? null : $p->tick($bid, $ask, $baseFree, $quote);
-        }, false);
-        if (!is_array($r)) {
-            if ($this->noTradeReason === '') {
-                $this->noTradeReason = 'engine_unavailable';
-            }
-            return;
-        }
-        $action = (string) ($r['action'] ?? '');
-        $detail = (string) ($r['detail'] ?? '');
-        $this->obsEngineAction($engine, $symbol, $action, $lotsBefore, $bid, $ask);
-        $this->noTradeReason = $action !== '' ? $action : 'idle';
-        if ($detail !== '') {
-            $this->notes[] = $engine . ' ' . ($action !== '' ? $action : 'idle') . ' ' . $detail;
-        }
-    }
-
-    /**
-     * Runs the volatility scanner at most once per tick, before the sleeves and never when the
-     * tick has already used half its time budget (DESIGN-PORTFOLIO.md §6.2). `Scanner::due()`
-     * keeps it to `scanner_refresh_min`; a weight-80 call must not run every minute.
-     *
-     * The half-budget test only guards ENTRY to the scan: once inside, the ATR pass is up to
-     * 25 sequential klines calls of up to 15 s apiece and could still outlast the whole tick.
-     * So the scan is also handed an absolute deadline at three quarters of the budget; past
-     * it the partial ranking is stored and the sleeves get the rest of the tick.
-     */
-    private function maybeRunScanner(): void
-    {
-        if (!class_exists('Scanner')) {
-            return;
-        }
-        try {
-            $scanner = new Scanner($this->cfg, $this->db, $this->ex);
-            if (!$scanner->due()) {
-                return;
-            }
-            if ($this->elapsedMs() >= $this->tickBudgetMs() / 2) {
-                $this->notes[] = 'scanner skipped (past half the time budget)';
-                return;
-            }
-            $info = $this->info;
-            // the ATR pass is up to 25 sequential klines calls: hand it a hard deadline at
-            // three quarters of the tick budget so the sleeves still get their turn
-            $deadline = ($this->tickStart * 1000.0) + ($this->tickBudgetMs() * 0.75);
-            $rows = $this->step('scanner', function () use ($scanner, $info, $deadline) {
-                return $scanner->refresh($info, false, $deadline);
-            }, false);
-            if (is_array($rows) && $rows !== []) {
-                $this->notes[] = 'scanner ranked ' . count($rows) . ' pair(s)';
-            }
-        } catch (BotAbort $e) {
-            throw $e;
-        } catch (Throwable $e) {
-            Log::warn('scanner: refresh failed - ' . $e->getMessage());
-        }
+        return Util::isoDiffMinutes((string) $row['ts'], $this->nowIso()) < self::OBS_ENGINE_SKIP_REPEAT_MIN;
     }
 
     /* ================================================================ steps 5-7: scalp */
@@ -2020,7 +1305,6 @@ final class Bot
         if ($this->engineLiveBlocked('scalp')) {
             $this->noTradeReason = 'engine_live_blocked';
             $this->notes[]       = 'engine scalp blocked in live mode';
-            $this->obsEngine('scalp', self::OBS_ALL_SYMBOLS, 'skipped', 'engine_live_blocked', 0.0, 0.0);
             $n = $this->cancelAllEngineOrders('engine_live_blocked');
             if ($n > 0) {
                 $this->notes[] = $n . ' engine order(s) cancelled (live blocked)';
@@ -2251,143 +1535,28 @@ final class Bot
         return $v > 0 ? $v : self::TICK_TIME_BUDGET_MS;
     }
 
-    /** Every symbol owned by a sleeve (enabled or not); [] outside portfolio mode. */
-    private function portfolioSymbols(): array
-    {
-        if (!$this->portfolio) {
-            return [];
-        }
-        return Sleeve::allSymbols($this->cfg, false);
-    }
-
-    /**
-     * Symbols whose base balance is engine INVENTORY rather than dust or an untracked
-     * position: the single engine's symbol, or every symbol a grid/pmm sleeve owns.
-     * @return array symbol => true
-     */
-    private function inventorySymbols(bool $enabledOnly = false): array
-    {
-        $out = [];
-        if ($this->portfolio) {
-            foreach (Sleeve::all($this->cfg) as $engine => $sleeve) {
-                if (!Risk::isContinuousEngine((string) $engine)) {
-                    continue;
-                }
-                if ($enabledOnly && empty($sleeve['enabled'])) {
-                    continue;
-                }
-                foreach ($sleeve['symbols'] as $sym) {
-                    $out[$sym] = true;
-                }
-            }
-            return $out;
-        }
-        if ($this->engineSymbol !== '') {
-            $out[$this->engineSymbol] = true;
-        }
-        return $out;
-    }
-
-    /** Sleeve symbols that still hold open lots (used by the kill switch to flatten). */
-    private function portfolioInventorySymbols(): array
-    {
-        $out = [];
-        foreach (array_keys($this->inventorySymbols()) as $sym) {
-            if ($this->engineInventoryQty($sym) > 0.0) {
-                $out[] = $sym;
-            }
-        }
-        return $out;
-    }
-
-    /** Engine that owns $symbol: its sleeve in portfolio mode, else the configured engine. */
-    private function engineOf(string $symbol): string
-    {
-        if (!$this->portfolio) {
-            return $this->engine;
-        }
-        $owner = Sleeve::ownerOf($this->cfg, $symbol);
-        if ($owner !== null && $owner !== '') {
-            return $owner;
-        }
-        return $this->inventoryEngine($symbol);
-    }
-
-    /** Watchlist, or every sleeve symbol in portfolio mode: what the panel telemetry covers. */
+    /** The watchlist: what the panel telemetry covers. */
     private function metricSymbols(): array
     {
-        if (!$this->portfolio) {
-            return $this->symbols();
-        }
-        $out = $this->portfolioSymbols();
-        foreach ($this->symbols() as $sym) {
-            if (!in_array($sym, $out, true)) {
-                $out[] = $sym;
-            }
-        }
-        return $out;
+        return $this->symbols();
     }
 
     /** Bid read this tick for $symbol (0.0 when the book was not read). */
     private function bidOf(string $symbol): float
     {
-        if ($symbol !== '' && $symbol === $this->engineSymbol && $this->engineBid > 0.0) {
-            return $this->engineBid;
-        }
         return isset($this->books[$symbol]) ? (float) $this->books[$symbol]['bid'] : 0.0;
     }
 
     /**
-     * Reads the book of every symbol a grid/pmm sleeve owns, once per tick: their inventory is
-     * valued at the bid and their engines quote around it. Best effort - a missing book leaves
-     * the sleeve reporting `engine_no_book` instead of failing the tick.
-     */
-    private function loadPortfolioBooks(): void
-    {
-        if (!$this->portfolio) {
-            return;
-        }
-        // only the sleeves that actually run: a disabled sleeve's inventory is still valued,
-        // from the prices call the tick already made, and must not cost a bookTicker call
-        foreach (array_keys($this->inventorySymbols(true)) as $sym) {
-            if (isset($this->books[$sym])) {
-                continue;
-            }
-            $book = $this->step('book:' . $sym, function () use ($sym): array {
-                return $this->ex->bookTicker($sym);
-            }, false);
-            if (!is_array($book)) {
-                continue;
-            }
-            $bid = (float) ($book['bid'] ?? 0.0);
-            $ask = (float) ($book['ask'] ?? 0.0);
-            $this->books[$sym] = ['bid' => $bid > 0.0 ? $bid : 0.0, 'ask' => $ask > 0.0 ? $ask : 0.0];
-        }
-    }
-
-    /** [symbol => price] for Sleeve::state(): the bid when this tick read one, else the last price. */
-    private function sleevePrices(array $prices, array $symbols): array
-    {
-        $out = [];
-        foreach ($symbols as $sym) {
-            $bid = $this->bidOf($sym);
-            if ($bid <= 0.0 && isset($prices[$sym]) && is_numeric($prices[$sym])) {
-                $bid = (float) $prices[$sym];
-            }
-            $out[$sym] = $bid > 0.0 ? $bid : 0.0;
-        }
-        return $out;
-    }
-
-    /**
-     * true when the engine may not trade because it is live and allow_live_engines is false.
-     * $engine / $symbol name the sleeve being checked in portfolio mode; empty means the
-     * configured single engine, so the historical call keeps its behaviour.
+     * true when the engine may not trade because it is live and `allow_live_engines` is false.
+     *
+     * The scalp engine is the only caller left (grid and pmm were removed), and it is the engine
+     * this guard matters most for: DESIGN-SCALP.md is explicit that it is for measuring on demo,
+     * and nothing about its fee arithmetic says it is ready for real money.
      */
     private function engineLiveBlocked(string $engine = '', string $symbol = ''): bool
     {
         $engine = $engine !== '' ? $engine : $this->engine;
-        $symbol = $symbol !== '' ? $symbol : $this->engineSymbol;
         // either source of truth saying "live" blocks: the exchange the bot is really talking to
         // and the configured mode, so a mis-paired config can never slip an order through
         $live    = $this->mode === 'live' || strtolower(trim((string) $this->cfg['mode'])) === 'live';
@@ -2406,259 +1575,6 @@ final class Bot
             ]);
         }
         return true;
-    }
-
-    /** A block reason that must take the whole ladder off the book (DESIGN-ENGINES.md §9.3). */
-    private static function isCapitalBlock(string $reason): bool
-    {
-        if (in_array($reason, self::ENGINE_CAPITAL_BLOCKS, true)) {
-            return true;
-        }
-        return strncmp($reason, 'paused:', 7) === 0;
-    }
-
-    /** grid | pmm with a configured symbol. */
-    private function engineActive(): bool
-    {
-        return $this->engine !== 'signal' && $this->engineSymbol !== '';
-    }
-
-    /** Symbol the panel actions work on: the engine symbol, else whatever inventory is left. */
-    private function actionSymbol(): string
-    {
-        if ($this->engineSymbol !== '') {
-            return $this->engineSymbol;
-        }
-        if ($this->portfolio) {
-            // the sleeves own the symbols; the grid sleeve is the one with an anchor to reset
-            foreach (['grid', 'pmm'] as $eng) {
-                $syms = Sleeve::symbols($this->cfg, $eng);
-                if ($syms !== []) {
-                    return $syms[0];
-                }
-            }
-        }
-        $sym = strtoupper(trim((string) ($this->cfg['engine_symbol'] ?? '')));
-        if ($sym !== '') {
-            return $sym;
-        }
-        try {
-            $st = $this->db->pdo()->prepare('SELECT symbol FROM lots WHERE mode = ? AND remaining > 0 ORDER BY id DESC LIMIT 1');
-            $st->execute([$this->mode]);
-            $v = $st->fetchColumn();
-            return $v === false || $v === null ? '' : strtoupper((string) $v);
-        } catch (Throwable $e) {
-            return '';
-        }
-    }
-
-    /** Distinct symbols with at least one resting engine order; [] (and no query cost) is the norm. */
-    private function liveEngineSymbols(): array
-    {
-        try {
-            $rows = $this->db->engineOrders(Db::ENGINE_LIVE_STATUSES, $this->mode);
-        } catch (Throwable $e) {
-            return [];
-        }
-        $out = [];
-        foreach ($rows as $row) {
-            // never touch another mode's book: a leftover paper/testnet row must not make a
-            // live cancelAll fire against the real account (and vice versa)
-            if (strtolower(trim((string) ($row['mode'] ?? ''))) !== strtolower(trim($this->mode))) {
-                continue;
-            }
-            $s = strtoupper((string) ($row['symbol'] ?? ''));
-            if ($s !== '') {
-                $out[$s] = true;
-            }
-        }
-        return array_keys($out);
-    }
-
-    /** Base quantity the engine still owns (open lots), 0.0 when the table or the symbol is empty. */
-    private function engineInventoryQty(string $symbol = ''): float
-    {
-        $sym = $symbol !== '' ? $symbol : $this->engineSymbol;
-        if ($sym === '') {
-            return 0.0;
-        }
-        try {
-            $lots = $this->db->openLots($sym, $this->mode, null);
-        } catch (Throwable $e) {
-            return 0.0;
-        }
-        $q = 0.0;
-        foreach ($lots as $lot) {
-            $q += max(0.0, (float) ($lot['remaining'] ?? 0.0));
-        }
-        return $q;
-    }
-
-    /**
-     * Reads the engine symbol's book once per tick. The engine equity values the base at the
-     * bid, and the equity snapshot runs before the engine branch, so this happens early.
-     * Best effort: a missing book leaves the price at 0.0 and the engine tick reports it.
-     */
-    private function loadEngineBook(): void
-    {
-        if (!$this->engineActive()) {
-            return;
-        }
-        $sym  = $this->engineSymbol;
-        $book = $this->step('book:' . $sym, function () use ($sym): array {
-            return $this->ex->bookTicker($sym);
-        }, false);
-        if (!is_array($book)) {
-            return;
-        }
-        $bid = (float) ($book['bid'] ?? 0.0);
-        $ask = (float) ($book['ask'] ?? 0.0);
-        $this->engineBid = $bid > 0.0 ? $bid : 0.0;
-        $this->engineAsk = $ask > 0.0 ? $ask : 0.0;
-    }
-
-    /** Mid price of $symbol from the book (cached when the tick already fetched it). */
-    private function engineMid(string $symbol): float
-    {
-        if ($symbol === $this->engineSymbol && $this->engineBid > 0.0 && $this->engineAsk > 0.0) {
-            return ($this->engineBid + $this->engineAsk) / 2.0;
-        }
-        if (isset($this->books[$symbol])
-            && (float) $this->books[$symbol]['bid'] > 0.0 && (float) $this->books[$symbol]['ask'] > 0.0) {
-            return ((float) $this->books[$symbol]['bid'] + (float) $this->books[$symbol]['ask']) / 2.0;
-        }
-        $book = $this->ex->bookTicker($symbol);
-        $bid  = (float) ($book['bid'] ?? 0.0);
-        $ask  = (float) ($book['ask'] ?? 0.0);
-        if ($bid > 0.0 && $ask > 0.0) {
-            return ($bid + $ask) / 2.0;
-        }
-        return max($bid, $ask);
-    }
-
-    /**
-     * Engine that owns the open lots of $symbol (oldest first), the configured engine when
-     * there are none. engineInventoryQty() counts every engine's lots, so a flatten after an
-     * engine switch must consume them under THEIR engine or bookSell() matches nothing.
-     */
-    private function inventoryEngine(string $symbol): string
-    {
-        try {
-            $lots = $this->db->openLots($symbol, $this->mode, null);
-        } catch (Throwable $e) {
-            return $this->engine;
-        }
-        foreach ($lots as $lot) {
-            $e = strtolower(trim((string) ($lot['engine'] ?? '')));
-            if ($e !== '') {
-                return $e;
-            }
-        }
-        return $this->engine;
-    }
-
-    /** EngineOrders for $symbol whose lot/cycle bookkeeping runs under $engine (never cached). */
-    private function engineOrdersBookingAs(string $symbol, string $engine): ?EngineOrders
-    {
-        if ($engine === '' || $engine === $this->engine) {
-            return $this->engineOrdersFor($symbol);
-        }
-        $symbol = strtoupper(trim($symbol));
-        if ($symbol === '') {
-            return null;
-        }
-        try {
-            $info = $this->infoFor($symbol);
-        } catch (Throwable $e) {
-            Log::warn('engine: no symbol info for ' . $symbol . ' - ' . $e->getMessage());
-            return null;
-        }
-        $cfg           = $this->engineCfg($symbol);
-        $cfg['engine'] = $engine;
-        return new EngineOrders($cfg, $this->db, $this->ex, $info, $this->fixedNowMs);
-    }
-
-    /**
-     * EngineOrders bound to $symbol, or null when the symbol info cannot be loaded.
-     * $engine names the sleeve the fills must be booked under (portfolio mode); empty
-     * keeps the configured engine, which is what the single-engine tick has always used.
-     */
-    private function engineOrdersFor(string $symbol, string $engine = ''): ?EngineOrders
-    {
-        $symbol = strtoupper(trim($symbol));
-        if ($symbol === '') {
-            return null;
-        }
-        $engine = $engine !== '' ? strtolower(trim($engine)) : $this->engine;
-        $key    = $symbol . '|' . $engine;
-        if (isset($this->engineOrdersCache[$key])) {
-            return $this->engineOrdersCache[$key];
-        }
-        try {
-            $info = $this->infoFor($symbol);
-        } catch (Throwable $e) {
-            Log::warn('engine: no symbol info for ' . $symbol . ' - ' . $e->getMessage());
-            return null;
-        }
-        $cfg = $this->engineCfg($symbol, $engine);
-        $this->engineOrdersCache[$key] = new EngineOrders($cfg, $this->db, $this->ex, $info, $this->fixedNowMs);
-        return $this->engineOrdersCache[$key];
-    }
-
-    private function makeGrid(string $symbol, ?EngineOrders $orders = null, string $engine = ''): ?EngineGrid
-    {
-        if (!class_exists('EngineGrid')) {
-            Log::error('engine: EngineGrid is not installed');
-            return null;
-        }
-        if ($orders === null) {
-            $orders = $this->engineOrdersFor($symbol, $engine);
-        }
-        if ($orders === null) {
-            return null;
-        }
-        return new EngineGrid($this->engineCfg($symbol, $engine), $this->db, $this->ex, $orders, $this->infoFor($symbol));
-    }
-
-    private function makePmm(string $symbol, ?EngineOrders $orders = null, string $engine = ''): ?EnginePmm
-    {
-        if (!class_exists('EnginePmm')) {
-            Log::error('engine: EnginePmm is not installed');
-            return null;
-        }
-        if ($orders === null) {
-            $orders = $this->engineOrdersFor($symbol, $engine);
-        }
-        if ($orders === null) {
-            return null;
-        }
-        return new EnginePmm($this->engineCfg($symbol, $engine), $this->db, $this->ex, $orders, $this->infoFor($symbol));
-    }
-
-    /** Config for the engine classes: the exchange's mode, engine and acting symbol win. */
-    private function engineCfg(string $symbol, string $engine = ''): array
-    {
-        $cfg = $this->cfg;
-        $cfg['mode']          = $this->mode;
-        $cfg['engine']        = $engine !== '' ? $engine : $this->engine;
-        $cfg['engine_symbol'] = $symbol;
-        $cfg['fee_pct']       = $this->feePct;
-        return $cfg;
-    }
-
-    /** Free client id for an engine order sent by the bot itself (flatten). */
-    private function newEngineClientId(string $side, string $symbol): ?string
-    {
-        $minute = intdiv($this->nowMs(), 60000) * 60;
-        $base   = Util::clientOrderId($side, $symbol, $minute);
-        $cid    = $base;
-        for ($n = 2; $n < 100; $n++) {
-            if ($this->db->engineOrder($cid) === null && $this->orderStatus($cid) === null) {
-                return $cid;
-            }
-            $cid = substr($base . '-' . $n, 0, 36);
-        }
-        return null;
     }
 
     /** Config flag that may arrive as bool, int or string. */
@@ -2965,171 +1881,6 @@ final class Bot
     }
 
     /**
-     * One observation for a continuous engine's entry decision (DESIGN-LEARNING.md §2).
-     * Written when the engine placed a buy, and when something refused to let it - never on
-     * an idle tick, which is not a decision. `entered` rows are resolved by the cycle their
-     * inventory eventually closes; `skipped` rows resolve to `not_taken` immediately.
-     */
-    private function obsEngine(string $engine, string $symbol, string $decision, string $skipReason, float $bid, float $ask): void
-    {
-        if (!$this->learningOn() || $symbol === '') {
-            return;
-        }
-        $reason = $skipReason !== '' ? $skipReason : 'skipped';
-        if ($decision !== 'entered' && $this->obsSkipRepeats($engine, $symbol, $reason)) {
-            // an engine that is blocked, paused or out of range reports the same refusal every
-            // minute; recording it once an hour keeps the control group honest without burying
-            // every real decision under a thousand copies of one
-            return;
-        }
-        $now = $this->nowIso();
-        $row = [
-            'ts'          => $now,
-            'mode'        => $this->mode,
-            'engine'      => $engine,
-            'symbol'      => $symbol,
-            'decision'    => $decision === 'entered' ? 'entered' : 'skipped',
-            'skip_reason' => $decision === 'entered' ? null : $reason,
-            'features'    => $this->obsEngineFeatures($engine, $symbol, $bid, $ask),
-        ];
-        if ($row['decision'] === 'skipped') {
-            $row['outcome']     = 'not_taken';
-            $row['resolved_at'] = $now;
-        }
-        $this->obsInsert($row);
-    }
-
-    /**
-     * True when the same refusal was already recorded for this engine and symbol less than
-     * OBS_ENGINE_SKIP_REPEAT_MIN ago. A block is re-reported every single tick for as long as
-     * it lasts; without this the control group would be almost entirely duplicates.
-     */
-    private function obsSkipRepeats(string $engine, string $symbol, string $reason): bool
-    {
-        try {
-            $filter = ['mode' => $this->mode, 'engine' => $engine, 'limit' => 1];
-            if ($symbol !== '') {
-                $filter['symbol'] = $symbol;
-            }
-            $last = $this->db->observations($filter);
-        } catch (Throwable $e) {
-            return false;
-        }
-        if ($last === []) {
-            return false;
-        }
-        $row = $last[0];
-        if ((string) $row['decision'] !== 'skipped' || (string) $row['skip_reason'] !== $reason) {
-            return false;
-        }
-        return Util::isoDiffMinutes((string) $row['ts'], $this->nowIso()) < self::OBS_ENGINE_SKIP_REPEAT_MIN;
-    }
-
-    /**
-     * Turns an engine tick's reported action into an observation: `entered` when a BUY the
-     * engine had working actually FILLED this tick, `skipped` when it was refused, nothing at
-     * all when it merely had nothing to do.
-     *
-     * A fill, not a placement: `EngineOrders::place()` writes its row before the exchange has
-     * answered, a post-only reject leaves it there, and pmm cancels and re-posts its bid every
-     * refresh - counting placements would file one `entered` row a minute for quotes that never
-     * traded, none of which any cycle could ever resolve. `$lotsBefore` is sampled before the
-     * tick's `sync()` (see obsLotBaseline()) so a fill booked by the sync itself still counts.
-     */
-    private function obsEngineAction(string $engine, string $symbol, string $action, int $lotsBefore, float $bid, float $ask): void
-    {
-        if (!$this->learningOn()) {
-            return;
-        }
-        if ($this->engineLotCount($symbol, $engine) > $lotsBefore) {
-            $this->obsEngine($engine, $symbol, 'entered', '', $bid, $ask);
-            return;
-        }
-        if (in_array($action, ['paused', 'range_exit', 'skipped', 'grid_dust'], true)) {
-            // an action that already names its engine ('grid_dust') is not prefixed twice
-            $reason = strpos($action, $engine) === 0 ? $action : $engine . '_' . $action;
-            $this->obsEngine($engine, $symbol, 'skipped', $reason, $bid, $ask);
-        }
-    }
-
-    /** Features an engine tick can supply without a single extra API call. */
-    private function obsEngineFeatures(string $engine, string $symbol, float $bid, float $ask): array
-    {
-        $sec = $this->nowSec();
-        $f = [
-            'hour_utc' => (int) gmdate('G', $sec),
-            'dow'      => (int) gmdate('w', $sec),
-        ];
-        $spread = $this->obsSpreadPct(['bid' => $bid, 'ask' => $ask]);
-        if ($spread !== null) {
-            $f['spread_pct'] = $spread;
-        }
-        $mid = ($bid > 0.0 && $ask > 0.0) ? ($bid + $ask) / 2.0 : 0.0;
-        if ($engine === 'grid' && $mid > 0.0) {
-            $anchor = 0.0;
-            try {
-                if ((string) $this->db->getState('grid_symbol', '') === $symbol) {
-                    $raw    = $this->db->getState('grid_anchor', null);
-                    $anchor = is_numeric($raw) ? (float) $raw : 0.0;
-                }
-            } catch (Throwable $e) {
-                $anchor = 0.0;
-            }
-            if ($anchor > 0.0) {
-                $f['dist_from_anchor_pct'] = ($mid - $anchor) / $anchor * 100.0;
-            }
-        }
-        if ($mid > 0.0) {
-            $info  = isset($this->info[$symbol]) ? $this->info[$symbol] : [];
-            $order = $engine === 'grid' ? 'grid_order_usdt' : 'pmm_order_usdt';
-            $usdt  = isset($this->cfg[$order]) && is_numeric($this->cfg[$order]) ? (float) $this->cfg[$order] : 0.0;
-            $step  = $info !== [] ? $this->obsStepValuePct($info, $mid, $usdt) : null;
-            if ($step !== null) {
-                $f['step_value_pct'] = $step;
-            }
-        }
-        return $f;
-    }
-
-    /**
-     * How many FIFO lots this mode has ever booked for a symbol. A READ, used only to tell
-     * "the engine's buy actually FILLED" from "the engine merely put a quote on the book".
-     * One lot row is written per booked engine BUY fill, which is exactly the unit a cycle
-     * later consumes - a quote that is rejected, cancelled or left resting writes none.
-     */
-    private function engineLotCount(string $symbol, string $engine): int
-    {
-        if ($symbol === '') {
-            return 0;
-        }
-        try {
-            $st = $this->db->pdo()->prepare(
-                'SELECT COUNT(*) FROM lots WHERE mode = ? AND symbol = ? AND engine = ?'
-            );
-            $st->execute([$this->mode, $symbol, $engine]);
-            return (int) $st->fetchColumn();
-        } catch (Throwable $e) {
-            return 0;
-        }
-    }
-
-    /** Samples the lot baseline for this tick, before `sync()` books anything. Capture only. */
-    private function obsLotBaseline(string $symbol, string $engine): void
-    {
-        if (!$this->learningOn() || $symbol === '') {
-            return;
-        }
-        $this->obsLotsBefore[$engine . '|' . $symbol] = $this->engineLotCount($symbol, $engine);
-    }
-
-    /** The baseline sampled by obsLotBaseline() this tick, or 0 when learning is off. */
-    private function obsLotsSampled(string $symbol, string $engine): int
-    {
-        $key = $engine . '|' . $symbol;
-        return isset($this->obsLotsBefore[$key]) ? (int) $this->obsLotsBefore[$key] : 0;
-    }
-
-    /**
      * Resolves every observation whose position has since closed - whatever closed it: an
      * exit signal, the kill switch, a panic sell or reconciliation. Idempotent: it only ever
      * looks at rows that still have no outcome, and the resolve is unforced.
@@ -3167,123 +1918,6 @@ final class Bot
                 'resolved_at'  => $now,
             ]);
         }
-    }
-
-    /**
-     * Resolves engine observations against the cycles booked since the last tick, oldest
-     * first - the order the FIFO lots are consumed in, so the cycle that closes a buy
-     * resolves the observation that recorded it. The `obs_cycle_cursor` bookmark makes the
-     * sweep idempotent: a cycle is considered exactly once, and a row that already carries an
-     * outcome is left alone by the unforced resolve.
-     */
-    private function obsResolveCycles(): void
-    {
-        $raw = $this->db->getState('obs_cycle_cursor', null);
-        if ($raw === null || $raw === '') {
-            // First sweep: every cycle already on the books closes a lot bought before capture
-            // began, so it can resolve nothing. Bookmark them instead of walking that history
-            // and pairing an ancient PnL with an observation written this minute.
-            try {
-                $newest = $this->db->cycles(1, $this->mode);
-            } catch (Throwable $e) {
-                return;
-            }
-            $this->db->setState('obs_cycle_cursor', $newest === [] ? 0 : (int) $newest[0]['id']);
-            return;
-        }
-        $cursor = (int) $raw;
-        try {
-            // forward from the bookmark, oldest first - the FIFO order of the lots. A page
-            // read backwards from the newest would jump the cursor past a burst larger than
-            // the page and lose those outcomes for good.
-            $fresh = $this->db->cyclesSince($cursor, $this->mode, 200);
-        } catch (Throwable $e) {
-            return;
-        }
-        if ($fresh === []) {
-            return;
-        }
-        $now  = $this->nowIso();
-        $seen = $cursor;
-        foreach ($fresh as $c) {
-            $id   = (int) $c['id'];
-            $seen = max($seen, $id);
-            $obs  = $this->obsEntryForCycle($c);
-            if ($obs === null) {
-                continue;   // no identifiable observation for this buy: resolve nothing
-            }
-            $pnl    = isset($c['pnl_usdt']) && is_numeric($c['pnl_usdt']) ? (float) $c['pnl_usdt'] : 0.0;
-            $cost   = (isset($c['qty']) ? (float) $c['qty'] : 0.0) * (isset($c['buy_price']) ? (float) $c['buy_price'] : 0.0);
-            $closed = isset($c['closed_at']) && (string) $c['closed_at'] !== '' ? (string) $c['closed_at'] : $now;
-            // the hold starts when the lot was bought (cycles.opened_at, the lot's created_at),
-            // not when the observation was written - an engine buy can rest on the book for hours
-            $opened = isset($c['opened_at']) && (string) $c['opened_at'] !== ''
-                ? (string) $c['opened_at'] : (string) $obs['ts'];
-            $this->obsResolveRow((int) $obs['id'], [
-                'outcome'      => self::obsOutcome($pnl),
-                'pnl_usdt'     => $pnl,
-                'pnl_pct'      => $cost > 0.0 ? $pnl / $cost * 100.0 : 0.0,
-                'exit_reason'  => 'cycle_closed',
-                'held_minutes' => max(0.0, Util::isoDiffMinutes($opened, $closed)),
-                'resolved_at'  => $now,
-                'cycle_id'     => (int) $id,
-            ]);
-        }
-        if ($seen > $cursor) {
-            $this->db->setState('obs_cycle_cursor', $seen);
-        }
-    }
-
-    /**
-     * The open `entered` observation that recorded the buy this cycle closed, or null.
-     *
-     * The link is the lot: `cycles.opened_at` is the consumed lot's `created_at`, and the
-     * observation is written by the very tick that booked that fill, so the two stamps agree to
-     * within a tick. Blind FIFO cannot be used - one lot sold in two slices writes two cycles,
-     * and a buy filling in two deltas writes two lots, so the queues drift apart permanently and
-     * every later cycle would staple its PnL to a different buy's conditions. A cycle with no
-     * match (its buy predates capture, or its observation is already resolved) resolves nothing.
-     *
-     * The candidate query is filtered in SQL, so rows that no cycle can ever resolve (inventory
-     * still held) cannot crowd the newest decisions out of a fixed window.
-     */
-    private function obsEntryForCycle(array $c): ?array
-    {
-        $engine = isset($c['engine']) ? (string) $c['engine'] : '';
-        $symbol = isset($c['symbol']) ? (string) $c['symbol'] : '';
-        $opened = isset($c['opened_at']) ? (string) $c['opened_at'] : '';
-        if ($engine === '' || $symbol === '' || $opened === '') {
-            return null;
-        }
-        try {
-            $open = $this->db->observations([
-                'mode'     => $this->mode,
-                'engine'   => $engine,
-                'symbol'   => $symbol,
-                'decision' => 'entered',
-                'resolved' => false,
-                'order'    => 'asc',
-                'limit'    => 200,
-            ]);
-        } catch (Throwable $e) {
-            return null;
-        }
-        $best    = null;
-        $gapBest = null;
-        foreach ($open as $o) {
-            if (($o['position_id'] ?? null) !== null || ($o['cycle_id'] ?? null) !== null) {
-                continue;   // already attached to a position or another cycle
-            }
-            $gap = abs(Util::isoDiffMinutes((string) $o['ts'], $opened));
-            if ($gap > self::OBS_CYCLE_MATCH_MIN) {
-                continue;   // a different buy: never borrow another decision's conditions
-            }
-            if ($gapBest === null || $gap < $gapBest) {
-                $best    = $o;
-                $gapBest = $gap;
-            }
-        }
-        return $best;
     }
 
     /* ================================================================ orders */
@@ -3912,9 +2546,6 @@ final class Bot
                 }
             }
         }
-        if ($this->engineSymbol !== '') {
-            $out[$this->engineSymbol] = true;   // grid/pmm do not use the watchlist
-        }
         // The scalp engine trades the movers board (DESIGN-SCALP.md §3), so its symbols are
         // normally NOT on the watchlist. Without them here the tick would fetch neither their
         // filters nor their price, and an open scalp position would be missing from equity -
@@ -3922,10 +2553,6 @@ final class Bot
         // Added whatever engine is selected: a position does not stop being real because the
         // user switched the selector.
         foreach ($this->scalpKeepSymbols() as $sym) {
-            $out[$sym] = true;
-        }
-        // portfolio mode: symbol info and prices cover the union of every sleeve's symbols
-        foreach ($this->portfolioSymbols() as $sym) {
             $out[$sym] = true;
         }
         return array_keys($out);

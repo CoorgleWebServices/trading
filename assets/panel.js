@@ -405,33 +405,9 @@
     apply();
   }
 
-  /* Settings → Portfolio: the per-sleeve fields follow the portfolio_enabled checkbox. Same
-   * rule as the engine groups - visibility is the `is-hidden` CLASS from panel.css, never an
-   * inline style attribute, and never an inline handler. */
-  function installPortfolioToggle() {
-    var box = document.querySelector('input[type="checkbox"][name="portfolio_enabled"]');
-    var fields = document.querySelectorAll('[data-portfolio-fields]');
-    var i;
-    if (!box || fields.length === 0) {
-      return;
-    }
-    function apply() {
-      for (i = 0; i < fields.length; i++) {
-        if (box.checked) {
-          fields[i].classList.remove('is-hidden');
-        } else {
-          fields[i].classList.add('is-hidden');
-        }
-      }
-    }
-    box.addEventListener('change', apply);
-    apply();
-  }
-
   function init() {
     installConfirms();
     installEngineGroups();
-    installPortfolioToggle();
     startAutoRefresh();
   }
 

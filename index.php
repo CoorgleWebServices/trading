@@ -377,17 +377,8 @@ function handle_action(string $action, array $cfg, Db $db): void
             Panel::redirect('?page=dashboard');
             return;
 
-        case 'cancel_order':
-        case 'cancel_all':
-        case 'reanchor_grid':
-        case 'flatten_inventory':
-            handle_engine_action($action, $cfg, $db);
-            return;
-
-        case 'assign_symbol':
-        case 'pause_sleeve':
-        case 'resume_sleeve':
-            handle_sleeve_action($action, $cfg, $db);
+        case 'cancel_engine_orders':
+            handle_cleanup_action($cfg, $db);
             return;
 
         case 'resume_scalp':
@@ -416,409 +407,6 @@ function handle_action(string $action, array $cfg, Db $db): void
     }
 }
 
-/* ------------------------------------------------------------ engine actions */
-
-/**
- * The four engine actions of DESIGN-ENGINES.md §10, all POST + CSRF (checked globally before
- * routing) and all inside Bot::runLocked so they can never race a cron tick:
- *   cancel_order (one client_id) | cancel_all | reanchor_grid | flatten_inventory (confirm box)
- * Each one redirects back to the dashboard with a flash.
- */
-function handle_engine_action(string $action, array $cfg, Db $db): void
-{
-    if (!class_exists('Bot')) {
-        Panel::flash('danger', 'lib/Bot.php is missing - the engine actions are unavailable.');
-        Panel::redirect('?page=dashboard');
-    }
-    if ($action === 'flatten_inventory' && (!isset($_POST['confirm']) || $_POST['confirm'] !== '1')) {
-        Panel::flash('warn', 'Flatten inventory not executed: tick the confirmation box first.');
-        Panel::redirect('?page=dashboard');
-    }
-    $clientId = '';
-    if ($action === 'cancel_order') {
-        $clientId = isset($_POST['client_id']) && is_string($_POST['client_id']) ? trim($_POST['client_id']) : '';
-        if ($clientId === '' || strlen($clientId) > 64) {
-            Panel::flash('warn', 'Cancel order: no order was named.');
-            Panel::redirect('?page=dashboard');
-        }
-    }
-    set_time_limit(55);
-    try {
-        $fresh = trader_config(true);
-        $res = Bot::runLocked(static function () use ($fresh, $db, $action, $clientId): array {
-            $ex  = Exchange::factory($fresh, $db);
-            $bot = new Bot($fresh, $db, $ex);
-            if ($action === 'cancel_all') {
-                $n = $bot->cancelAllEngineOrders('panel_cancel_all');
-                return ['status' => 'ok', 'summary' => $n . ' resting order(s) cancelled.', 'ms' => 0];
-            }
-            if ($action === 'reanchor_grid') {
-                $bot->reanchorGrid();
-                $anchor = (string) $db->getState('grid_anchor', '');
-                return [
-                    'status'  => $anchor !== '' ? 'ok' : 'error',
-                    'summary' => $anchor !== ''
-                        ? 'Grid re-anchored at ' . Util::money((float) $anchor, 6) . '; the pause was cleared.'
-                        : 'Could not re-anchor: no book price for the engine symbol.',
-                    'ms'      => 0,
-                ];
-            }
-            if ($action === 'flatten_inventory') {
-                $r = $bot->flattenInventory();
-                return [
-                    'status'  => !empty($r['ok']) ? 'ok' : 'error',
-                    'summary' => (string) ($r['message'] ?? '')
-                        . (isset($r['cancelled']) && (int) $r['cancelled'] > 0 ? ' ' . (int) $r['cancelled'] . ' resting order(s) cancelled.' : ''),
-                    'ms'      => 0,
-                ];
-            }
-            // cancel_order: one resting order, resolved through EngineOrders so a fill that
-            // beat the cancel is still booked (lots / cycles) instead of being lost
-            $row = $db->engineOrder($clientId);
-            if ($row === null) {
-                return ['status' => 'error', 'summary' => 'Unknown order ' . $clientId . '.', 'ms' => 0];
-            }
-            $symbol = strtoupper((string) $row['symbol']);
-            // A fill that beat the cancel is booked right here, so it must land under the
-            // engine that OWNS the order (the sleeve key, DESIGN-PORTFOLIO.md §1) and not
-            // under the global cfg['engine'], which is meaningless in portfolio mode.
-            $cfgOrder  = $fresh;
-            $rowEngine = strtolower(trim((string) ($row['engine'] ?? '')));
-            if ($rowEngine !== '') {
-                $cfgOrder['engine'] = $rowEngine;
-            }
-            $ok     = panel_engine_orders($cfgOrder, $db, $ex, $symbol)->cancel($clientId);
-            $after  = $db->engineOrder($clientId);
-            $status = $after !== null ? strtoupper((string) $after['status']) : 'UNKNOWN';
-            return [
-                'status'  => $ok ? 'ok' : 'error',
-                'summary' => $ok
-                    ? 'Order ' . $clientId . ' left the book (' . $status . ').'
-                    : 'Order ' . $clientId . ' could not be cancelled (' . $status . ').',
-                'ms'      => 0,
-            ];
-        });
-        $status = (string) ($res['status'] ?? 'ok');
-        if ($status === 'skipped') {
-            Panel::flash('warn', 'Skipped: a tick is running right now. Try again in a few seconds.');
-        } else {
-            Panel::flash($status === 'ok' ? 'ok' : 'warn', (string) ($res['summary'] ?? ''));
-        }
-    } catch (Throwable $e) {
-        Log::error('panel: engine action ' . $action . ' failed - ' . $e->getMessage());
-        Panel::flash('danger', 'Engine action failed: ' . $e->getMessage());
-    }
-    Panel::redirect('?page=dashboard');
-}
-
-/** EngineOrders bound to $symbol, using the cached symbol info so the panel spends no extra weight. */
-function panel_engine_orders(array $cfg, Db $db, ExchangeInterface $ex, string $symbol): EngineOrders
-{
-    $cached = $db->getStateJson('symbol_info', []);
-    $info   = (is_array($cached) && isset($cached[$symbol]) && is_array($cached[$symbol])) ? $cached[$symbol] : [];
-    if ($info === []) {
-        $fetched = $ex->symbolInfo([$symbol]);
-        $info    = isset($fetched[$symbol]) && is_array($fetched[$symbol]) ? $fetched[$symbol] : [];
-    }
-    $cfg['engine_symbol'] = $symbol;
-    return new EngineOrders($cfg, $db, $ex, $info);
-}
-
-/* --------------------------------------------------------- portfolio actions */
-
-/** The sleeve engines, in canonical order (DESIGN-PORTFOLIO.md §1: the key IS the engine). */
-function panel_sleeve_engines(): array
-{
-    return class_exists('Sleeve') ? Sleeve::ENGINES : ['signal', 'grid', 'pmm'];
-}
-
-/** Engines whose sleeve takes exactly one symbol (DESIGN-PORTFOLIO.md §2). */
-function panel_single_symbol_engines(): array
-{
-    return ['grid', 'pmm'];
-}
-
-/**
- * What a sleeve is still holding, as human sentences ([] when it holds nothing).
- * Database only, so it is right in every mode: open FIFO lots, open/stuck signal positions
- * and resting engine orders on the symbols the sleeve owns - or, when $symbols is given,
- * on exactly that list of symbols (used to probe a symbol before it is handed to a sleeve).
- */
-function panel_sleeve_inventory(array $cfg, Db $db, string $engine, ?array $symbols = null): array
-{
-    $mode  = strtolower(trim((string) ($cfg['mode'] ?? 'paper')));
-    $held  = [];
-    $syms  = $symbols !== null
-        ? $symbols
-        : (class_exists('Sleeve') ? Sleeve::symbols($cfg, $engine) : []);
-    foreach ($syms as $sym) {
-        $sym = strtoupper((string) $sym);
-        try {
-            $qty = 0.0;
-            foreach ($db->openLots($sym, $mode) as $lot) {
-                $qty += isset($lot['remaining']) && is_numeric($lot['remaining']) ? (float) $lot['remaining'] : 0.0;
-            }
-            if ($qty > 0.0) {
-                $held[] = $sym . ': ' . Util::toDecimalString($qty, 8) . ' in open engine lots';
-            }
-        } catch (Throwable $e) {
-            // no lots table on an install that predates the engines
-        }
-        try {
-            $q = $db->pdo()->prepare("SELECT COUNT(*) FROM positions WHERE symbol = ? AND status IN ('OPEN','STUCK') AND mode = ?");
-            $q->execute([$sym, $mode]);
-            $n = (int) $q->fetchColumn();
-            if ($n > 0) {
-                $held[] = $sym . ': ' . $n . ' open position' . ($n === 1 ? '' : 's');
-            }
-        } catch (Throwable $e) {
-            // ignore
-        }
-        try {
-            $open = $db->openEngineOrders($sym, $mode);
-            if ($open !== []) {
-                $held[] = $sym . ': ' . count($open) . ' resting order' . (count($open) === 1 ? '' : 's');
-            }
-        } catch (Throwable $e) {
-            // ignore
-        }
-    }
-    return $held;
-}
-
-/**
- * The mirror of panel_sleeve_inventory(): what $symbol still holds that is booked to an engine
- * OTHER than $engine, as human sentences ([] when there is nothing).
- *
- * Why it matters: a sleeve's budget is an accounting boundary, not an exchange one
- * (DESIGN-PORTFOLIO.md §1). `EngineOrders::bookSell()` consumes FIFO lots filtered by the
- * SELLING engine, so if the "pmm" sleeve is handed a symbol whose open lots are booked to
- * "grid", a pmm sale matches nothing: it writes zero `cycles` rows (the proceeds simply leave
- * the books), while the grid lot's `remaining` never decrements. The sleeve's unrealised then
- * falls permanently and parks it in `Bot::sleeveDrawdownPaused()`. So the symbol is refused at
- * the panel boundary instead - the engines themselves are left exactly as they are.
- *
- * Database only, so it is right in every mode.
- */
-function panel_symbol_foreign_inventory(array $cfg, Db $db, string $symbol, string $engine): array
-{
-    $symbol = strtoupper(trim($symbol));
-    $engine = strtolower(trim($engine));
-    $mode   = strtolower(trim((string) ($cfg['mode'] ?? 'paper')));
-    if ($symbol === '') {
-        return [];
-    }
-    $out = [];
-    try {
-        $qty = 0.0;
-        foreach ($db->openLots($symbol, $mode) as $lot) {
-            $lotEngine = strtolower(trim((string) ($lot['engine'] ?? '')));
-            if ($lotEngine === $engine) {
-                continue;
-            }
-            $qty += isset($lot['remaining']) && is_numeric($lot['remaining']) ? (float) $lot['remaining'] : 0.0;
-        }
-        if ($qty > 0.0) {
-            $out[] = $symbol . ': ' . Util::toDecimalString($qty, 8) . ' in open lots booked to a different engine';
-        }
-    } catch (Throwable $e) {
-        // no lots table on an install that predates the engines
-    }
-    try {
-        $n = 0;
-        foreach ($db->openEngineOrders($symbol, $mode) as $row) {
-            $rowEngine = strtolower(trim((string) ($row['engine'] ?? '')));
-            if ($rowEngine !== $engine) {
-                $n++;
-            }
-        }
-        if ($n > 0) {
-            $out[] = $symbol . ': ' . $n . ' resting order' . ($n === 1 ? '' : 's') . ' of a different engine';
-        }
-    } catch (Throwable $e) {
-        // ignore
-    }
-    return $out;
-}
-
-/**
- * Portfolio actions (DESIGN-PORTFOLIO.md §7), all POST + CSRF (checked globally before routing)
- * and all inside Bot::runLocked so they can never race a cron tick:
- *
- *   assign_symbol  set a scanner row's symbol as a sleeve's symbol. Refused when another sleeve
- *                  already owns it (naming that sleeve) and refused when the target sleeve still
- *                  holds inventory (naming what it holds) - a silent symbol change under a live
- *                  grid would strand that inventory.
- *   pause_sleeve / resume_sleeve   stop or resume ONE sleeve (state `sleeve_paused_<engine>`)
- *                  while the others keep trading.
- */
-function handle_sleeve_action(string $action, array $cfg, Db $db): void
-{
-    if (!class_exists('Sleeve')) {
-        Panel::flash('danger', 'lib/Sleeve.php is missing - the portfolio actions are unavailable.');
-        Panel::redirect('?page=dashboard');
-    }
-    if (!class_exists('Bot')) {
-        Panel::flash('danger', 'lib/Bot.php is missing - the portfolio actions are unavailable.');
-        Panel::redirect('?page=dashboard');
-    }
-    $engine = isset($_POST['engine']) && is_string($_POST['engine']) ? strtolower(trim($_POST['engine'])) : '';
-    if ($engine === '' || strlen($engine) > 32 || Sleeve::of($cfg, $engine) === null) {
-        Panel::flash('warn', 'No such sleeve: "' . $engine . '". Configure it in Settings → Portfolio first.');
-        Panel::redirect('?page=dashboard');
-    }
-
-    if ($action === 'pause_sleeve' || $action === 'resume_sleeve') {
-        $pause = $action === 'pause_sleeve';
-        try {
-            $res = Bot::runLocked(static function () use ($db, $engine, $pause): array {
-                $db->setState('sleeve_paused_' . $engine, $pause ? 'manual' : null);
-                return ['status' => 'ok', 'summary' => '', 'ms' => 0];
-            });
-            if ((string) ($res['status'] ?? '') === 'skipped') {
-                Panel::flash('warn', 'Skipped: a tick is running right now. Try again in a few seconds.');
-            } else {
-                Log::warn('panel: sleeve ' . ($pause ? 'paused' : 'resumed'), ['engine' => $engine]);
-                Panel::flash('ok', $pause
-                    ? 'Sleeve "' . $engine . '" paused: it opens no new exposure. The other sleeves keep trading and its own exits are still managed.'
-                    : 'Sleeve "' . $engine . '" resumed. It opens new exposure again as soon as its budget allows.');
-            }
-        } catch (Throwable $e) {
-            Log::error('panel: sleeve action ' . $action . ' failed - ' . $e->getMessage());
-            Panel::flash('danger', 'Sleeve action failed: ' . $e->getMessage());
-        }
-        Panel::redirect('?page=dashboard');
-    }
-
-    // ---- assign_symbol
-    $symbol = isset($_POST['symbol']) && is_string($_POST['symbol']) ? strtoupper(trim($_POST['symbol'])) : '';
-    if ($symbol === '' || preg_match('/^[A-Z0-9]{2,24}$/', $symbol) !== 1) {
-        Panel::flash('warn', 'Assign: "' . $symbol . '" is not a valid symbol.');
-        Panel::redirect('?page=dashboard');
-    }
-    $quote = strtoupper(trim((string) ($cfg['quote_asset'] ?? 'USDT')));
-    if ($quote !== '' && (strlen($symbol) <= strlen($quote) || substr($symbol, -strlen($quote)) !== $quote)) {
-        Panel::flash('warn', 'Assign: ' . $symbol . ' does not end with the quote asset ' . $quote . '.');
-        Panel::redirect('?page=dashboard');
-    }
-    $owner = Sleeve::ownerOf($cfg, $symbol);
-    if ($owner !== null && $owner !== $engine) {
-        Panel::flash('danger', 'Refused: ' . $symbol . ' is already owned by the "' . $owner . '" sleeve. Two sleeves must never share a symbol '
-            . '- one would sell what the other bought. Remove it from "' . $owner . '" first (Settings → Portfolio).');
-        Panel::redirect('?page=dashboard');
-    }
-    if ($owner === $engine) {
-        Panel::flash('info', $symbol . ' already belongs to the "' . $engine . '" sleeve. Nothing changed.');
-        Panel::redirect('?page=dashboard');
-    }
-    // The incoming symbol must be empty too. A symbol no sleeve owns can still carry a
-    // signal position, open FIFO lots or resting orders (a symbol dropped from a sleeve,
-    // or one held from before portfolio mode). Handing it to a sleeve would let that
-    // sleeve sell base it never bought - the one thing DESIGN-PORTFOLIO.md §1 forbids.
-    $carries = panel_sleeve_inventory($cfg, $db, $engine, array($symbol));
-    if ($carries !== []) {
-        Panel::flash('danger', 'Refused: ' . $symbol . ' still holds inventory that belongs to no sleeve ('
-            . implode('; ', $carries) . '). Giving it to the "' . $engine . '" sleeve would let that sleeve sell base '
-            . 'it never bought, and book the proceeds against the wrong method. Close or flatten it first, then assign '
-            . $symbol . '.');
-        Panel::redirect('?page=dashboard');
-    }
-    $held = panel_sleeve_inventory($cfg, $db, $engine);
-    if ($held !== []) {
-        Panel::flash('danger', 'Refused: the "' . $engine . '" sleeve still holds inventory (' . implode('; ', $held)
-            . '). Changing its symbols now would strand that inventory - flatten it or let it close first, then assign ' . $symbol . '.');
-        Panel::redirect('?page=dashboard');
-    }
-    // Belt and braces on the same rule from the other side: whatever the check above lets
-    // through must also carry no inventory booked to ANOTHER engine. EngineOrders::bookSell()
-    // consumes lots filtered by the selling engine, so a sale of foreign inventory writes no
-    // cycles row at all - the proceeds leave the books and the sleeve drifts to a permanent
-    // unrealised loss that parks it in the drawdown pause.
-    $foreign = panel_symbol_foreign_inventory($cfg, $db, $symbol, $engine);
-    if ($foreign !== []) {
-        Panel::flash('danger', 'Refused: ' . implode('; ', $foreign) . '. The "' . $engine . '" sleeve would be charged '
-            . 'for that inventory but could never sell it out of the books - flatten it under the engine that bought it first.');
-        Panel::redirect('?page=dashboard');
-    }
-
-    $single  = in_array($engine, panel_single_symbol_engines(), true);
-    $current = Sleeve::symbols($cfg, $engine);
-    $wanted  = $single ? [$symbol] : array_values(array_unique(array_merge($current, [$symbol])));
-
-    set_time_limit(55);
-    try {
-        $res = Bot::runLocked(static function () use ($db, $engine, $symbol, $wanted, $single, $current): array {
-            $fresh = trader_config(true);
-            // re-check under the lock: the config may have changed since the page was rendered
-            $owner2 = Sleeve::ownerOf($fresh, $symbol);
-            if ($owner2 !== null && $owner2 !== $engine) {
-                return ['status' => 'error', 'summary' => 'Refused: ' . $symbol . ' is now owned by the "' . $owner2 . '" sleeve.', 'ms' => 0];
-            }
-            // and re-check the inventory here: the pre-lock read at request time is only a fast
-            // rejection - a tick that filled between it and this lock would otherwise be stranded.
-            $carries2 = panel_sleeve_inventory($fresh, $db, $engine, array($symbol));
-            if ($carries2 !== []) {
-                return ['status' => 'error', 'summary' => 'Refused: ' . $symbol . ' now holds inventory that belongs to no sleeve ('
-                    . implode('; ', $carries2) . '). Close or flatten it first.', 'ms' => 0];
-            }
-            $held2 = panel_sleeve_inventory($fresh, $db, $engine);
-            if ($held2 !== []) {
-                return ['status' => 'error', 'summary' => 'Refused: the "' . $engine . '" sleeve still holds inventory ('
-                    . implode('; ', $held2) . '). Changing its symbols now would strand that inventory - flatten it or let it close first.', 'ms' => 0];
-            }
-            $sleeves = isset($fresh['sleeves']) && is_array($fresh['sleeves']) ? $fresh['sleeves'] : [];
-            $key = null;
-            foreach ($sleeves as $k => $unused) {
-                if (strtolower(trim((string) $k)) === $engine) {
-                    $key = $k;
-                    break;
-                }
-            }
-            if ($key === null) {
-                $key = $engine;
-                $sleeves[$key] = ['enabled' => false, 'budget_usdt' => 0.0, 'symbols' => []];
-            }
-            if (!is_array($sleeves[$key])) {
-                $sleeves[$key] = ['enabled' => false, 'budget_usdt' => 0.0, 'symbols' => []];
-            }
-            $sleeves[$key]['symbols'] = $wanted;
-
-            $validated = Risk::validateConfig(['sleeves' => $sleeves], $fresh);
-            $newCfg    = isset($validated[0]) && is_array($validated[0]) ? $validated[0] : $fresh;
-            $errors    = isset($validated[1]) && is_array($validated[1]) ? $validated[1] : [];
-            if ($errors !== []) {
-                return ['status' => 'error', 'summary' => 'Refused by the config validator: ' . implode(' ', array_map('strval', $errors)), 'ms' => 0];
-            }
-            // If validateConfig does not parse sleeves it hands them back unchanged; apply then.
-            $before = isset($fresh['sleeves']) && is_array($fresh['sleeves']) ? $fresh['sleeves'] : [];
-            $after  = isset($newCfg['sleeves']) && is_array($newCfg['sleeves']) ? $newCfg['sleeves'] : [];
-            if ($after == $before) {
-                $newCfg['sleeves'] = $sleeves;
-            }
-            trader_save_config($newCfg);
-            Log::warn('panel: sleeve symbol assigned', ['engine' => $engine, 'symbol' => $symbol,
-                'from' => $current, 'to' => $wanted]);
-            return [
-                'status'  => 'ok',
-                'summary' => $single
-                    ? $symbol . ' is now the only symbol of the "' . $engine . '" sleeve (it trades exactly one).'
-                    : $symbol . ' was added to the "' . $engine . '" sleeve (' . implode(', ', $wanted) . ').',
-                'ms'      => 0,
-            ];
-        });
-        $status = (string) ($res['status'] ?? 'ok');
-        if ($status === 'skipped') {
-            Panel::flash('warn', 'Skipped: a tick is running right now. Try again in a few seconds.');
-        } else {
-            Panel::flash($status === 'ok' ? 'ok' : 'danger', (string) ($res['summary'] ?? ''));
-        }
-    } catch (Throwable $e) {
-        Log::error('panel: assign_symbol failed - ' . $e->getMessage());
-        Panel::flash('danger', 'Assign failed: ' . $e->getMessage());
-    }
-    Panel::redirect('?page=dashboard');
-}
-
 /* ---------------------------------------------------------- learning actions */
 
 /**
@@ -829,10 +417,47 @@ function handle_sleeve_action(string $action, array $cfg, Db $db): void
  * Deliberately NOT wrapped in Bot::runLocked(): Learn's entire write surface is the
  * two state keys learn_weights / learn_at (plus the learn_log it prints here). It
  * places no order, touches no position and cannot reach size, take-profit,
- * stop-loss, a sleeve budget or any kill switch, so it can never race a tick into
+ * stop-loss or any kill switch, so it can never race a tick into
  * anything dangerous - and holding the tick lock for a statistics pass would only
  * cost the operator a minute of trading.
  */
+/**
+ * "Cancel leftover engine orders" - the one piece of the removed grid and pmm engines that had
+ * to stay reachable.
+ *
+ * Those engines rested LIMIT orders on Binance. An order resting on the exchange does not care
+ * that the code which placed it is gone, so removing the engines without this would have left
+ * any last ladder sitting on the book indefinitely, holding real balance, with nothing in the
+ * panel able to take it off. POST + CSRF (checked globally before routing) and inside
+ * Bot::runLocked so it cannot race a tick.
+ */
+function handle_cleanup_action(array $cfg, Db $db): void
+{
+    if (!class_exists('Bot')) {
+        Panel::flash('danger', 'lib/Bot.php is missing - the cleanup action is unavailable.');
+        Panel::redirect('?page=dashboard');
+    }
+    try {
+        $res = Bot::runLocked(static function () use ($cfg, $db): array {
+            $ex  = Exchange::factory($cfg, $db);
+            $bot = new Bot($cfg, $db, $ex);
+            return ['status' => 'ok', 'summary' => (string) $bot->cancelAllEngineOrders('manual_cleanup'), 'ms' => 0];
+        });
+        if ((string) ($res['status'] ?? '') === 'skipped') {
+            Panel::flash('warn', 'A tick is running right now - try again in a few seconds.');
+        } else {
+            $n = (int) ($res['summary'] ?? 0);
+            Panel::flash($n > 0 ? 'ok' : 'info', $n > 0
+                ? $n . ' leftover order(s) were cancelled. Any coins they already bought stay in the '
+                    . 'wallet - sell those by hand, or the kill switch will halt on untracked_position.'
+                : 'No leftover engine orders were found; there is nothing resting on the book.');
+        }
+    } catch (Throwable $e) {
+        Panel::flash('danger', 'Cleanup failed: ' . $e->getMessage());
+    }
+    Panel::redirect('?page=dashboard');
+}
+
 /**
  * "Resume scalping" (DESIGN-SCALP.md §5) - POST + CSRF (checked globally before routing) and
  * inside Bot::runLocked so it can never race a cron tick that is mid-loop.
@@ -1045,15 +670,8 @@ function settings_keys(): array
         'trailing_activate_pct', 'trailing_distance_pct', 'trailing_floor_pct', 'max_hold_minutes', 'entry_threshold', 'adaptive',
         'candle_interval', 'trend_interval', 'atr_min_pct', 'atr_max_pct', 'atr1h_min_pct', 'atr1h_max_pct', 'max_spread_pct',
         'fee_pct', 'paper_start_usdt', 'recv_window', 'timezone',
-        // engines (DESIGN-ENGINES.md §2)
-        'engine', 'allow_live_engines', 'engine_symbol', 'engine_max_orders', 'post_only',
-        'grid_levels', 'grid_spacing_pct', 'grid_order_usdt', 'grid_range_up_pct', 'grid_range_down_pct', 'grid_exit_liquidates',
-        'pmm_spread_pct', 'pmm_order_usdt', 'pmm_refresh_sec', 'pmm_target_base_pct', 'pmm_max_base_pct',
-        // portfolio + scanner (DESIGN-PORTFOLIO.md §2); the per-sleeve fields are nested and are
-        // collected separately by settings_sleeve_input()
-        'portfolio_enabled', 'sleeve_reserve_pct', 'sleeve_max_drawdown_pct',
-        'scanner_enabled', 'scanner_refresh_min', 'scanner_min_quote_vol', 'scanner_max_spread_pct',
-        'scanner_min_atr_pct', 'scanner_max_atr_pct', 'scanner_top_n', 'scanner_exclude',
+        // engine selection
+        'engine', 'allow_live_engines',
         // scalp engine (DESIGN-SCALP.md §6)
         'scalp_universe_size', 'scalp_order_usdt', 'scalp_budget_per_symbol', 'scalp_budgets',
         'scalp_max_open', 'scalp_tp_pct', 'scalp_sl_pct', 'scalp_max_hold_sec', 'scalp_dip_pct',
@@ -1068,61 +686,14 @@ function settings_keys(): array
 /** Settings keys rendered as checkboxes: absent from the POST means "off", never "unchanged". */
 function settings_checkbox_keys(): array
 {
-    return ['enabled', 'adaptive', 'allow_live_engines', 'grid_exit_liquidates', 'post_only',
-        'portfolio_enabled', 'scanner_enabled', 'learning_enabled', 'learning_apply'];
-}
-
-/**
- * DESIGN-PORTFOLIO.md §2 defaults. Used only to render the form (and to sanitise a value the
- * config validator does not know yet) on an install whose config.php predates portfolio mode -
- * exactly like panel_engine_defaults() does for the engines.
- */
-function panel_portfolio_defaults(): array
-{
-    return [
-        'portfolio_enabled'       => false,
-        'sleeve_reserve_pct'      => 5.0,
-        'sleeve_max_drawdown_pct' => 25.0,
-        'scanner_enabled'         => true,
-        'scanner_refresh_min'     => 60,
-        'scanner_min_quote_vol'   => 5000000.0,
-        'scanner_max_spread_pct'  => 0.06,
-        'scanner_min_atr_pct'     => 0.5,
-        'scanner_max_atr_pct'     => 4.0,
-        'scanner_top_n'           => 10,
-        'scanner_exclude'         => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT'],
-        'scalp_universe_size'     => 20,
-        'scalp_order_usdt'        => 50.0,
-        'scalp_budget_per_symbol' => 100.0,
-        'scalp_budgets'           => [],
-        'scalp_max_open'          => 6,
-        'scalp_tp_pct'            => 0.25,
-        'scalp_sl_pct'            => 0.20,
-        'scalp_max_hold_sec'      => 120,
-        'scalp_dip_pct'           => 0.15,
-        'scalp_window'            => 8,
-        'scalp_poll_sec'          => 3,
-        'scalp_run_seconds'       => 50,
-        'scalp_max_consecutive_losses' => 5,
-        'scalp_max_trades_per_hour'    => 60,
-        'scalp_min_quote_vol'     => 20000000.0,
-        'scalp_min_trade_count'   => 50000,
-        'scalp_max_spread_pct'    => 0.05,
-        'scalp_universe_refresh_min'   => 10,
-        'scalp_exclude'           => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT', 'USDPUSDT'],
-        'sleeves'                 => [
-            'signal' => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['SOLUSDT', 'ETHUSDT']],
-            'grid'   => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['DOGEUSDT']],
-            'pmm'    => ['enabled' => false, 'budget_usdt' => 1000.0, 'symbols' => ['XRPUSDT']],
-        ],
-    ];
+    return ['enabled', 'adaptive', 'allow_live_engines', 'learning_enabled', 'learning_apply'];
 }
 
 /**
  * DESIGN-LEARNING.md §5 defaults plus the §7 `bnb_min_balance`. Used only to render the form
  * (and to sanitise a value the config validator does not know yet) on an install whose
  * config.php predates learning - exactly like panel_engine_defaults() and
- * panel_portfolio_defaults() do for their sections. Panel::learnDefaults() is the single
+ * does for its section. Panel::learnDefaults() is the single
  * source, so the form and the panel's own reading of the keys can never drift apart.
  */
 function panel_learning_defaults(): array
@@ -1136,7 +707,7 @@ function panel_learning_defaults(): array
  * learning), so a validator that does know the key always wins, clamps included.
  *
  * Note what is NOT here: nothing in this function can reach position size, take-profit,
- * stop-loss, a sleeve budget or a kill switch. The learning settings are five numbers and
+ * stop-loss or a kill switch. The learning settings are five numbers and
  * two flags, and the bounds below are the ones DESIGN-LEARNING.md §5 documents.
  */
 function settings_learning_fallback(array $in, array $cfg, array $newCfg): array
@@ -1174,207 +745,13 @@ function settings_learning_fallback(array $in, array $cfg, array $newCfg): array
     return $newCfg;
 }
 
-/**
- * The per-sleeve form fields as the nested `sleeves` map of §2, or null when the posted form
- * carried no sleeve field at all (an old cached form must never wipe the sleeves).
- */
-function settings_sleeve_input()
-{
-    $seen = false;
-    $out  = [];
-    foreach (panel_sleeve_engines() as $engine) {
-        $bKey = 'sleeve_' . $engine . '_budget_usdt';
-        $sKey = 'sleeve_' . $engine . '_symbols';
-        $eKey = 'sleeve_' . $engine . '_enabled';
-        if (isset($_POST[$bKey]) || isset($_POST[$sKey]) || isset($_POST[$eKey]) || isset($_POST['portfolio_form'])) {
-            $seen = true;
-        }
-        $budget = isset($_POST[$bKey]) && is_string($_POST[$bKey]) ? trim($_POST[$bKey]) : '';
-        $syms   = isset($_POST[$sKey]) && is_string($_POST[$sKey]) ? trim($_POST[$sKey]) : '';
-        $list   = [];
-        foreach (preg_split('/[\s,;]+/', $syms) as $sym) {
-            $sym = strtoupper(trim((string) $sym));
-            if ($sym !== '' && !in_array($sym, $list, true)) {
-                $list[] = $sym;
-            }
-        }
-        $out[$engine] = [
-            'enabled'     => isset($_POST[$eKey]),
-            'budget_usdt' => is_numeric($budget) ? (float) $budget : 0.0,
-            'symbols'     => $list,
-        ];
-    }
-    return $seen ? $out : null;
-}
-
 /** A finite float from a posted string, or $d. */
 function panel_num($v, float $d): float
 {
     return (is_numeric($v) && is_finite((float) $v)) ? (float) $v : $d;
 }
 
-/**
- * Last-resort sanitiser for the §2 keys: applied ONLY to a key that Risk::validateConfig()
- * did not return at all (an install whose lib/Risk.php predates portfolio mode), so a
- * validator that does know the key always wins, clamps included.
- */
-function settings_portfolio_fallback(array $in, array $cfg, array $newCfg): array
-{
-    $d = panel_portfolio_defaults();
-    foreach ($d as $key => $def) {
-        if ($key === 'sleeves' || array_key_exists($key, $newCfg)) {
-            continue;
-        }
-        if (!array_key_exists($key, $in)) {
-            $newCfg[$key] = array_key_exists($key, $cfg) ? $cfg[$key] : $def;
-            continue;
-        }
-        $raw = $in[$key];
-        switch ($key) {
-            case 'portfolio_enabled':
-            case 'scanner_enabled':
-                $newCfg[$key] = (string) $raw === '1';
-                break;
-            case 'sleeve_reserve_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 5.0), 0.0, 90.0);
-                break;
-            case 'sleeve_max_drawdown_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 25.0), 1.0, 100.0);
-                break;
-            case 'scanner_refresh_min':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 60.0), 1.0, 1440.0);
-                break;
-            case 'scanner_min_quote_vol':
-                $newCfg[$key] = max(0.0, panel_num($raw, 5000000.0));
-                break;
-            case 'scanner_max_spread_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 0.06), 0.001, 10.0);
-                break;
-            case 'scanner_min_atr_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 0.5), 0.0, 50.0);
-                break;
-            case 'scanner_max_atr_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 4.0), 0.01, 100.0);
-                break;
-            case 'scanner_top_n':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 10.0), 1.0, 100.0);
-                break;
-            case 'scanner_exclude':
-            case 'scalp_exclude':
-                $list = [];
-                foreach (preg_split('/[\s,;]+/', (string) $raw) as $sym) {
-                    $sym = strtoupper(trim((string) $sym));
-                    if ($sym !== '' && !in_array($sym, $list, true)) {
-                        $list[] = $sym;
-                    }
-                }
-                $newCfg[$key] = $list;
-                break;
-
-            // ---- scalp engine (DESIGN-SCALP.md §6). The bounds here match
-            //      Risk::validateConfig()'s, which has the last word; clamping first just means
-            //      a slipped decimal point comes back as a clamped value and a warning rather
-            //      than as an error that throws the whole form away.
-            case 'scalp_universe_size':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 20.0), 1.0, 30.0);
-                break;
-            case 'scalp_order_usdt':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 6.0), 1.0, 10000.0);
-                break;
-            case 'scalp_budget_per_symbol':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 100.0), 0.0, 1000000.0);
-                break;
-            case 'scalp_budgets':
-                // The form posts JSON. It is passed straight through so Risk::validateConfig()
-                // can REPORT an unparseable value: quietly replacing it with an empty map would
-                // put every symbol back on the default budget without saying so.
-                $newCfg[$key] = $raw;
-                break;
-            case 'scalp_max_open':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 6.0), 1.0, 30.0);
-                break;
-            case 'scalp_tp_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 0.25), 0.01, 20.0);
-                break;
-            case 'scalp_sl_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 0.20), 0.01, 20.0);
-                break;
-            case 'scalp_max_hold_sec':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 120.0), 1.0, 86400.0);
-                break;
-            case 'scalp_dip_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 0.15), 0.0, 20.0);
-                break;
-            case 'scalp_window':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 20.0), 3.0, 200.0);
-                break;
-            case 'scalp_poll_sec':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 3.0), 1.0, 30.0);
-                break;
-            case 'scalp_run_seconds':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 50.0), 1.0, 55.0);
-                break;
-            case 'scalp_max_consecutive_losses':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 5.0), 2.0, 20.0);
-                break;
-            case 'scalp_max_trades_per_hour':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 60.0), 1.0, 100000.0);
-                break;
-            case 'scalp_min_quote_vol':
-                $newCfg[$key] = max(0.0, panel_num($raw, 20000000.0));
-                break;
-            case 'scalp_min_trade_count':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 50000.0), 0.0, 1000000000.0);
-                break;
-            case 'scalp_max_spread_pct':
-                $newCfg[$key] = Util::clamp(panel_num($raw, 0.05), 0.001, 5.0);
-                break;
-            case 'scalp_universe_refresh_min':
-                $newCfg[$key] = (int) Util::clamp(panel_num($raw, 10.0), 1.0, 1440.0);
-                break;
-
-            default:
-                break;
-        }
-    }
-    return $newCfg;
-}
-
-/**
- * Validation errors of §2 grouped by the sleeve they name, so the settings form can print them
- * against the offending sleeve instead of only in the list at the top. An error that names two
- * sleeves (the overlap rule reports both) is shown against both; one that talks about the
- * portfolio without naming a sleeve lands in the '' bucket.
- */
-function settings_sleeve_errors(array $errors): array
-{
-    $out = ['' => []];
-    foreach (panel_sleeve_engines() as $engine) {
-        $out[$engine] = [];
-    }
-    foreach ($errors as $err) {
-        $msg = (string) $err;
-        $low = strtolower($msg);
-        // every §2 sleeve rule names the sleeve ("sleeve grid: …", "X is in the grid sleeve and
-        // in the pmm sleeve"), so this never claims an unrelated engine error
-        if (strpos($low, 'sleeve') === false && strpos($low, 'portfolio') === false) {
-            continue;
-        }
-        $hit = false;
-        foreach (panel_sleeve_engines() as $engine) {
-            if (preg_match('/\b' . preg_quote($engine, '/') . '\b/', $low) === 1) {
-                $out[$engine][] = $msg;
-                $hit = true;
-            }
-        }
-        if (!$hit) {
-            $out[''][] = $msg;
-        }
-    }
-    return $out;
-}
-
-/** Inline error list for one sleeve (or the portfolio section); '' when there is nothing to say. */
+/** Inline error list for one settings section; '' when there is nothing to say. */
 function panel_inline_errors(array $msgs): string
 {
     if ($msgs === []) {
@@ -1385,121 +762,6 @@ function panel_inline_errors(array $msgs): string
         $h .= '<li>' . Panel::e((string) $m) . '</li>';
     }
     return $h . '</ul></div>';
-}
-
-/**
- * Settings → Portfolio (DESIGN-PORTFOLIO.md §7): portfolio_enabled, per sleeve enabled / budget /
- * symbols with the §2 validation errors inline, and the scanner thresholds. Visibility of the
- * sleeve fields is the `is-hidden` CLASS toggled by assets/panel.js - the CSP forbids inline
- * styles and inline scripts alike.
- */
-function page_settings_portfolio(array $v, array $errors): string
-{
-    $byS = settings_sleeve_errors($errors);
-    $on  = !empty($v['portfolio_enabled']);
-    $sleeves = isset($v['sleeves']) && is_array($v['sleeves']) ? $v['sleeves'] : [];
-
-    $h  = '<fieldset><legend>Portfolio</legend>';
-    $h .= '<input type="hidden" name="portfolio_form" value="1">';
-    $h .= panel_inline_errors($byS['']);
-    $h .= '<p class="muted small">Portfolio mode runs the three methods <strong>at the same time</strong>, each with its own slice of '
-        . 'capital and its own symbols. A sleeve budget is an <strong>accounting</strong> boundary, not an exchange one: Binance holds a '
-        . 'single balance and the bot enforces the split itself. Two sleeves must therefore never share a symbol - one would sell the '
-        . 'inventory the other bought - and the validator rejects any overlap outright. With portfolio mode off, everything behaves '
-        . 'exactly as the single-engine panel above.</p>';
-    $h .= panel_check('portfolio_enabled', $v, 'Run the sleeves in parallel (portfolio mode).',
-        '<span class="muted">Off = the single Engine selected above, unchanged.</span>');
-    $h .= '<div class="grid3">';
-    $h .= panel_input('sleeve_reserve_pct', $v, 'Reserve %', 'number', 'percent of the total quote balance never allocated to a sleeve');
-    $h .= panel_input('sleeve_max_drawdown_pct', $v, 'Sleeve max drawdown %', 'number', 'a sleeve under budget x (1 - this) stops opening; the others keep trading');
-    $h .= '</div>';
-
-    $h .= '<div class="portfolio-sleeves' . ($on ? '' : ' is-hidden') . '" data-portfolio-fields>';
-    foreach (panel_sleeve_engines() as $engine) {
-        $cur    = isset($sleeves[$engine]) && is_array($sleeves[$engine]) ? $sleeves[$engine] : [];
-        $sv     = [
-            'sleeve_' . $engine . '_enabled'     => !empty($cur['enabled']),
-            'sleeve_' . $engine . '_budget_usdt' => isset($cur['budget_usdt']) ? $cur['budget_usdt'] : 0.0,
-            'sleeve_' . $engine . '_symbols'     => isset($cur['symbols']) && is_array($cur['symbols']) ? implode(', ', $cur['symbols']) : (string) ($cur['symbols'] ?? ''),
-        ];
-        $single = in_array($engine, panel_single_symbol_engines(), true);
-        $h .= '<div class="sleeve-group" data-sleeve="' . Panel::e($engine) . '">';
-        $h .= '<h3>' . Panel::e($engine) . ' sleeve</h3>';
-        $h .= panel_inline_errors($byS[$engine]);
-        $h .= panel_check('sleeve_' . $engine . '_enabled', $sv, 'Enabled');
-        $h .= '<div class="grid2">';
-        $h .= panel_input('sleeve_' . $engine . '_budget_usdt', $sv, 'Budget (quote)', 'number',
-            'must cover about 20 minimum-size orders of its symbols');
-        $h .= panel_input('sleeve_' . $engine . '_symbols', $sv, 'Symbols', 'text',
-            $single ? 'exactly one symbol - this engine is single-symbol' : 'comma separated, exclusive to this sleeve');
-        $h .= '</div></div>';
-    }
-    $h .= '</div>';
-
-    $h .= '<h3>Scanner</h3>';
-    $h .= '<p class="muted small">The scanner ranks quote-asset pairs by <em>tradeable</em> volatility: ATR discounted by liquidity and '
-        . 'spread, so an illiquid or wide-spread coin scores near zero. It costs weight 80 per refresh, which is why it runs hourly and '
-        . 'never per tick. It <strong>never</strong> reassigns a sleeve\'s symbols on its own - it ranks and explains, and you apply a '
-        . 'suggestion with the "Assign to…" control on the dashboard.</p>';
-    $h .= panel_check('scanner_enabled', $v, 'Run the volatility scanner.');
-    $h .= '<div class="grid3">';
-    $h .= panel_input('scanner_refresh_min', $v, 'Refresh (minutes)', 'number', 'weight 80 per refresh', '1');
-    $h .= panel_input('scanner_min_quote_vol', $v, 'Min 24 h quote volume', 'number', 'the liquidity floor, in the quote asset');
-    $h .= panel_input('scanner_max_spread_pct', $v, 'Max spread %', 'number', '(ask - bid) / mid');
-    $h .= panel_input('scanner_min_atr_pct', $v, 'Min ATR14 % (15m)', 'number', 'below this the pair does not move enough to trade');
-    $h .= panel_input('scanner_max_atr_pct', $v, 'Max ATR14 % (15m)', 'number', 'above this is untradeable noise, not opportunity');
-    $h .= panel_input('scanner_top_n', $v, 'Rows shown', 'number', 'how many ranked rows the dashboard lists', '1');
-    $h .= '</div>';
-    $exclude = isset($v['scanner_exclude']) && is_array($v['scanner_exclude']) ? implode(', ', $v['scanner_exclude']) : (string) ($v['scanner_exclude'] ?? '');
-    $h .= '<label>Never rank these pairs<span class="muted help">stablecoin pairs and anything else that should never be suggested</span>'
-        . '<textarea name="scanner_exclude" rows="2" spellcheck="false">' . Panel::e($exclude) . '</textarea></label>';
-    $h .= '</fieldset>';
-    return $h;
-}
-
-/**
- * Symbols whose resting engine orders no tick will ever reconcile again after this save.
- * Only an ENABLED sleeve is run by `Bot::runPortfolioTick()`, and `EngineOrders::sync()` is
- * reached only from there, so a sleeve that was just disabled, emptied or pointed at another
- * symbol would leave its ladder resting on the book: it keeps filling into base that no `lots`
- * row records, that no sleeve values and that the kill switch cannot flatten.
- *
- * @return array list of symbols, upper case
- */
-function settings_stranded_symbols(array $newCfg, Db $db): array
-{
-    $keep = [];
-    if (!empty($newCfg['portfolio_enabled']) && class_exists('Sleeve')) {
-        foreach (Sleeve::all($newCfg) as $sleeve) {
-            if (empty($sleeve['enabled'])) {
-                continue;
-            }
-            foreach ($sleeve['symbols'] as $sym) {
-                $keep[strtoupper(trim((string) $sym))] = true;
-            }
-        }
-    } else {
-        // single-engine mode manages exactly one symbol, and only for grid/pmm
-        $sym = strtoupper(trim((string) ($newCfg['engine_symbol'] ?? '')));
-        if ($sym !== '' && strtolower(trim((string) ($newCfg['engine'] ?? 'signal'))) !== 'signal') {
-            $keep[$sym] = true;
-        }
-    }
-    $mode = strtolower(trim((string) ($newCfg['mode'] ?? 'paper')));
-    $out  = [];
-    try {
-        $rows = $db->engineOrders(Db::ENGINE_LIVE_STATUSES, $mode);
-    } catch (Throwable $e) {
-        return [];   // no engine_orders table on an install that predates the engines
-    }
-    foreach ($rows as $row) {
-        $sym = strtoupper(trim((string) ($row['symbol'] ?? '')));
-        if ($sym === '' || isset($keep[$sym]) || in_array($sym, $out, true)) {
-            continue;
-        }
-        $out[] = $sym;
-    }
-    return $out;
 }
 
 function handle_settings(string $action, array $cfg, Db $db): void
@@ -1515,66 +777,13 @@ function handle_settings(string $action, array $cfg, Db $db): void
             $in[$key] = trim($_POST[$key]);
         }
     }
-    // the per-sleeve fields (DESIGN-PORTFOLIO.md §2) are nested under `sleeves`; they are also
-    // passed flat so a validator that reads either shape sees them
-    $sleeveIn = settings_sleeve_input();
-    if ($sleeveIn !== null) {
-        $in['sleeves'] = $sleeveIn;
-        foreach ($sleeveIn as $sleeveEngine => $sleeveVals) {
-            $in['sleeve_' . $sleeveEngine . '_enabled']     = $sleeveVals['enabled'] ? '1' : '0';
-            $in['sleeve_' . $sleeveEngine . '_budget_usdt'] = $sleeveVals['budget_usdt'];
-            $in['sleeve_' . $sleeveEngine . '_symbols']     = implode(', ', $sleeveVals['symbols']);
-        }
-    }
     // the secret is write-only: blank keeps the stored one (validateConfig skips blanks)
     $validated = Risk::validateConfig($in, $cfg);
     $newCfg    = $validated[0];
     $errors    = isset($validated[1]) && is_array($validated[1]) ? $validated[1] : [];
     $warnings  = isset($validated[2]) && is_array($validated[2]) ? $validated[2] : [];
     // only for keys the validator does not know at all (older lib/Risk.php)
-    $newCfg    = settings_portfolio_fallback($in, $cfg, $newCfg);
     $newCfg    = settings_learning_fallback($in, $cfg, $newCfg);
-    if ($sleeveIn !== null) {
-        $sleeveBefore = isset($cfg['sleeves']) && is_array($cfg['sleeves']) ? $cfg['sleeves'] : [];
-        $sleeveAfter  = isset($newCfg['sleeves']) && is_array($newCfg['sleeves']) ? $newCfg['sleeves'] : [];
-        if ($sleeveAfter == $sleeveBefore && $sleeveIn != $sleeveBefore) {
-            $newCfg['sleeves'] = $sleeveIn;
-        }
-    }
-    // A symbol may only move INTO a sleeve while it is empty of foreign inventory. The
-    // dashboard "Assign to..." action refuses that already; this is the same rule on the
-    // Settings form, which would otherwise be the way around it. Only symbols being ADDED are
-    // checked, so an unchanged save, a budget edit, disabling a sleeve or removing a symbol are
-    // never blocked. The "sleeve <engine>" prefix is what settings_sleeve_errors() keys on to
-    // render the message inline against the offending sleeve.
-    if ($sleeveIn !== null) {
-        $sleevesNow = isset($cfg['sleeves']) && is_array($cfg['sleeves']) ? $cfg['sleeves'] : [];
-        foreach ($sleeveIn as $sleeveEngine => $sleeveVals) {
-            $had = [];
-            foreach ($sleevesNow as $k => $v) {
-                if (strtolower(trim((string) $k)) !== strtolower(trim((string) $sleeveEngine))) {
-                    continue;
-                }
-                $syms = (is_array($v) && isset($v['symbols']) && is_array($v['symbols'])) ? $v['symbols'] : [];
-                foreach ($syms as $s) {
-                    $had[] = strtoupper(trim((string) $s));
-                }
-            }
-            $posted = (is_array($sleeveVals) && isset($sleeveVals['symbols']) && is_array($sleeveVals['symbols']))
-                ? $sleeveVals['symbols'] : [];
-            foreach ($posted as $sym) {
-                $sym = strtoupper(trim((string) $sym));
-                if ($sym === '' || in_array($sym, $had, true)) {
-                    continue;   // unchanged symbol: never blocked
-                }
-                foreach (panel_symbol_foreign_inventory($cfg, $db, $sym, (string) $sleeveEngine) as $line) {
-                    $errors[] = 'sleeve ' . $sleeveEngine . ': ' . $line
-                        . ' - flatten it under the engine that bought it before moving it here.';
-                }
-            }
-        }
-    }
-
     $newMode   = (string) ($newCfg['mode'] ?? 'paper');
 
     if ($action === 'test_api') {
@@ -1613,9 +822,6 @@ function handle_settings(string $action, array $cfg, Db $db): void
             if (($cfg[$key] ?? null) != ($newCfg[$key] ?? null)) {
                 $changed[] = $key;
             }
-        }
-        if (($cfg['sleeves'] ?? null) != ($newCfg['sleeves'] ?? null)) {
-            $changed[] = 'sleeves';
         }
         Log::info('panel: settings saved', ['changed' => $changed, 'mode' => $newMode]);
         if ((string) ($cfg['mode'] ?? '') !== $newMode) {
@@ -1665,40 +871,6 @@ function handle_settings(string $action, array $cfg, Db $db): void
             } catch (Throwable $e) {
                 Log::error('panel: cancelling the previous engine orders failed - ' . $e->getMessage());
                 Panel::flash('warn', 'The previous engine\'s resting orders could not be cancelled: ' . $e->getMessage());
-            }
-        }
-
-        // The same hazard for the sleeves (DESIGN-PORTFOLIO.md §6): a grid/pmm sleeve that was
-        // just disabled, emptied or pointed at another symbol is no longer run by the tick, so
-        // nothing calls EngineOrders::sync() for it and its ladder rests on the book forever.
-        // Take those symbols off the book here, exactly as for the single engine above.
-        $sleevesChanged = (($cfg['sleeves'] ?? null) != ($newCfg['sleeves'] ?? null))
-            || (!empty($cfg['portfolio_enabled']) !== !empty($newCfg['portfolio_enabled']));
-        $stranded = ($sleevesChanged && class_exists('Bot')) ? settings_stranded_symbols($newCfg, $db) : [];
-        if ($stranded !== []) {
-            try {
-                $res = Bot::runLocked(static function () use ($newCfg, $db, $stranded): array {
-                    $ex = Exchange::factory($newCfg, $db);
-                    $n  = 0;
-                    foreach ($stranded as $sym) {
-                        $n += (int) panel_engine_orders($newCfg, $db, $ex, $sym)->cancelAll($sym, 'sleeve_changed');
-                    }
-                    return ['status' => 'ok', 'summary' => (string) $n, 'ms' => 0];
-                });
-                if ((string) ($res['status'] ?? '') === 'skipped') {
-                    Panel::flash('warn', 'A tick was running, so the resting orders on ' . implode(', ', $stranded)
-                        . ' were left on the book and no sleeve syncs them now: press "Cancel all orders" on the dashboard.');
-                } else {
-                    $n = (int) ($res['summary'] ?? 0);
-                    if ($n > 0) {
-                        Panel::flash('warn', $n . ' resting order(s) on ' . implode(', ', $stranded) . ' were cancelled: no enabled '
-                            . 'sleeve owns those symbols any more. Inventory they still hold stays in the wallet - re-enable the sleeve '
-                            . 'and use "Flatten inventory" to sell it.');
-                    }
-                }
-            } catch (Throwable $e) {
-                Log::error('panel: cancelling the stranded sleeve orders failed - ' . $e->getMessage());
-                Panel::flash('warn', 'The resting orders of a disabled sleeve could not be cancelled: ' . $e->getMessage());
             }
         }
 
@@ -1925,20 +1097,20 @@ function page_diagnostics(array $cfg): string
     $core = ['index.php','cron.php','config.php','bootstrap.php','lib/Util.php','lib/Db.php','lib/Log.php',
              'lib/Binance.php','lib/Indicators.php','lib/Strategy.php','lib/Risk.php','lib/Exchange.php',
              'lib/Bot.php','lib/Panel.php','assets/panel.css','assets/panel.js'];
-    $extra = ['lib/EngineOrders.php' => 'grid + market making',
-              'lib/EngineGrid.php'   => 'grid',
-              'lib/EnginePmm.php'    => 'market making',
-              'lib/Sleeve.php'       => 'portfolio sleeves',
-              'lib/Scanner.php'      => 'volatility scanner',
+    $extra = ['lib/Scalper.php'       => 'the scalp engine',
+              'lib/Movers.php'       => 'the movers board',
               'lib/Learn.php'        => 'learning / insights'];
 
+    // Each row is [files that must exist, file to grep, marker string]. The MARKER has to be
+    // something that file genuinely contains, or the row reports "present but out of date" on a
+    // perfectly good deploy and sends the user round the upload loop for nothing. The scalp row
+    // used to grep cron.php for `Scalper`, which was true of an earlier build and stopped being
+    // true when the loop moved inside Bot::tick() - so it cried wolf on every correct install.
+    // Grep the file that actually owns the feature.
     $feats = [
         'Demo mode'            => [['lib/Binance.php'], 'lib/Binance.php', 'demo-api.binance.com'],
-        'Grid engine'          => [['lib/EngineGrid.php','lib/EngineOrders.php','lib/Bot.php'], 'lib/Bot.php', 'EngineGrid'],
-        'Market making (pmm)'  => [['lib/EnginePmm.php','lib/EngineOrders.php','lib/Bot.php'], 'lib/Bot.php', 'EnginePmm'],
-        'Portfolio sleeves'    => [['lib/Sleeve.php','index.php'], 'index.php', 'portfolio_enabled'],
-        'Volatility scanner'   => [['lib/Scanner.php','lib/Bot.php'], 'lib/Bot.php', 'Scanner'],
-        'Scalp engine'         => [['lib/Scalper.php','lib/Movers.php','cron.php'], 'cron.php', 'Scalper'],
+        'Scalp engine'         => [['lib/Scalper.php','lib/Movers.php','lib/Bot.php'], 'lib/Bot.php', 'runScalpTick'],
+        'Movers board'         => [['lib/Movers.php'], 'lib/Movers.php', 'class Movers'],
         'Learning / Insights'  => [['lib/Learn.php','index.php'], 'index.php', 'insights'],
         'BNB fee discount'     => [['lib/Binance.php'], 'lib/Binance.php', 'bnbBurn'],
     ];
@@ -2052,14 +1224,15 @@ function page_dashboard(array $cfg, array $s): string
         . 'tables, the current weights and what a recompute would do.</p>';
     $h .= '</section>';
 
-    // ---- engine block (DESIGN-ENGINES.md §10): rendered only when grid or pmm is selected.
-    // The signal-engine cards below stay exactly as they are when engine === 'signal'.
-    $engineOn = !empty($s['show']['engine']);
-    $h .= panel_engine_dashboard($s, $quote, $engineOn);
-
-    // ---- portfolio block (DESIGN-PORTFOLIO.md §7): hidden unless portfolio_enabled, so the
-    // single-engine and signal-engine cards keep working exactly as before when it is off.
-    $h .= panel_portfolio_dashboard($s, $quote, !empty($s['show']['portfolio']));
+    // ---- the grid/pmm removal notice, and the cleanup button that goes with it
+    $migrated = !empty($s['show']['engine_migrated']);
+    $h .= '<section class="card danger-card" data-show="engine_migrated"' . ($migrated ? '' : ' hidden') . '>';
+    $h .= '<h2>Engine changed</h2><p><span data-field="engine_migrated">'
+        . $e((string) ($s['text']['engine_migrated'] ?? '')) . '</span></p>';
+    $h .= '<form method="post" action="index.php" class="inline">' . Panel::csrfField()
+        . '<input type="hidden" name="action" value="cancel_engine_orders">'
+        . '<button type="submit" class="btn btn-warn">Cancel leftover orders</button></form>';
+    $h .= '</section>';
 
     // ---- three cards: API health, position, sparkline
     $h .= '<section class="grid3">';
@@ -2142,9 +1315,6 @@ function page_dashboard(array $cfg, array $s): string
     //      the per-symbol scoreboard, the open positions and the movers board.
     $h .= panel_scalp_dashboard($s, $quote);
 
-    // ---- scanner (DESIGN-PORTFOLIO.md §7)
-    $h .= panel_scanner_dashboard($s, !empty($s['show']['scanner']));
-
     // ---- closed positions
     $h .= '<section class="card"><h2>Closed positions (last 30)</h2><div class="table-wrap"><table class="tbl"><thead><tr>'
         . '<th>Symbol</th><th>Opened</th><th>Closed</th><th>Qty</th><th>Entry eff.</th><th>Exit</th><th>PnL ' . $e($quote) . '</th><th>PnL %</th><th>Reason</th><th>Status</th><th>Score</th>'
@@ -2159,94 +1329,6 @@ function page_dashboard(array $cfg, array $s): string
     $h .= '</section>';
 
     $h .= '<p class="muted small">Server time ' . Panel::field($s, 'now') . '. Values refresh every 20 s without reloading; actions reload the page.</p>';
-    return $h;
-}
-
-/**
- * Engine card, actions, open orders, cycles and cycle KPIs (DESIGN-ENGINES.md §10).
- * Every section carries data-show="engine" so assets/panel.js reveals or hides the whole
- * block when the engine changes, without a page reload and without an inline style.
- */
-function panel_engine_dashboard(array $s, string $quote, bool $on): string
-{
-    $e   = 'Panel::e';
-    $hid = $on ? '' : ' hidden';
-
-    $h  = '<section class="card engine-card" data-show="engine"' . $hid . '>';
-    $h .= '<h2>Engine ' . Panel::pill((string) ($s['text']['eng_name'] ?? '–'), (string) ($s['levels']['eng_name'] ?? 'muted'), 'eng_name')
-        . ' ' . Panel::pill((string) ($s['text']['eng_state'] ?? '–'), (string) ($s['levels']['eng_state'] ?? 'muted'), 'eng_state') . '</h2>';
-    $h .= '<p class="flash flash-danger" data-show="engine_live_blocked" hidden>This engine is in <strong>live</strong> mode with '
-        . '<code>allow_live_engines</code> off: it places no order at all and every tick reports <code>engine_live_blocked</code>. '
-        . 'Enable the setting in Settings → Engine, or switch the mode back to paper, demo or testnet.</p>';
-
-    // actions
-    $h .= '<div class="actions-row">';
-    $h .= panel_action_form('cancel_all', 'Cancel all orders', 'btn btn-warn', false);
-    $h .= '<span class="inline-group" data-show="grid_engine"' . (!empty($s['show']['grid_engine']) ? '' : ' hidden') . '>'
-        . '<form method="post" action="index.php" class="inline" data-confirm="Re-anchor the grid on the current mid price? This also clears a range-exit pause.">'
-        . Panel::csrfField() . '<input type="hidden" name="action" value="reanchor_grid">'
-        . '<button type="submit" class="btn">Re-anchor grid</button></form></span>';
-    $h .= '<form method="post" action="index.php" class="inline panic" data-confirm="FLATTEN INVENTORY: cancel every resting order and market-sell the whole engine inventory. Continue?">'
-        . Panel::csrfField() . '<input type="hidden" name="action" value="flatten_inventory">'
-        . '<label class="check small"><input type="checkbox" name="confirm" value="1" required> confirm</label>'
-        . '<button type="submit" class="btn btn-danger">Flatten inventory</button></form>';
-    $h .= '</div>';
-
-    // card body
-    $h .= '<div class="grid3 engine-kv">';
-    $h .= '<dl class="kv">';
-    $h .= panel_kv($s, 'Engine', 'eng_name');
-    $h .= panel_kv($s, 'Symbol', 'eng_symbol');
-    $h .= panel_kv($s, 'Last price', 'eng_price');
-    $h .= panel_kv($s, 'Live orders', 'eng_orders');
-    $h .= '</dl>';
-    $h .= '<dl class="kv">';
-    $h .= panel_kv($s, 'Inventory', 'eng_inventory');
-    $h .= panel_kv($s, 'Inventory cost', 'eng_inv_cost');
-    $h .= panel_kv($s, 'Inventory at bid', 'eng_inv_value');
-    $h .= panel_kv($s, 'Unrealised', 'eng_unreal', true);
-    $h .= '</dl>';
-    $h .= '<div data-show="grid_engine"' . (!empty($s['show']['grid_engine']) ? '' : ' hidden') . '><dl class="kv">';
-    $h .= panel_kv($s, 'Anchor', 'eng_anchor');
-    $h .= panel_kv($s, 'Anchored at', 'eng_anchor_at');
-    $h .= panel_kv($s, 'Range up', 'eng_range_up', true);
-    $h .= panel_kv($s, 'Range down', 'eng_range_down', true);
-    $h .= panel_kv($s, 'Rung spacing', 'eng_spacing');
-    $h .= '</dl></div>';
-    $h .= '<div data-show="pmm_engine"' . (!empty($s['show']['pmm_engine']) ? '' : ' hidden') . '><dl class="kv">';
-    $h .= panel_kv($s, 'Half-spread', 'eng_spread');
-    $h .= panel_kv($s, 'Re-quote age', 'eng_refresh');
-    $h .= '</dl>';
-    $h .= '<p class="muted small">pmm is expected to lose money at VIP0 fees: a round trip costs about 0.2 % while typical '
-        . 'spreads on the majors are 0.01–0.05 %. Watch the realised cycle PnL below, not the fill count.</p></div>';
-    $h .= '</div></section>';
-
-    // cycle KPIs
-    $h .= '<section class="kpis" data-show="engine"' . $hid . '>';
-    $h .= Panel::kpi($s, 'eng_cycles_today', 'Cycles today');
-    $h .= Panel::kpi($s, 'eng_cycles', 'Cycles total');
-    $h .= Panel::kpi($s, 'eng_pnl_today', 'Cycle PnL today', true);
-    $h .= Panel::kpi($s, 'eng_pnl', 'Cycle PnL realised', true);
-    $h .= Panel::kpi($s, 'eng_fees', 'Cycle fees');
-    $h .= Panel::kpi($s, 'eng_win_rate', 'Cycle win rate');
-    $h .= '</section>';
-
-    // open orders
-    $h .= '<section class="card" data-show="engine"' . $hid . '><h2>Open orders</h2><div class="table-wrap">'
-        . '<table class="tbl"><thead><tr><th>Side</th><th>Level</th><th>Price</th><th>Qty</th><th>Quote ' . $e($quote) . '</th>'
-        . '<th>Age</th><th>Status</th><th></th></tr></thead>'
-        . '<tbody data-table="engine_orders" data-cols="8">' . Panel::tableRows($s['tables']['engine_orders']) . '</tbody>'
-        . '</table></div><p class="muted small">The engine owns the order book of its symbol: anything resting there that it does not '
-        . 'track is cancelled on the next tick. Cancelling here resolves the order against the exchange first, so a fill that beat the '
-        . 'cancel is still booked into the lots and cycles.</p></section>';
-
-    // cycles
-    $h .= '<section class="card" data-show="engine"' . $hid . '><h2>Cycles (last 30)</h2><div class="table-wrap">'
-        . '<table class="tbl"><thead><tr><th>Level</th><th>Buy</th><th>Sell</th><th>Qty</th><th>PnL ' . $e($quote) . '</th><th>Closed</th></tr></thead>'
-        . '<tbody data-table="cycles" data-cols="6">' . Panel::tableRows($s['tables']['cycles']) . '</tbody>'
-        . '</table></div><p class="muted small">One row per realised buy → sell round trip, FIFO. PnL is net: the sell fee is deducted '
-        . 'and the buy fee is already inside the buy price.</p></section>';
-
     return $h;
 }
 
@@ -2266,114 +1348,6 @@ function panel_kv(array $s, string $label, string $key, bool $pill = false): str
         $h .= Panel::field($s, $key);
     }
     return $h . '</dd>';
-}
-
-/**
- * Portfolio card, overlaid per-sleeve equity sparkline and the per-sleeve pause / resume
- * actions (DESIGN-PORTFOLIO.md §7). Every section carries data-show="portfolio", so
- * assets/panel.js reveals or hides the whole block without a reload and without an inline
- * style attribute. With portfolio_enabled = false the block is simply hidden and every
- * single-engine and signal-engine card above it is untouched.
- */
-function panel_portfolio_dashboard(array $s, string $quote, bool $on): string
-{
-    $e   = 'Panel::e';
-    $hid = $on ? '' : ' hidden';
-    $pf  = isset($s['portfolio']) && is_array($s['portfolio']) ? $s['portfolio'] : [];
-    $sleeves = isset($pf['sleeves']) && is_array($pf['sleeves']) ? $pf['sleeves'] : [];
-
-    $h  = '<section class="card portfolio-card" data-show="portfolio"' . $hid . '>';
-    $h .= '<h2>Portfolio ' . Panel::pill((string) ($s['text']['pf_state'] ?? '-'), (string) ($s['levels']['pf_state'] ?? 'muted'), 'pf_state')
-        . ' <span class="muted small" data-field="pf_sleeves">' . $e((string) ($s['text']['pf_sleeves'] ?? '')) . '</span></h2>';
-    $h .= '<p class="muted small">Each sleeve is one method with its own budget and its own exclusive symbols. The budget is an '
-        . '<strong>accounting</strong> boundary, not an exchange one: Binance holds a single balance and the bot enforces the split '
-        . 'itself, which only works because two sleeves never share a symbol. The global kill switch still uses total equity and still '
-        . 'halts everything.</p>';
-
-    // per-sleeve pause / resume
-    if ($sleeves !== []) {
-        $h .= '<div class="actions-row sleeve-actions">';
-        foreach ($sleeves as $c) {
-            $eng = isset($c['engine']) ? (string) $c['engine'] : '';
-            if ($eng === '') {
-                continue;
-            }
-            $paused = !empty($c['paused']);
-            $h .= '<span class="inline-group"><span class="mono sleeve-name">' . $e($eng) . '</span>';
-            $h .= panel_sleeve_form('pause_sleeve', $eng, 'Pause', 'btn btn-mini btn-warn', $paused);
-            $h .= panel_sleeve_form('resume_sleeve', $eng, 'Resume', 'btn btn-mini', !$paused);
-            if ($eng === 'grid') {
-                // a range exit pauses the grid sleeve alone (DESIGN-ENGINES.md §7.2); the engine
-                // card that normally carries this button is hidden in portfolio mode, so without
-                // it the sleeve could never be resumed from the panel
-                $h .= '<form method="post" action="index.php" class="inline" data-confirm="Re-anchor the grid on the current mid price? This also clears a range-exit pause.">'
-                    . Panel::csrfField() . '<input type="hidden" name="action" value="reanchor_grid">'
-                    . '<button type="submit" class="btn btn-mini">Re-anchor</button></form>';
-            }
-            $h .= '</span>';
-        }
-        $h .= '</div><p class="muted small">Pausing one sleeve stops it opening new exposure; its exits stay managed and the other '
-            . 'sleeves keep trading. That is what makes the comparison safe - a failing method stops itself without taking the account down.</p>';
-    }
-
-    $h .= '<div class="table-wrap"><table class="tbl"><thead><tr>'
-        . '<th>Sleeve</th><th>Symbols</th><th>Budget</th><th>Equity</th><th>Realised ' . $e($quote) . '</th><th>Unrealised ' . $e($quote) . '</th>'
-        . '<th>PnL %</th><th>Trades / cycles</th><th>Win rate</th><th>Fees</th><th>Used %</th><th>Status</th>'
-        . '</tr></thead><tbody data-table="portfolio" data-cols="12">'
-        . Panel::tableRows(isset($s['tables']['portfolio']) && is_array($s['tables']['portfolio']) ? $s['tables']['portfolio'] : [])
-        . '</tbody></table></div>';
-
-    // the honest headline: who leads, on how many trades, and why that is not a result yet
-    $h .= '<p class="pf-best">' . Panel::pill((string) ($s['text']['pf_best'] ?? '-'), (string) ($s['levels']['pf_best'] ?? 'muted'), 'pf_best', 'pill-wide') . '</p>';
-    $h .= '<p class="muted small" data-field="pf_best_caveat">' . $e((string) ($s['text']['pf_best_caveat'] ?? '')) . '</p>';
-
-    $h .= '<dl class="kv pf-kv">';
-    $h .= panel_kv($s, 'Total budget', 'pf_budget');
-    $h .= panel_kv($s, 'Total sleeve equity', 'pf_equity', true);
-    $h .= panel_kv($s, 'Realised', 'pf_realised', true);
-    $h .= panel_kv($s, 'Unrealised', 'pf_unrealised', true);
-    $h .= panel_kv($s, 'Sample', 'pf_sample');
-    $h .= panel_kv($s, 'Reserve', 'pf_reserve');
-    $h .= panel_kv($s, 'Sleeve drawdown pause', 'pf_drawdown');
-    $h .= panel_kv($s, 'Unattributed base', 'pf_unattributed', true);
-    $h .= panel_kv($s, 'Valuation', 'pf_valuation');
-    $h .= '</dl>';
-    $h .= '<p class="muted small">Unattributed base is a balance whose symbol belongs to no sleeve: it is excluded from every sleeve\'s '
-        . 'numbers and still counts in total equity for the global kill switch.</p>';
-    $h .= '</section>';
-
-    // ---- overlaid per-sleeve equity sparkline
-    $spark = isset($s['sleeve_sparkline']) && is_array($s['sleeve_sparkline']) ? $s['sleeve_sparkline'] : [];
-    $h .= '<section class="card" data-show="portfolio"' . $hid . '><h2>Sleeve equity (last 288 samples)</h2>';
-    $h .= '<div class="spark-wrap">' . Panel::svgMultiSparkline($spark) . '</div>';
-    $h .= '<div class="spark-meta">';
-    foreach ($sleeves as $c) {
-        $eng = isset($c['engine']) ? (string) $c['engine'] : '';
-        if ($eng === '') {
-            continue;
-        }
-        $key = 'pf_leg_' . Panel::slug($eng);
-        $h .= '<span class="legend-item"><span class="legend-swatch swatch-' . $e(Panel::slug($eng)) . '" aria-hidden="true"></span>'
-            . '<span class="legend-name mono">' . $e($eng) . '</span> '
-            . Panel::field($s, $key, 'span', 'legend-value') . '</span>';
-    }
-    $h .= '<span class="muted">min ' . Panel::field($s, 'pf_spark_min') . ' · max ' . Panel::field($s, 'pf_spark_max')
-        . ' · ' . Panel::field($s, 'pf_spark_count') . '</span></div>';
-    $h .= '<p class="muted small">All sleeves share one scale, so the lines are directly comparable. One sample is written per sleeve '
-        . 'per tick; a flat line means the sleeve has not traded, not that it is broken.</p>';
-    $h .= '</section>';
-
-    return $h;
-}
-
-/** One sleeve action button (POST + CSRF); disabled when it would be a no-op. */
-function panel_sleeve_form(string $action, string $engine, string $label, string $class, bool $disabled): string
-{
-    return '<form method="post" action="index.php" class="inline">' . Panel::csrfField()
-        . '<input type="hidden" name="action" value="' . Panel::e($action) . '">'
-        . '<input type="hidden" name="engine" value="' . Panel::e($engine) . '">'
-        . '<button type="submit" class="' . Panel::e($class) . '"' . ($disabled ? ' disabled' : '') . '>'
-        . Panel::e($label) . '</button></form>';
 }
 
 /**
@@ -2511,35 +1485,6 @@ function panel_scalp_dashboard(array $s, string $quote): string
     return $h;
 }
 
-/**
- * Volatility scanner card (DESIGN-PORTFOLIO.md §5, §7): every documented column plus the
- * per-row "Assign to…" control. The scanner never reassigns anything by itself - this control
- * is the only way a suggestion is applied, and it refuses an assignment that would strand
- * inventory or take a symbol another sleeve owns.
- */
-function panel_scanner_dashboard(array $s, bool $on): string
-{
-    $e   = 'Panel::e';
-    $hid = $on ? '' : ' hidden';
-    $h  = '<section class="card scanner-card" data-show="scanner"' . $hid . '>';
-    $h .= '<h2>Scanner ' . Panel::pill((string) ($s['text']['pf_scanner_state'] ?? '-'), (string) ($s['levels']['pf_scanner_state'] ?? 'muted'), 'pf_scanner_state')
-        . ' ' . Panel::pill((string) ($s['text']['pf_scanner_age'] ?? '-'), (string) ($s['levels']['pf_scanner_age'] ?? 'muted'), 'pf_scanner_age') . '</h2>';
-    $h .= '<div class="table-wrap"><table class="tbl"><thead><tr>'
-        . '<th>#</th><th>Symbol</th><th>Price</th><th>24 h change</th><th>ATR %</th><th>Spread</th><th>24 h quote vol</th>'
-        . '<th>Step value</th><th>Required size</th><th>Score</th><th>Eligible / gates</th><th>Assign</th>'
-        . '</tr></thead><tbody data-table="scanner" data-cols="12">'
-        . Panel::tableRows(isset($s['tables']['scanner']) && is_array($s['tables']['scanner']) ? $s['tables']['scanner'] : [])
-        . '</tbody></table></div>';
-    $h .= '<p class="muted small">score = ATR % × liquidity factor × spread factor, so volatility alone never wins: an illiquid or '
-        . 'wide-spread coin is penalised toward zero. A gated row is kept, not dropped, so the gate can explain the rejection. '
-        . 'Refresh interval: <span data-field="pf_scanner_refresh">' . $e((string) ($s['text']['pf_scanner_refresh'] ?? '')) . '</span>; '
-        . 'rows: <span data-field="pf_scanner_rows">' . $e((string) ($s['text']['pf_scanner_rows'] ?? '')) . '</span>.</p>';
-    $h .= '<p class="muted small">"Assign to…" sets the symbol as that sleeve\'s symbol. It is refused when another sleeve already owns '
-        . 'the symbol, and when the target sleeve still holds inventory - a silent symbol change under a live grid would strand it.</p>';
-    $h .= '</section>';
-    return $h;
-}
-
 /* -------------------------------------------------------------- settings */
 
 /* ------------------------------------------------------------- insights page */
@@ -2600,7 +1545,7 @@ function page_insights(array $cfg, array $ins): string
     $h .= '<section class="card"><h2>Current weights ' . Panel::pill(!empty($head['learning_apply']) ? 'APPLY ON' : 'APPLY OFF',
         (string) ($w['apply_level'] ?? 'muted')) . '</h2>';
     $h .= '<p class="muted small">Learning may adjust <strong>only</strong> the score-component weights and the effective entry '
-        . 'threshold, inside the caps below. It has no access to position size, take-profit, stop-loss, sleeve budgets or any kill '
+        . 'threshold, inside the caps below. It has no access to position size, take-profit, stop-loss, the scalp budgets or any kill '
         . 'switch: its whole write surface is two state keys, and the test suite asserts that the rest of the configuration comes '
         . 'back unchanged from a recompute.</p>';
     $h .= '<dl class="kv">';
@@ -2688,11 +1633,6 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
             $v[$k] = $d;   // the form still renders on an install whose config predates the engines
         }
     }
-    foreach (panel_portfolio_defaults() as $k => $d) {
-        if (!isset($v[$k])) {
-            $v[$k] = $d;   // ditto for the portfolio and scanner keys (DESIGN-PORTFOLIO.md §2)
-        }
-    }
     foreach (panel_learning_defaults() as $k => $d) {
         if (!array_key_exists($k, $v)) {
             $v[$k] = $d;   // ditto for the learning keys (DESIGN-LEARNING.md §5, §7)
@@ -2733,65 +1673,33 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     $h .= panel_input('quote_asset', $v, 'Quote asset', 'text');
     $h .= '</div></fieldset>';
 
-    // -- engine (DESIGN-ENGINES.md §2, §10)
+    // -- engine (the removed grid/pmm contract)
     $engine = strtolower(trim((string) ($v['engine'] ?? 'signal')));
-    if (!in_array($engine, ['signal', 'grid', 'pmm', 'scalp'], true)) {
+    if (!in_array($engine, ['signal', 'scalp'], true)) {
         $engine = 'signal';
     }
     $h .= '<fieldset><legend>Engine</legend>';
     $h .= '<div class="grid3">';
-    $h .= '<label>Engine<span class="muted help">signal trades one position at a time on the watchlist; grid and pmm quote one symbol continuously; '
+    $h .= '<label>Engine<span class="muted help">signal trades one position at a time on the watchlist; '
         . 'scalp trades many symbols at once, many times a minute</span>'
         . '<select name="engine" data-engine-select>';
     foreach ([
         'signal' => 'signal - mean-reversion, market orders, one position',
-        'grid'   => 'grid - ladder of resting limit orders',
-        'pmm'    => 'pmm - pure market making (expected to lose at VIP0 fees)',
         'scalp'  => 'scalp - fast micro-trades across 20-30 symbols at once (demo, to measure it)',
     ] as $k => $label) {
         $h .= '<option value="' . $e($k) . '"' . ($engine === $k ? ' selected' : '') . '>' . $e($label) . '</option>';
     }
     $h .= '</select></label>';
-    $h .= panel_input('engine_symbol', $v, 'Engine symbol', 'text', 'the single pair grid / pmm trade - they do not use the watchlist');
-    $h .= panel_input('engine_max_orders', $v, 'Max simultaneous orders', 'number', '1-20; also held under the symbol MAX_NUM_ORDERS - 2', '1');
     $h .= '</div>';
-    $h .= panel_check('post_only', $v, 'Post-only quotes (LIMIT_MAKER).',
-        '<span class="muted">A quote that would match immediately is rejected and simply skipped for that tick - that rejection is normal. Unticked uses LIMIT + GTC, which can take.</span>');
-    $h .= panel_check('allow_live_engines', $v, 'Allow grid / pmm / scalp to run in LIVE mode.',
-        '<span class="danger">Warning: grid, pmm and scalp refuse to place a single order in live mode while this is off '
-        . '(the tick reports <code>engine_live_blocked</code>). Only turn it on once you have run the engine in paper, demo or testnet '
-        . 'and understand that it trades real money continuously.</span>');
+    $h .= panel_check('allow_live_engines', $v, 'Allow the scalp engine to run in LIVE mode.',
+        '<span class="danger">Warning: the scalp engine refuses to place a single order in live mode while this is off '
+        . '(the tick reports <code>engine_live_blocked</code>). Only turn it on once you have run it on demo and read the '
+        . 'Gross / Fees / Net card - the fee arithmetic says it needs roughly a 76 % win rate just to break even.</span>');
 
     // signal
     $h .= panel_engine_group('signal', $engine,
         '<p class="muted">The signal engine is configured by the sections below (watchlist, sizing, exits, strategy). '
-        . 'The grid and pmm fields do not apply to it.</p>');
-
-    // grid
-    $grid  = '<div class="grid3">';
-    $grid .= panel_input('grid_levels', $v, 'Buy rungs below the anchor', 'number', '1-20, and under engine_max_orders', '1');
-    $grid .= panel_input('grid_spacing_pct', $v, 'Rung spacing %', 'number', 'must be at least 2 x fee % + 0.1, otherwise a round trip cannot pay for itself');
-    $grid .= panel_input('grid_order_usdt', $v, 'Quote per rung', 'number', 'must clear the symbol required size (minNotional + step)');
-    $grid .= panel_input('grid_range_up_pct', $v, 'Range up %', 'number', 'mid above anchor x (1 + x) ends the grid');
-    $grid .= panel_input('grid_range_down_pct', $v, 'Range down %', 'number', 'mid below anchor x (1 - x) ends the grid');
-    $grid .= '</div>';
-    $grid .= panel_check('grid_exit_liquidates', $v, 'On a range exit, also market-sell the inventory.',
-        '<span class="muted">Off keeps the base in the wallet; a range exit always cancels every resting order and pauses the grid until you press "Re-anchor grid".</span>');
-    $h .= panel_engine_group('grid', $engine, $grid);
-
-    // pmm
-    $pmm  = '<div class="flash flash-warn"><strong>pmm is expected to LOSE money at VIP0 fees.</strong> Binance charges 0.1 % maker, '
-          . 'identical to taker, so a round trip costs about 0.2 % while observed spreads on the majors are 0.01-0.05 %. '
-          . 'It is here because it was asked for, and it becomes viable at a better fee tier, on wide-spread pairs, or with maker rebates. '
-          . 'Run it in paper or demo mode and watch the cycle KPIs before you consider anything else.</div>';
-    $pmm .= '<div class="grid3">';
-    $pmm .= panel_input('pmm_spread_pct', $v, 'Half-spread % each side', 'number', 'bid = mid x (1 - x), ask = mid x (1 + x)');
-    $pmm .= panel_input('pmm_order_usdt', $v, 'Quote per quote-order', 'number', 'the inventory skew scales it, never above 1.5 x');
-    $pmm .= panel_input('pmm_refresh_sec', $v, 'Re-quote age (s)', 'number', 'quotes older than this are cancelled and replaced', '1');
-    $pmm .= panel_input('pmm_target_base_pct', $v, 'Target base %', 'number', 'share of engine equity held as base');
-    $pmm .= panel_input('pmm_max_base_pct', $v, 'Max base %', 'number', 'above this stop bidding; below 100 - this stop asking');
-    $pmm .= '</div>';
-    $h .= panel_engine_group('pmm', $engine, $pmm);
+        . 'The scalp fields do not apply to it.</p>');
 
     // scalp (DESIGN-SCALP.md §6)
     $scalpTp  = (float) ($v['scalp_tp_pct'] ?? 0.25);
@@ -2847,9 +1755,6 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     $h .= panel_engine_group('scalp', $engine, $scalp);
     $h .= '</fieldset>';
 
-    // -- portfolio & scanner (DESIGN-PORTFOLIO.md §2, §7)
-    $h .= page_settings_portfolio($v, $errors);
-
     // -- sizing & kill switches
     $h .= '<fieldset><legend>Sizing &amp; kill switches</legend><div class="grid3">';
     $h .= panel_input('trade_usdt', $v, 'Trade size (quote)', 'number', 'target quote per entry; actual = min(trade, 65 % of free)');
@@ -2894,7 +1799,7 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
         . 'and the ones it refused - and the outcome that followed, then reports which conditions actually preceded profit. That is '
         . 'statistics over its own history, not a model that discovers alpha. What it may change is deliberately tiny: the '
         . '<strong>score-component weights and the effective entry threshold, nothing else</strong>. It cannot reach position size, '
-        . 'take-profit, stop-loss, a sleeve budget or any kill switch - those are hard invariants asserted by the test suite. '
+        . 'take-profit, stop-loss, a scalp budget or any kill switch - those are hard invariants asserted by the test suite. '
         . 'See <a href="?page=insights">Insights</a> for what it currently believes and on how many trades.</p>';
     $h .= panel_check('learning_enabled', $v, 'Capture observations and compute insights.',
         '<span class="muted">Off writes no observation row and makes no claim; the Insights page then only shows what is already stored.</span>');
@@ -2980,16 +1885,11 @@ function panel_engine_group(string $name, string $current, string $body): string
         . ' data-engine-group="' . Panel::e($name) . '">' . $body . '</div>';
 }
 
-/** DESIGN-ENGINES.md §2 defaults, used only to render the form when config.php has no value yet. */
+/** Engine defaults, used only to render the form when config.php has no value yet. */
 function panel_engine_defaults(): array
 {
     return [
-        'engine' => 'signal', 'allow_live_engines' => false, 'engine_symbol' => 'DOGEUSDT',
-        'engine_max_orders' => 12, 'post_only' => true,
-        'grid_levels' => 6, 'grid_spacing_pct' => 0.60, 'grid_order_usdt' => 1.30,
-        'grid_range_up_pct' => 4.0, 'grid_range_down_pct' => 6.0, 'grid_exit_liquidates' => false,
-        'pmm_spread_pct' => 0.25, 'pmm_order_usdt' => 1.30, 'pmm_refresh_sec' => 60,
-        'pmm_target_base_pct' => 50, 'pmm_max_base_pct' => 80,
+        'engine' => 'signal', 'allow_live_engines' => false,
         'scalp_universe_size' => 20, 'scalp_order_usdt' => 50.0, 'scalp_budget_per_symbol' => 100.0,
         'scalp_budgets' => [], 'scalp_max_open' => 6, 'scalp_tp_pct' => 0.25, 'scalp_sl_pct' => 0.20,
         'scalp_max_hold_sec' => 120, 'scalp_dip_pct' => 0.15, 'scalp_window' => 8,

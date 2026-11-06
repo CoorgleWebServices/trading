@@ -282,7 +282,7 @@ final class Binance
             'tickSize'             => '0.00000001',
             'basePrecision'        => (int)($s['baseAssetPrecision'] ?? 8),
             'quotePrecision'       => (int)($s['quoteAssetPrecision'] ?? ($s['quotePrecision'] ?? 8)),
-            // PRICE_FILTER bounds (0 = no bound), PERCENT_PRICE_BY_SIDE and MAX_NUM_ORDERS (DESIGN-ENGINES.md §3)
+            // PRICE_FILTER bounds (0 = no bound), PERCENT_PRICE_BY_SIDE and MAX_NUM_ORDERS
             'minPrice'             => '0.00000000',
             'maxPrice'             => '0.00000000',
             'bidMultiplierUp'      => 0.0,
@@ -342,7 +342,7 @@ final class Binance
     }
 
     /**
-     * PERCENT_PRICE_BY_SIDE check (DESIGN-ENGINES.md §3): a BUY price must sit inside
+     * PERCENT_PRICE_BY_SIDE check: a BUY price must sit inside
      * [reference × bidMultiplierDown, reference × bidMultiplierUp] and a SELL price inside
      * [reference × askMultiplierDown, reference × askMultiplierUp].
      *
@@ -824,7 +824,7 @@ final class Binance
         return is_array($r) ? $r : [];
     }
 
-    // ------------------------------------------------------------------ limit orders (DESIGN-ENGINES.md §3)
+    // ------------------------------------------------------------------ limit orders
 
     /**
      * Places a resting limit order. $qtyStr and $priceStr are pre-rounded exact decimal strings

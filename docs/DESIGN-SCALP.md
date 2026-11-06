@@ -1,7 +1,8 @@
 # Scalp engine — fast micro-trading across many symbols
 
-A fourth engine (`engine = 'scalp'`) alongside signal, grid and pmm. Extends `docs/DESIGN.md`
-and `DESIGN-ENGINES.md`, which stay authoritative for what they cover.
+A second engine (`engine = 'scalp'`) alongside signal. Extends `docs/DESIGN.md`, which stays
+authoritative for what it covers. (The grid and pmm engines it was originally written beside, and
+portfolio mode, have since been removed.)
 
 ## 1. What the user asked for, in their words
 
@@ -10,7 +11,7 @@ size, on the **demo** account, with a board showing the **top coins by fluctuati
 of traders**, and a **pause after 5–10 consecutive losses** that waits for a human to resume.
 
 The existing engines do not do this. `signal` holds one position and trades a few times a day;
-`grid` and `pmm` rest limit orders on a single symbol. This engine is many symbols, many trades,
+This engine is many symbols, many trades,
 market orders, seconds not hours.
 
 ## 2. The honest purpose: measurement, not profit
@@ -30,7 +31,7 @@ signal works and fees eat it, which is a fee problem. Gross negative means there
 all and no fee tier would save it. Never show net alone, and never imply a few green trades
 prove anything — show the trade count beside every verdict.
 
-**Demo-only**, exactly like grid and pmm: `scalp` places no order when `mode` is `live` unless
+**Demo-only**: `scalp` places no order when `mode` is `live` unless
 `allow_live_engines` is explicitly true.
 
 ## 3. Movers board (`lib/Movers.php`)

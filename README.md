@@ -170,114 +170,54 @@ You do not need keys for paper mode. For demo, testnet and live:
 
 ---
 
-## Engines: signal, grid, pmm, scalp
+## Engines: signal and scalp
 
-The bot runs exactly one **engine** at a time, chosen with the `engine` setting. The signal engine
-is the default and is what the rest of this file describes; the other two trade continuously and
-are **demo-only by default**.
+The bot runs exactly one **engine** at a time, chosen with the `engine` setting.
 
 | engine | what it does | orders | earns from | loses when |
 |---|---|---|---|---|
 | `signal` (default) | one position at a time, entries only on a closed 15m candle | market | mean reversion inside an uptrend | the setup keeps failing (the survival layer bounds it) |
-| `grid` | a ladder of resting buy rungs below an anchor, each with a sell one rung up | limit (post-only) | oscillation inside a range | price **trends out of the range** |
-| `pmm` | pure market making: one bid and one ask around mid, re-quoted every refresh | limit (post-only) | the spread | always, at VIP0 fees - see below |
 | `scalp` | 20 coins at once, ~16 decision points a minute, tiny market orders, a budget per coin | market | tiny mean-reversion bounces | fees, mostly - which is why it measures and shows gross vs net (see below) |
 
-**pmm is expected to LOSE money at VIP0 fees.** Binance charges 0.1 % maker, identical to taker, so
-a round trip costs about 0.2 %, while observed spreads on the majors are 0.01 - 0.05 %. It is
-included because it was asked for and because it becomes viable at better fee tiers, on wide-spread
-pairs, or with maker rebates. Do not run it live expecting profit. The panel repeats this warning
-wherever pmm is selected.
+### What was removed, and why
 
-**Grid earns while the market ranges and bleeds while it trends.** Every completed rung round trip
-banks `grid_spacing_pct` minus the ~0.2 % round trip, so a choppy market pays and a one-way market
-does not: the ladder just keeps buying into the fall and ends up holding inventory bought above the
-market. It is viable only when the rung spacing exceeds the round-trip cost, which the settings
-validator enforces (`grid_spacing_pct` must be at least `2 x fee_pct + 0.1`). Its real risk is not
-the fee but the trend: a grid holds inventory bought on the way down, so a market that leaves the
-range leaves you long. `grid_range_up_pct` / `grid_range_down_pct` bound that - on a range exit the
-bot cancels every order, optionally market-sells the inventory (`grid_exit_liquidates`, off by
-default), and pauses until you press **Re-anchor grid** in the panel.
+Earlier versions also had a `grid` engine (a ladder of resting limit orders), a `pmm` engine
+(pure market making) and **portfolio mode**, which split the account into per-engine "sleeves"
+and ranked pairs with a volatility scanner. All of it is gone.
+
+* **pmm could not work at this fee tier.** Binance charges 0.1 % maker, identical to taker, so a
+  round trip costs ~0.2 % while spreads on the majors are 0.01 - 0.05 %. It was structurally
+  unprofitable, and no amount of tuning changed that.
+* **grid** earned while a market ranged and bled while it trended, which made it a bet on market
+  regime rather than on anything the bot could measure.
+* **portfolio mode quietly took the tick over from whichever engine was selected.** A bot set to
+  `scalp` with `portfolio_enabled` left on would run the sleeves and never the scalp loop - the
+  panel showed a healthy scalp card that never opened a trade. Its per-engine budgets are
+  superseded by the scalp engine's own per-symbol budgets, which do the same job better.
+
+**If your `data/config.json` still says `grid` or `pmm`**, the bot rewrites it to `signal` on the
+next load and the dashboard shows an **Engine changed** notice saying so - it does not switch
+silently. Orders those engines left resting on Binance are NOT abandoned: the same notice carries
+a **Cancel leftover orders** button, because an order resting on the exchange does not care that
+the code that placed it is gone. Coins they already bought stay in your wallet; sell those by
+hand, or the survival layer will halt on `untracked_position`.
 
 ### The demo-only rule
 
-`grid` and `pmm` **place no order at all in `live` mode** unless `allow_live_engines` is explicitly
-turned on. The default is off. In that state every tick returns immediately with
-`no_trade_reason = engine_live_blocked`, the event is logged once, and the dashboard shows a red
-banner. This is deliberate, not a bug: prove an engine in paper, demo or testnet first.
-
-The rule covers the **panel actions** as well as the cron tick, because it is about orders, not
-about ticks:
-
-| action | while live-blocked |
-|---|---|
-| **Run tick** / cron | returns `engine_live_blocked`, places nothing |
-| **Cancel all orders** | still works - cancelling only ever takes risk off the book |
-| **Cancel** (one order) | still works, same reason |
-| **Re-anchor grid** | moves the anchor and clears the pause; quotes nothing against it |
-| **Flatten inventory** | **refused.** It ends in a real market SELL, so it cancels the resting orders, sells nothing, and tells you to switch the engine back to `signal` first |
-
-So the one way out of a live-blocked engine that is holding inventory is to set `engine` back to
-`signal` (or turn `allow_live_engines` on, deliberately) and flatten from there. `tests/run.php`
-proves the whole guarantee in the `engine-demo-only` group: it builds a real ladder and a real lot
-with the flag on, turns the flag off, drives every action listed above, and asserts that the limit,
-market-buy and market-sell counters of the exchange double are all still zero.
+The scalp engine places **no order at all** in live mode unless `allow_live_engines` is explicitly
+true. The tick reports `engine_live_blocked` and the panel says so. This is deliberate: the fee
+arithmetic below says the engine needs roughly a 76 % win rate just to break even, and that claim
+should be tested on demo with real numbers before any real money is involved.
 
 ### Engine settings
 
-All sixteen keys below are ordinary config keys with defaults in `config.php`, so an installation
-that predates the engines picks them up on the next load - you never have to hand-edit
-`data/config.json`. The Settings page shows only the fields of the engine you have selected, and
-`Risk::validateConfig()` checks their bounds on save (see the notes column).
-
 | key | default | notes |
 |---|---|---|
-| `engine` | `signal` | `signal` / `grid` / `pmm` |
-| `allow_live_engines` | `false` | must be on before grid/pmm may trade in live mode |
-| `engine_symbol` | `DOGEUSDT` | the single symbol grid/pmm trade; they ignore the watchlist |
-| `engine_max_orders` | `12` | hard cap on simultaneously open orders (1 - 20) |
-| `post_only` | `true` | `LIMIT_MAKER`; a post-only rejection is normal and simply skips that quote |
-| `grid_levels` | `6` | buy rungs below the anchor, 1 - 20 |
-| `grid_spacing_pct` | `0.60` | distance between rungs; must clear the round-trip fee |
-| `grid_order_usdt` | `1.30` | quote per rung; must clear the symbol's required size |
-| `grid_range_up_pct` | `4.0` | mid above `anchor x (1 + x)` ends the grid |
-| `grid_range_down_pct` | `6.0` | mid below `anchor x (1 - x)` ends the grid |
-| `grid_exit_liquidates` | `false` | on a range exit, also market-sell the inventory |
-| `pmm_spread_pct` | `0.25` | half-spread each side of mid |
-| `pmm_order_usdt` | `1.30` | quote per quote-order |
-| `pmm_refresh_sec` | `60` | quotes older than this are cancelled and replaced |
-| `pmm_target_base_pct` | `50` | inventory target, percent of engine equity held as base |
-| `pmm_max_base_pct` | `80` | above this stop bidding; below `100 - this` stop asking |
+| `engine` | `signal` | `signal` or `scalp` |
+| `allow_live_engines` | `false` | must be on before the scalp engine may trade in live mode |
 
-**Funding the ladder.** A grid needs `grid_levels x grid_order_usdt` of free quote before the lower
-rungs can fill, and each rung must also clear the symbol's required size - about **1.35 USDT for
-DOGEUSDT** (see the minimum-notional section above), so the 1.30 default should be raised slightly
-for that pair. The defaults therefore want roughly `6 x 1.30 = 7.80 USDT` free, or `8.10` at a rung
-of 1.35. That is nothing on a demo account, but on a 10 USDT live account it is very nearly the
-whole balance: the settings validator warns when the full ladder costs more than 90 % of the free
-quote. On a small real account drop `grid_levels` to 1 - 2.
+Everything else the scalp engine needs is in its own section below.
 
-### Switching back to the signal engine
-
-The resting orders and the inventory belong to the engine, not to the signal engine, and once the
-selector says `signal` no tick will ever sync that ladder again. So do this in order:
-
-1. **Flatten inventory** while the engine is still selected (it market-sells what the engine holds
-   and needs its confirmation tick box). Skip this only if you want to keep the base.
-2. Wait one tick, so the fills book into `cycles` and the KPIs are right.
-3. Set `engine` back to `signal` in **Settings** and save.
-
-Saving a change to `engine` **or** to `engine_symbol` cancels the previous engine's resting orders
-automatically - it is the last moment anything can, since the dashboard's engine card disappears
-with the same save - and tells you how many went. That safety net is not a substitute for step 1:
-it cancels orders, it never sells. **Inventory is deliberately kept**, because it is real base and
-selling it is your decision, not the panel's. If you find leftover base later, select the engine
-again and use **Flatten inventory**, or sell it by hand on Binance.
-
-The signal-engine cards reappear as soon as `signal` is selected. Realised engine PnL keeps
-counting against the daily and weekly loss caps either way, so a bad grid still pauses the account.
-
----
 
 ## Scalp: many coins, many trades, one pot per coin
 
@@ -285,7 +225,7 @@ counting against the daily and weekly loss caps either way, so a bad grid still 
 times a minute, in tiny size**, and it is the one to pick if what you want is the question *"which
 coin actually makes money?"* answered with numbers instead of opinions.
 
-It is **demo-only**, exactly like `grid` and `pmm`: in `live` mode it places **zero orders** unless
+It is **demo-only**: in `live` mode it places **zero orders** unless
 `allow_live_engines` is explicitly turned on. Leave it off.
 
 ### What it actually does
@@ -486,169 +426,6 @@ The design contract for all of it is `docs/DESIGN-SCALP.md`.
 
 ---
 
-## Portfolio mode: three sleeves at once
-
-Portfolio mode (`portfolio_enabled`, off by default) runs the three methods **at the same time**,
-each with its own slice of capital and its own symbols, so the dashboard can show which one is
-actually working. With it off, nothing changes: the bot runs the single engine selected above,
-exactly as it does today.
-
-A **sleeve** is one method with a budget and an exclusive symbol set. The sleeve key *is* the engine
-name, so there is one sleeve per method: `signal`, `grid`, `pmm`.
-
-**The budget is an accounting boundary, not an exchange one.** Binance holds a single balance; the
-bot enforces the split itself. That is the honest framing to keep in mind: nothing on the exchange
-stops one method from spending another's money, only this code does. It works because two sleeves
-**never share a symbol** - the settings validator rejects an overlap outright, naming both sleeves,
-because otherwise one sleeve would sell inventory the other bought. A base balance on a symbol no
-sleeve owns is reported separately as *unattributed* and is excluded from every sleeve's numbers
-(it still counts in total equity for the global kill switch).
-
-The global survival layer is unchanged and still governs everything: the equity floor and the
-drawdown kill switch use **total** equity, halt every sleeve, and cancel every sleeve's resting
-orders before liquidating anything.
-
-| key | default | notes |
-|---|---|---|
-| `portfolio_enabled` | `false` | off = the single-engine behaviour described above, unchanged |
-| `sleeves` | signal / grid / pmm | per sleeve: `enabled`, `budget_usdt`, `symbols` |
-| `sleeve_reserve_pct` | `5` | percent of total quote held back, never allocated |
-| `sleeve_max_drawdown_pct` | `25` | a sleeve below `budget x (1 - this)` stops opening new exposure |
-| `scanner_enabled` | `true` | |
-| `scanner_refresh_min` | `60` | how often the 24 h ticker is refreshed (weight 80 per refresh) |
-| `scanner_min_quote_vol` | `5000000` | 24 h quote volume floor in USDT - the liquidity filter |
-| `scanner_max_spread_pct` | `0.06` | |
-| `scanner_min_atr_pct` | `0.5` | ATR14 on 15m, percent of price |
-| `scanner_max_atr_pct` | `4.0` | above this is untradeable noise, not opportunity |
-| `scanner_top_n` | `10` | how many rows the scanner card shows |
-| `scanner_exclude` | stablecoin pairs | `USDCUSDT`, `FDUSDUSDT`, `TUSDUSDT`, `BUSDUSDT`, `EURUSDT` |
-
-**What the validator enforces on save** (all of it inline against the offending sleeve): a symbol
-belongs to at most one sleeve; every symbol is upper-case and ends with `quote_asset`; `grid` and
-`pmm` take exactly one symbol each (their engines are single-symbol); the enabled budgets together
-fit inside `total quote x (1 - sleeve_reserve_pct/100)`; and each budget is at least **20x** the
-required size of its symbols - about 118 USDT for a 130 USDT coin with a 5 USDT minimum notional.
-Those last two are what make portfolio mode a **funded-account feature**: three sleeves cannot be
-funded out of 10 USDT, and the validator will say so rather than let you pretend otherwise.
-
-**Per sleeve, per tick:** the sleeves run in a rotating order (persisted in `sleeve_cursor`) so a
-long tick never starves the same sleeve twice; each engine is restricted to its own symbols and to
-its own `available` budget = `max(0, budget + realised - inventory_cost - reserved)`; sells are
-never budget-blocked, because reducing inventory returns capital to the sleeve. A sleeve whose
-equity falls to `budget x (1 - sleeve_max_drawdown_pct/100)` pauses itself - it stops opening new
-exposure while the other sleeves keep trading, which is what makes the comparison safe. You can also
-pause and resume one sleeve by hand from the portfolio card.
-
-### Reading the comparison card
-
-The **Portfolio** card on the dashboard is one row per sleeve. Left to right:
-
-| column | what it means | how to read it |
-|---|---|---|
-| Sleeve | `signal` / `grid` / `pmm` | the sleeve key *is* the method |
-| Symbols | the symbols this sleeve owns | exclusive: no symbol appears twice down the column |
-| Budget | `budget_usdt` from Settings | an accounting figure, not a balance on Binance |
-| Equity | `budget + realised + unrealised` | the sleeve's own mark-to-market |
-| Realised | closed PnL: `positions.pnl_usdt` + `cycles.pnl_usdt` for this engine and mode | the only number that is actually money |
-| Unrealised | `inventory_value - inventory_cost` | at the bid, so it is what you would get if you sold now |
-| PnL % | `(equity - budget) / budget` | the row colour follows its sign |
-| Trades / cycles | signal entries / engine round trips | your sample size - see below |
-| Win rate | wins over closed round trips | meaningless under a few hundred trades |
-| Fees | commission paid by this sleeve | compare it with `Realised`: for `pmm` it usually exceeds it |
-| Used % | `1 - available/budget` | how much of the sleeve's slice is committed |
-| Status | running / paused / drawdown-paused / blocked | `blocked` names the reason (halted, live-blocked, ...) |
-
-Above the table is a row of per-sleeve controls: **Pause** / **Resume** for each sleeve, plus a
-**Re-anchor** button on the grid sleeve. That last one matters in portfolio mode, because the engine
-card that normally carries "Re-anchor grid" is hidden there - without it a grid sleeve that hit its
-range exit could never be resumed from the panel. Below the table the card totals budget, sleeve
-equity, realised and unrealised across the sleeves, and reports the **reserve**, the sleeve drawdown
-threshold and any **unattributed base** - base on a symbol no sleeve owns, which is excluded from
-every sleeve's numbers and still counts in total equity for the global kill switch.
-
-Below the table, the **"best method so far"** line names the leader by *realised* PnL together with
-its sample size, and repeats the caveat in plain words: a handful of trades proves nothing. Treat
-anything under a few hundred closed round trips per sleeve as noise, not as evidence of an edge.
-Unrealised PnL is deliberately **not** used to pick the leader - an open grid ladder can carry a
-large paper gain that a range exit erases.
-
-The three overlaid sparklines under the card are `sleeve_equity`, sampled once per sleeve per tick.
-Read the *shape*, not the endpoint: a sleeve that grinds upward and a sleeve that spikes and gives
-it back can finish the week at the same number.
-
-**The honest caveat about the numbers you will see.** The shipped defaults budget **1000 USDT per
-sleeve** because that is roughly the smallest amount at which three sleeves can each place orders
-that clear Binance's 5 USDT minimum notional with enough room for the dust rule. Results measured at
-that size **do not transfer down**. On a 10 USDT account:
-
-* a 5 USDT minimum notional is half the account, so position sizing, the `0.65 x quoteFree` clamp
-  and the dust rule dominate every decision - the strategy barely gets a vote;
-* the grid cannot hold a ladder at all: `grid_levels x grid_order_usdt` alone exceeds the balance;
-* fixed per-trade costs (0.1 % a side, plus a full step of dust on every buy) are a far larger
-  share of a small ticket, so the same win rate produces a worse expectancy;
-* the validator will refuse the configuration outright rather than let you run a comparison whose
-  result cannot mean anything (each budget must cover about 20 minimum-size orders).
-
-So: portfolio mode is a **funded-account feature**, and a sleeve comparison run at 1000 USDT per
-sleeve tells you nothing about how the same method behaves on 10 USDT. Compare like with like, or
-do not compare at all.
-
-### Moving a symbol between sleeves
-
-Both the **Assign to...** button on the scanner card and the **Settings -> Portfolio** form refuse
-to move a symbol into a sleeve while that symbol still carries inventory booked to a *different*
-engine - open FIFO lots, or resting orders. This is not fussiness: FIFO consumption is scoped to the
-selling engine, so if the `pmm` sleeve were handed a symbol whose lots belong to `grid`, a pmm sale
-would match no lot at all. It would write **no** `cycles` row - the proceeds would simply leave the
-books - while the grid lot's `remaining` never decreased, and the sleeve's unrealised would fall
-permanently until the drawdown pause parked it. Flatten the symbol under the engine that bought it
-first, then move it. Removing a symbol, editing a budget or disabling a sleeve is never blocked.
-
-### The volatility scanner
-
-The scanner ranks USDT pairs by *tradeable* volatility so the sleeves can be pointed at coins that
-actually move. It costs **weight 80** per refresh, so it runs at most every `scanner_refresh_min`
-minutes (hourly by default), never per tick, and never when a tick is already past half its time
-budget.
-
-It keeps spot pairs that end in `quote_asset`, drops the `scanner_exclude` list, leveraged tokens
-(`...UP`, `...DOWN`, `...BULL`, `...BEAR`) and anything not `TRADING`, then scores what is left:
-
-```
-score = atr_pct x liquidity_factor x spread_factor
-```
-
-so volatility alone can never win - an illiquid or wide-spread coin is pushed toward zero, and a
-coin outside the ATR band (too quiet, or untradeable noise) scores zero with the reason recorded.
-A row that fails a gate is **kept and explained** in the `gates` column, not dropped, so the panel
-can tell you why a coin you expected is not eligible.
-
-**Volatility is not one thing: it helps the grid and hurts the market maker.** The same ATR that
-makes a coin a good grid candidate makes it a bad one to quote both sides of:
-
-* **grid** earns from *oscillation*. Higher ATR inside a range means rungs are crossed more often,
-  so more round trips clear the 0.2 % cost. Its enemy is not volatility but **trend** - price
-  walking out of the range, which the range exit bounds.
-* **pmm** earns the *spread* and is short volatility by construction. A fast move fills whichever
-  side of the quote is on the wrong side of it and leaves the maker holding inventory that has
-  already moved against them - the classic adverse-selection loss. At VIP0 fees (0.1 % maker, the
-  same as taker) a 0.01-0.05 % spread does not begin to pay for that, which is why `pmm` is
-  expected to lose money here and is demo-only by default.
-* **signal** wants ATR in a *band*: too quiet and the mean-reversion edge is smaller than the fees,
-  too wild and the stop is hit by noise. That is exactly what `atr_min_pct` / `atr_max_pct` gate.
-
-So do not read the scanner's ranking as one league table. The top of it is where you point the grid
-sleeve; for `pmm` the interesting column is the *spread*, and a top-ranked ATR row is a reason to be
-careful, not a reason to quote it.
-
-**The scanner never reassigns a sleeve's symbols on its own.** It ranks and explains; you apply a
-suggestion with the per-row **Assign to...** button. That assignment is refused - with the reason -
-when another sleeve already owns the symbol, and when the target sleeve still holds inventory
-(open lots, an open position or a resting order), because a silent symbol change under a live grid
-would strand that inventory.
-
----
-
 ## Learning: what the bot records, and what it may change
 
 Learning here is **honest statistics over the bot's own history**, not a model and not alpha. Every
@@ -668,7 +445,7 @@ trades and the same equity curve.
 
 1. **Learning may never increase risk.** It can adjust the score-component weights (`rsi`, `bb`,
    `reversal`, `rsi_up`, `vol`) and the effective entry threshold. It cannot touch position size,
-   stop-loss, take-profit, sleeve budgets or any kill switch - not "we don't call that", but
+   stop-loss, take-profit, the scalp budgets or any kill switch - not "we don't call that", but
    structurally: `lib/Learn.php` writes three `state` keys and nothing else, and never loads the
    config writer at all. The `learn-caps` test snapshots the whole configuration and database,
    runs a recompute on evidence engineered to demand an enormous change, and asserts that the only
@@ -735,7 +512,7 @@ deleted. Beyond that the table is pruned like everything else, so it cannot grow
   loser rides. Every number here is a count, never an extrapolation.
 * **Evidence by engine.** Which engines the window's rows came from. The condition cards pool
   **every** engine into one win rate, while the weight suggestions read **signal-engine rows only** -
-  so a window dominated by grid fills can produce a confident-looking card about conditions the
+  so a window dominated by one coin's fills can produce a confident-looking card about conditions the
   weights will never act on. The row says so in as many words.
 * **Current weights.** Each score component's base points, its learned delta, the resulting points,
   and the cap that applies (±10, and never past the component's own base). Plus when the last
@@ -774,11 +551,10 @@ rate comes from the account.
 
 ## Recommended rollout
 
-0. **Pick the engine first.** The steps below describe the signal engine. `grid` and `pmm` are
-   demo-only until you deliberately set `allow_live_engines`, so step 3 is off the table for them
-   by default - and it should stay off the table for `pmm`, which is expected to lose money at
-   VIP0 fees. See "Engines: signal, grid, pmm" above.
-
+0. **Pick the engine first.** The steps below describe the signal engine. `scalp` has its own
+   section above and is **demo-only by default** - `allow_live_engines` must be switched on
+   before it will place a single live order, and you should not switch it on until the
+   Gross / Fees / Net card has told you whether there is an edge at all.
 1. **Paper for 2 - 4 weeks.** Fills are simulated at the live bid/ask with the configured fee, so
    the numbers are realistic. Watch: win rate, expectancy per trade, total fees versus total PnL,
    the no-trade-reasons histogram (if it is all `atr_low` or `size_unaffordable` your watchlist or
@@ -946,13 +722,13 @@ always sell it by hand on Binance; the next reconciliation will notice.
   age - red "cron not running" after 3 minutes), equity and PnL tiles, API health (clock offset,
   used request weight, last error), the open position with its live stop/target/trailing state, an
   equity sparkline, the watchlist table (filters, required size, ATR, spread, last score and gates),
-  closed positions, a histogram of why no trade was taken in the last 24 hours, and the log tail. When an engine is active the dashboard also shows an **Engine** card (engine, symbol, anchor, distance to each range edge, live order count, inventory and unrealised at bid), an **Open orders** table with a per-order Cancel and **Cancel all orders**, a **Cycles** table with its KPIs, and the **Re-anchor grid** and **Flatten inventory** actions.
-* **Portfolio mode** adds two more cards: a **Portfolio** card (one row per sleeve - symbols,
-  budget, equity, realised and unrealised PnL, trades/cycles, win rate, fees, used %, status -
-  coloured by PnL sign, with the "best method so far" line and its sample-size caveat, three
-  overlaid equity sparklines and a Pause/Resume button per sleeve) and a **Scanner** card (rank,
-  price, 24 h change, ATR %, spread, 24 h quote volume, step value, required size, score, the gates
-  that rejected a row, and an **Assign to...** control per row).
+  closed positions, a histogram of why no trade was taken in the last 24 hours, and the log tail.
+* **With the scalp engine selected** the dashboard also shows a **Scalp engine** card (the
+  Gross / Fees / Net verdict with its trade count and break-even win rate, the per-symbol
+  scoreboard, and open positions with their age in seconds), a **Movers** card (the top 10 by
+  intraday range and 24 h trade count, with the gate that rejected any row), and - once the
+  consecutive-loss breaker trips - a **Scalping is paused** banner with its **Resume scalping**
+  button.
 * **Insights** (`?page=insights`): what the observations say. A header with the totals and, while
   the evidence is thin, a plain sentence saying no conclusion is available yet and roughly how many
   more resolved trades are needed; one card per condition with its bucket table (range, n, win rate
@@ -966,9 +742,9 @@ always sell it by hand on Binance; the next reconciliation will notice.
   the BNB fee-burn toggle and its read-only refresh.
 * **Settings**: every parameter with validation (the take-profit must be at least three times the
   round-trip fee, the stop between 0.2 % and 5 %, symbols must end with the quote asset, ...), the
-  cron command, the cron key, and "Test API connection". The **Portfolio** section holds
-  `portfolio_enabled`, the per-sleeve enabled / budget / symbols fields and the scanner thresholds;
-  a sleeve that fails validation is flagged inline, next to the sleeve at fault.
+  cron command, the cron key, and "Test API connection". The **Scalp engine** section holds its
+  own keys and states the fee arithmetic inline - the win rate the configured target and stop
+  would need just to break even - so a guaranteed loss cannot be configured silently.
 * The dashboard refreshes itself every 20 seconds through `index.php?api=status`.
 
 Sessions expire after 30 minutes of inactivity; five wrong passwords lock the IP for 15 minutes.
@@ -1070,37 +846,31 @@ indicators, the strategy on oversold / overbought / downtrend series, the surviv
 fills, and a complete tick sequence (entry, no double entry on one candle, take-profit, stop-loss,
 kill switch, order reconciliation after a crash or a timeout).
 
-The engines are covered by the same run: `util-tick`, `engine-orders` (place / sync / cancel, a
-fill becomes a lot, a sell consumes lots FIFO into cycles, a repeated sync books nothing twice),
-`engine-grid` (the ladder, a rung round trip earning spacing minus fees, the order cap, range exit
-and re-anchor), `engine-pmm` (both quotes around mid, refresh, inventory skew), `engine-fees`
-(spacing under the fee floor is rejected on save), `engine-guard` (the equity floor and the daily
-cap take the ladder off the book) and `engine-demo-only` (the demo-only rule, proved over a real
-ladder and a real lot, across the tick and every panel action).
+The scalp engine is covered by the same run: `scalp-movers` (deterministic ranking on a fixture;
+stablecoins and leveraged tokens dropped; a thin-trade or wide-spread coin gated rather than
+dropped; a 5 % one-way drift scoring below an 8 % intraday range, which is the whole point of
+scoring range and not 24 h change; a symbol holding a position pinned into the universe even when
+gated; and a feed carrying no trade counts failing OPEN rather than gating the entire exchange),
+`scalp-entry` and `scalp-exit` (every entry condition and all three exits, measured on the bid
+against `entry_eff` - including the case that is +0.25 % on the raw fill but only +0.15 % on
+`entry_eff` and must NOT book a profit the round trip never made), `scalp-pnl` (gross, fees and
+net reconcile per trade and over the run, and gross is never silently equal to net),
+`scalp-guard` (demo-only, the hourly cap, the loop's time budget) and `scalp-config` (the
+break-even warning is a warning and not an error, the bounds hold, an unparseable budget map is
+an error rather than a silent reset).
 
-Portfolio mode adds `sleeve-alloc` (budget arithmetic: available shrinks with inventory cost and
-resting buys and never goes negative, a sell restores it), `sleeve-exclusive` (overlapping symbols
-are a validation error, a sleeve holding inventory refuses a reassignment, `ownerOf` resolves),
-`sleeve-budget-cap` (an engine cannot place an order above `available`, the signal entry size is
-clamped to it, sells are never blocked), `sleeve-drawdown` (a sleeve past its drawdown stops while
-the others keep trading, and the global kill switch still halts everything), `portfolio-tick`
-(three sleeves in one tick each trade only their own symbols, the rotating cursor advances, and the
-time budget skips the rest and records it), `scanner-rank` (deterministic ranking on a fixture,
-stablecoins and leveraged tokens excluded, gates recorded instead of dropped, the ATR band rejected
-at both ends) and `portfolio-off` (with `portfolio_enabled = false` the two runs produce
-byte-identical tables and no sleeve or scanner code runs at all).
+Two groups cover the things that were asked for by name. `scalp-breaker` drives real fills on a
+real paper exchange until three closes lose in a row, then asserts the engine paused itself, that
+a paused poll opens **zero** positions, that the pause survives a new engine instance, that the
+global kill switch still overrides, and that any win resets the counter. `scalp-budget` asserts
+that `available` is never negative or NaN, that one symbol losing its whole pot leaves every other
+symbol untouched, and - the part that matters - gives two symbols the same price path, the same
+window and the same poll, differing only in budget, so that the one with money trades and the one
+without does not.
 
-Three further groups prove the isolation rules the whole design rests on, over real portfolio ticks
-rather than on the validator: `sleeve-no-cross-trade` gives the grid sleeve real inventory in one
-symbol, drives the pmm sleeve all the way through a live sale of its own inventory out of the same
-wallet, and asserts that the pmm sleeve places no order on the grid's symbol, books no lot or cycle
-there, and leaves the grid's lot with every unit it started with - including the direct check that
-FIFO consumption scoped to the wrong engine takes nothing at all. `portfolio-isolation` proves that
-flattening one sleeve's symbol leaves the other sleeve's resting orders live, and that a sleeve
-which aborts the tick still hands the rotating cursor on so the sleeves behind it run next tick.
-`portfolio-range-exit` proves a grid range exit in portfolio mode pauses that grid alone
-(`grid_paused_reason`) and never writes the global `paused_until` / `pause_reason` the other
-sleeves read - while single-engine mode still writes both, unchanged.
+Every gate is tested with a **control** proving the same code path DOES trade when the gate is
+lifted. Without that, "0 orders placed" would be indistinguishable from a test that never reached
+an entry in the first place.
 
 Learning adds ten more: `learn-wilson` (the interval matches known values; k=0 and k=n do not
 divide by zero), `learn-buckets` (edges are inclusive-low / exclusive-high, empty buckets are
@@ -1116,7 +886,7 @@ off makes the same market-data calls and produces the same trades, signals, equi
 proof that `learning_enabled = true` is a safe default) and, above all, `learn-caps`: the safety
 test that snapshots the entire configuration and every table, runs a recompute on evidence
 engineered to demand an enormous change, and asserts that position size, take-profit, stop-loss,
-every sleeve budget and every kill-switch key came back byte-identical, that the only state keys
+every scalp budget and every kill-switch key came back byte-identical, that the only state keys
 written were the learning ones, and that the deltas obey ±10, one component per run and the
 threshold range.
 
@@ -1127,14 +897,6 @@ at its cap, and ten more back-to-back at the same instant - re-checking after **
 that the only state keys that moved were `learn_weights`, `learn_at` and the learn log, that no
 weight ever escaped ±10 or its own base value, that no table other than `state` was written, and
 that every kill-switch key came back byte-identical. Repetition cannot walk a weight past its cap.
-`learn-capture-engine` freezes the engine capture rule: three grid ticks that place rungs and fill
-none write **no** observation at all (counting placements instead of fills would file roughly 300
-unresolvable rows for every one a cycle could close), the tick where a rung actually fills writes
-exactly one `entered` row, the cycle that closes it resolves that same row with
-`exit_reason = 'cycle_closed'` and a hold measured from the **lot's** buy rather than from when the
-observation was written, and a pmm run whose `pmm_refresh_sec` is shorter than the tick gap
-cancels and re-posts its quotes all day without writing a single entry observation.
-
 `learn-evidence` also pins the three ways a sample can look bigger than it is: 55 flat outcomes
 plus 6 decided ones per side is 61 rows a bucket - past the floor if rows were what counted - and
 produces no adjustment; a marginal separation that clears a plain 95 % on its own is reported as
@@ -1187,8 +949,7 @@ It needs no `curl`, no cron job and no API key; `pdo_sqlite` and `json` are enou
 trader/
   index.php      panel        cron.php   tick        config.php  configuration helpers
   lib/           the code     assets/    css + js    tests/      offline tests
-  docs/DESIGN.md the design contract every file follows;  docs/DESIGN-ENGINES.md the same for grid + pmm
-  docs/DESIGN-PORTFOLIO.md  the contract for portfolio mode (sleeves) and the volatility scanner
+  docs/DESIGN.md            the design contract every file follows
   docs/DESIGN-LEARNING.md   the contract for observation capture, evidence and bounded feedback
   docs/DESIGN-SCALP.md      the contract for the scalp engine, the movers board and the per-coin budgets
   data/          runtime (auto-created): config.json (secrets, 0600), trader.sqlite (positions,

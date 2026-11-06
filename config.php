@@ -24,7 +24,7 @@ function trader_config_path(): string
     return trader_data_dir() . '/config.json';
 }
 
-/** Defaults table from DESIGN.md §3 plus DESIGN-ENGINES.md §2 (cron_key is filled with a random value on first use). */
+/** Defaults table from DESIGN.md §3 plus(the removed grid/pmm contract)(cron_key is filled with a random value on first use). */
 function trader_config_defaults(): array
 {
     return [
@@ -68,46 +68,20 @@ function trader_config_defaults(): array
         'recv_window'                 => 10000,
         'timezone'                    => 'UTC',
 
-        // --- engines (docs/DESIGN-ENGINES.md §2). They live here, not only in the panel's
-        //     form fallback, so a config.json written before the engines existed still comes
-        //     back from trader_config() with every key present and correctly typed.
+        // --- engine selection. `signal` trades the watchlist one position at a time; `scalp`
+        //     (docs/DESIGN-SCALP.md) trades many symbols many times a minute.
+        //
+        //     The grid and pmm engines, and portfolio mode with its sleeves and volatility
+        //     scanner, were REMOVED. pmm could not clear a 0.2 % round trip at VIP0 fees, and
+        //     portfolio mode quietly took the tick over from whichever engine was selected - a
+        //     scalp install with `portfolio_enabled` left on ran the sleeves and never the scalp
+        //     loop, which looks exactly like a broken engine and is precisely how it was found.
+        //     Its per-engine budgets are superseded by the scalp engine's own per-symbol budgets
+        //     (DESIGN-SCALP.md §7).
+        //
+        //     `allow_live_engines` stays: it is the demo-only guard the scalp engine runs behind.
         'engine'                      => 'signal',
         'allow_live_engines'          => false,
-        'engine_symbol'               => 'DOGEUSDT',
-        'engine_max_orders'           => 12,
-        'post_only'                   => true,
-        'grid_levels'                 => 6,
-        'grid_spacing_pct'            => 0.60,
-        'grid_order_usdt'             => 1.30,
-        'grid_range_up_pct'           => 4.0,
-        'grid_range_down_pct'         => 6.0,
-        'grid_exit_liquidates'        => false,
-        'pmm_spread_pct'              => 0.25,
-        'pmm_order_usdt'              => 1.30,
-        'pmm_refresh_sec'             => 60,
-        'pmm_target_base_pct'         => 50.0,
-        'pmm_max_base_pct'            => 80.0,
-
-        // --- portfolio mode (docs/DESIGN-PORTFOLIO.md §2). Same reason as the engine keys:
-        //     a config.json written before portfolio mode existed still comes back complete.
-        //     `sleeves` is a nested map, so trader_config_merge() normalises it separately
-        //     (trader_config_cast() only handles flat lists).
-        'portfolio_enabled'           => false,
-        'sleeve_reserve_pct'          => 5.0,
-        'sleeve_max_drawdown_pct'     => 25.0,
-        'scanner_enabled'             => true,
-        'scanner_refresh_min'         => 60,
-        'scanner_min_quote_vol'       => 5000000.0,
-        'scanner_max_spread_pct'      => 0.06,
-        'scanner_min_atr_pct'         => 0.5,
-        'scanner_max_atr_pct'         => 4.0,
-        'scanner_top_n'               => 10,
-        'scanner_exclude'             => ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'EURUSDT'],
-        'sleeves'                     => [
-            'signal' => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['SOLUSDT', 'ETHUSDT']],
-            'grid'   => ['enabled' => true,  'budget_usdt' => 1000.0, 'symbols' => ['DOGEUSDT']],
-            'pmm'    => ['enabled' => false, 'budget_usdt' => 1000.0, 'symbols' => ['XRPUSDT']],
-        ],
 
         // --- learning (docs/DESIGN-LEARNING.md §5) plus the §7 BNB warning threshold. Same
         //     reason as the engine and portfolio keys: a config.json written before learning
@@ -211,50 +185,6 @@ function trader_config_budgets($value, array $default): array
 }
 
 /**
- * Normalise the nested `sleeves` map of DESIGN-PORTFOLIO.md §2 to
- * [engine => ['enabled'=>bool,'budget_usdt'=>float,'symbols'=>string[]]].
- * Unknown engine keys are kept (Risk::validateConfig() reports them); scalars are coerced.
- */
-function trader_config_sleeves($value, array $default): array
-{
-    if (!is_array($value)) {
-        return $default;
-    }
-    $out = [];
-    foreach ($value as $engine => $sleeve) {
-        $engine = strtolower(trim((string) $engine));
-        if ($engine === '' || !is_array($sleeve)) {
-            continue;
-        }
-        $symbols = [];
-        $raw = isset($sleeve['symbols']) ? $sleeve['symbols'] : [];
-        if (is_string($raw)) {
-            $parts = preg_split('/[\s,;]+/', $raw);
-            $raw = $parts === false ? [] : $parts;
-        }
-        if (is_array($raw)) {
-            foreach ($raw as $sym) {
-                if (!is_scalar($sym)) {
-                    continue;
-                }
-                $sym = strtoupper(trim((string) $sym));
-                if ($sym !== '' && !in_array($sym, $symbols, true)) {
-                    $symbols[] = $sym;
-                }
-            }
-        }
-        $budget = isset($sleeve['budget_usdt']) && is_numeric($sleeve['budget_usdt'])
-            ? (float) $sleeve['budget_usdt'] : 0.0;
-        $out[$engine] = [
-            'enabled'     => trader_config_cast(isset($sleeve['enabled']) ? $sleeve['enabled'] : false, false),
-            'budget_usdt' => $budget < 0.0 ? 0.0 : $budget,
-            'symbols'     => $symbols,
-        ];
-    }
-    return $out === [] ? $default : $out;
-}
-
-/**
  * Create data/ (0750) and data/.htaccess when missing. Returns the directory.
  * @throws RuntimeException when the directory cannot be created
  */
@@ -323,9 +253,7 @@ function trader_config_merge(array $cfg): array
 {
     $out = trader_config_defaults();
     foreach ($cfg as $k => $v) {
-        if ($k === 'sleeves') {
-            $out['sleeves'] = trader_config_sleeves($v, $out['sleeves']);
-        } elseif ($k === 'scalp_budgets') {
+        if ($k === 'scalp_budgets') {
             $out['scalp_budgets'] = trader_config_budgets($v, $out['scalp_budgets']);
         } elseif (array_key_exists($k, $out)) {
             $out[$k] = trader_config_cast($v, $out[$k]);
@@ -335,6 +263,21 @@ function trader_config_merge(array $cfg): array
     }
     $out['quote_asset'] = strtoupper(trim((string) $out['quote_asset']));
     $out['symbols'] = array_values(array_unique(array_map('strtoupper', $out['symbols'])));
+    // MIGRATION. The grid and pmm engines were removed, and so was portfolio mode. A config.json
+    // saved while one of them was selected must not leave the bot pointing at an engine that no
+    // longer exists - Risk::engineName() would fall back to `signal` silently and the user would
+    // never be told why their engine changed. Rewrite it here, once, and leave a breadcrumb in
+    // `engine_migrated_from` so the panel can say so.
+    $engine = strtolower(trim((string) ($out['engine'] ?? 'signal')));
+    if ($engine === 'grid' || $engine === 'pmm') {
+        $out['engine_migrated_from'] = $engine;
+        $out['engine'] = 'signal';
+    }
+    // Portfolio mode used to take the tick over from whichever engine was selected, so leaving a
+    // stale `portfolio_enabled` in the file would do nothing now but confuse anyone reading it.
+    unset($out['portfolio_enabled'], $out['sleeves'], $out['sleeve_reserve_pct'],
+          $out['sleeve_max_drawdown_pct']);
+
     $out['mode'] = strtolower(trim((string) $out['mode']));
     if (!in_array($out['mode'], ['paper', 'demo', 'testnet', 'live'], true)) {
         $out['mode'] = 'paper';
