@@ -714,7 +714,7 @@ final class Bot
             }
             $value  = $price > 0.0 ? $total * $price : 0.0;
             $minNotional = (float) ($info['minNotional'] ?? 0.0);
-            $row = ['symbol' => $sym, 'base' => $base, 'free' => $free, 'total' => $total, 'price' => $price, 'value' => $value, 'tracked' => isset($tracked[$sym]), 'untracked_big' => false];
+            $row = ['symbol' => $sym, 'base' => $base, 'free' => $free, 'total' => $total, 'price' => $price, 'value' => $value, 'tracked' => isset($tracked[$sym]), 'untracked' => false, 'untracked_big' => false];
             if ($total > 0.0 && $price > 0.0) {
                 if (isset($tracked[$sym])) {
                     $pq = (float) $tracked[$sym]['qty'];
@@ -726,9 +726,10 @@ final class Bot
                     $posValue += $value;
                 } else {
                     $dustValue += $value;
-                    if ($minNotional > 0.0 && $value >= $minNotional) {
-                        $row['untracked_big'] = true;
-                    }
+                    // Whether this is big enough to HALT on cannot be decided here: the floor
+                    // scales with equity, and equity is only complete once this loop has summed
+                    // every position and every crumb. Mark it a candidate and settle it below.
+                    $row['untracked'] = true;
                 }
                 if (!$isEngine && $minNotional > 0.0 && $value >= $minNotional) {
                     $hasBase = true;
@@ -736,10 +737,25 @@ final class Bot
             }
             $bases[$sym] = $row;
         }
+
+        // Second pass: now that equity is known, decide which untracked balances are actually
+        // worth halting over. See untrackedHaltFloor() - minNotional is a property of the SYMBOL,
+        // so on its own it let 1.15 USDT of leftover DOGE shut down a 5000 USDT account.
+        $equity = $qFree + $qLocked + $posValue + $dustValue;
+        foreach ($bases as $sym => $row) {
+            if (empty($row['untracked'])) {
+                continue;
+            }
+            $mn = isset($this->info[$sym]['minNotional']) ? (float) $this->info[$sym]['minNotional'] : 0.0;
+            if ($mn > 0.0 && (float) $row['value'] >= $this->untrackedHaltFloor($mn, $equity)) {
+                $bases[$sym]['untracked_big'] = true;
+            }
+        }
+
         return [
             'quote_free'        => $qFree,
             'quote_total'       => $qFree + $qLocked,
-            'equity'            => $qFree + $qLocked + $posValue + $dustValue,
+            'equity'            => $equity,
             'position_value'    => $posValue,
             'dust_value'        => $dustValue,
             'exchange_has_base' => $hasBase,
@@ -747,13 +763,66 @@ final class Bot
         ];
     }
 
+    /**
+     * The value an UNTRACKED base balance has to reach before it halts the bot.
+     *
+     * `max(minNotional, untracked_halt_pct % of equity)`.
+     *
+     * minNotional alone is the wrong test once the account is more than tiny. It is a property of
+     * the SYMBOL, not of the account: DOGEUSDT's is 1.00 USDT, so 1.15 USDT of leftover DOGE -
+     * 0.02 % of a 5000 USDT account - would halt all trading, repeatedly, and "Reset halt" could
+     * not clear it because the next tick re-checked the same wallet. That is not a safety
+     * mechanism doing its job, it is a crumb switching the bot off.
+     *
+     * Scaling by equity keeps the protection EXACTLY as strict as it was wherever it mattered and
+     * only relaxes it where it never did:
+     *
+     *   - at 10 USDT equity the floor is max(5.00, 0.05) = 5.00 - minNotional still governs,
+     *     byte for byte the old behaviour on the account this bot was designed for;
+     *   - at 5000 USDT it is max(5.00, 25.00) = 25.00, so crumbs are ignored and a genuinely
+     *     unexplained position still halts the moment it is worth noticing.
+     *
+     * The thing this check exists to catch - something trading the account behind the bot's back,
+     * or a position it lost track of - is a position of real size, and real size scales with the
+     * account. A fixed 1 USDT trigger catches only dust.
+     *
+     * `untracked_halt_pct` (default 0.5) tunes it; 0 restores the old minNotional-only rule
+     * exactly. The floor is never BELOW minNotional, so this can only ever relax, never tighten,
+     * and it cannot be set to something that halts on an amount too small to sell.
+     */
+    private function untrackedHaltFloor(float $minNotional, float $equity): float
+    {
+        $pct = isset($this->cfg['untracked_halt_pct']) && is_numeric($this->cfg['untracked_halt_pct'])
+            ? (float) $this->cfg['untracked_halt_pct']
+            : 0.5;
+        if (!is_finite($pct) || $pct <= 0.0) {
+            return $minNotional;                        // explicitly opted out of the scaling
+        }
+        // THIS tick's equity, passed in by the caller - never db->lastEquity(). reconcileBalances()
+        // runs at step 2 and the equity row is not written until step 3, so on a fresh database
+        // the stored value does not exist yet and every first tick would silently fall back to
+        // the bare minNotional. That is exactly the bug this method exists to fix, so reading it
+        // from the database would have made the whole thing a no-op on the one run that matters.
+        if (!is_finite($equity) || $equity <= 0.0) {
+            return $minNotional;
+        }
+        $scaled = $equity * $pct / 100.0;
+        return $scaled > $minNotional ? $scaled : $minNotional;
+    }
+
     /** Untracked base balance ⇒ HALT; OPEN position whose base is gone ⇒ CLOSED reconciled_missing. */
     private function reconcileBalances(array $acct, array $bal): void
     {
         foreach ($bal['bases'] as $sym => $row) {
             if (!empty($row['untracked_big'])) {
-                Log::error('reconcile: untracked ' . $row['base'] . ' balance worth ' . Util::money((float) $row['value']) . ' ' . $this->cfg['quote_asset'] . ' with no tracked position - halting', [
+                $floor = $this->untrackedHaltFloor((float) ($this->info[$sym]['minNotional'] ?? 0.0),
+                    isset($bal['equity']) ? (float) $bal['equity'] : 0.0);
+                Log::error('reconcile: untracked ' . $row['base'] . ' balance worth '
+                    . Util::money((float) $row['value']) . ' ' . $this->cfg['quote_asset']
+                    . ' with no tracked position (halt floor ' . Util::money($floor) . ') - halting'
+                    . ' | SELL that balance at MARKET on the exchange, then press "Reset halt"', [
                     'symbol' => $sym, 'balance' => $row['total'], 'price' => $row['price'],
+                    'value' => $row['value'], 'halt_floor' => $floor,
                 ]);
                 $this->halt('untracked_position');
                 $this->notes[] = 'HALT untracked_position ' . $sym;

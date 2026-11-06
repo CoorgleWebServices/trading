@@ -5312,6 +5312,71 @@ T::group('panel-csp', ['Panel'], static function (): void {
         . 'assertions above extended to cover it', T::dump($emitters));
 });
 
+T::group('untracked-halt-floor', ['Bot', 'PaperExchange', 'FakeMarketData', 'Db'], static function (): void {
+    // The survival layer halts on a base balance it has no position row for. The threshold used
+    // to be the SYMBOL's minNotional alone, which is wrong once the account is more than tiny:
+    // DOGEUSDT's is 1.00 USDT, so 1.15 USDT of leftover DOGE halted a 5000 USDT account on every
+    // single tick, and "Reset halt" could not clear it because the next tick re-read the same
+    // wallet. It is now max(minNotional, `untracked_halt_pct` % of equity).
+    $run = static function (float $start, float $dogeQty, $pct = null): array {
+        $db   = freshDb('untracked-' . (int) $start . '-' . (int) ($dogeQty * 100) . '-' . (string) $pct);
+        $info = ['DOGEUSDT' => array_merge(FakeMarketData::SYMBOL_INFO['DOGEUSDT'],
+            ['quote' => 'USDT', 'status' => 'TRADING', 'spotAllowed' => true])];
+        $md = new FakeMarketData();
+        $md->setSymbolInfo('DOGEUSDT', $info['DOGEUSDT']);
+        $md->setPrice('DOGEUSDT', 0.0883, 0.0884, 0.0883);
+        $ex = new PaperExchange($md, $db, 0.1, $start);
+        // untracked coins in the wallet, exactly like leftovers sitting on the exchange
+        $r = new ReflectionProperty('PaperExchange', 'balances');
+        $r->setAccessible(true);
+        $b = $r->getValue($ex);
+        $b['DOGE'] = $dogeQty;
+        $r->setValue($ex, $b);
+        $over = ['engine' => 'signal', 'mode' => 'paper', 'enabled' => true,
+                 'symbols' => ['DOGEUSDT'], 'paper_start_usdt' => $start];
+        if ($pct !== null) {
+            $over['untracked_halt_pct'] = $pct;
+        }
+        $cfg = function_exists('trader_config_merge') ? trader_config_merge($over) : $over;
+        (new Bot($cfg, $db, $ex))->tick();
+        return [(string) $db->getState('halted', '0'), (string) $db->getState('halt_reason', '')];
+    };
+
+    // 13 DOGE at 0.0883 = 1.15 USDT. minNotional is 1.00, so the OLD rule halted on this.
+    list($h10) = $run(10.0, 13.0);
+    T::eq('1', $h10, 'on a 10 USDT account 1.15 USDT of untracked DOGE still halts - at that size '
+        . 'the floor is max(1.00, 0.05) = minNotional, so the old behaviour is unchanged exactly '
+        . 'where it was right');
+
+    list($h5000, $why5000) = $run(5000.0, 13.0);
+    T::eq('0', $h5000, 'on a 5000 USDT account the same 1.15 USDT does NOT halt: the floor is '
+        . 'max(1.00, 25.00) = 25.00. This is the bug that shut the bot down every tick and could '
+        . 'not be cleared by Reset halt', $why5000);
+
+    // ... but a position of real size on the same account still halts: the check keeps its teeth
+    list($hBig) = $run(5000.0, 400.0);          // 400 DOGE = ~35 USDT, over the 25 USDT floor
+    T::eq('1', $hBig, 'a 35 USDT untracked position on the same 5000 USDT account DOES halt - '
+        . 'the point was to ignore crumbs, not to stop noticing real ones');
+
+    // the escape hatch restores the old rule byte for byte
+    list($hOff) = $run(5000.0, 13.0, 0);
+    T::eq('1', $hOff, 'untracked_halt_pct = 0 restores the minNotional-only rule exactly');
+
+    // and a small account is not quietly loosened by the percentage either
+    list($hSmall) = $run(10.0, 70.0);           // 70 DOGE = ~6.2 USDT on a 10 USDT account
+    T::eq('1', $hSmall, 'a 6.2 USDT untracked balance on a 10 USDT account halts, as it always did');
+
+    // the floor can only ever relax, never tighten: even an absurd percentage cannot push the
+    // trigger below minNotional, which would halt on an amount too small to sell
+    list($hTiny) = $run(10.0, 13.0, 5.0);
+    T::eq('1', $hTiny, 'at the maximum 5 % the floor on a 10 USDT account is still minNotional '
+        . '(max(1.00, 0.50)), so it cannot be configured to halt on an unsellable crumb');
+
+    list($cfg, $errs) = Risk::validateConfig(['untracked_halt_pct' => 50.0], ['untracked_halt_pct' => 0.5]);
+    T::ok($errs !== [], 'the percentage is bounded, so it cannot be set so high that a real '
+        . 'unexplained position goes unnoticed', T::dump($errs));
+});
+
 /* ============================================================ summary */
 
 echo "\n" . T::$pass . ' passed, ' . T::$fail . ' failed'

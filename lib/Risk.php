@@ -552,6 +552,9 @@ final class Risk
             'learn_recompute_hours'       => ['i', 1, 8760],
             'learn_window_days'           => ['i', 1, 3650],
             'bnb_min_balance'             => ['f', 0.0, 100000.0],
+            // 0 = the old minNotional-only rule; capped at 5 % so this can never be set so high
+            // that a genuinely unexplained position goes unnoticed.
+            'untracked_halt_pct'          => ['f', 0.0, 5.0],
             // scalp engine (DESIGN-SCALP.md §6). The bounds are the engine's own hard limits,
             // so a value accepted here is one Scalper and Movers will actually honour rather
             // than silently clamp - except where the clamp IS the safety rule, which is the

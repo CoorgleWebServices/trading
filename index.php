@@ -665,6 +665,7 @@ function handle_bnb_action(string $action, array $cfg, Db $db): void
 function settings_keys(): array
 {
     return ['mode', 'enabled', 'api_key', 'api_secret', 'symbols', 'quote_asset', 'trade_usdt', 'equity_floor_usdt', 'hwm_drawdown_pct',
+        'untracked_halt_pct',
         'daily_loss_cap_pct', 'weekly_loss_cap_pct', 'max_trades_per_day', 'max_orders_per_hour', 'max_consecutive_losses',
         'cooldown_after_loss_min', 'cooldown_after_2_losses_min', 'take_profit_pct', 'take_profit_max_pct', 'stop_loss_pct',
         'trailing_activate_pct', 'trailing_distance_pct', 'trailing_floor_pct', 'max_hold_minutes', 'entry_threshold', 'adaptive',
@@ -1759,6 +1760,8 @@ function page_settings(array $cfg, Db $db, array $v, array $errors, string $test
     $h .= '<fieldset><legend>Sizing &amp; kill switches</legend><div class="grid3">';
     $h .= panel_input('trade_usdt', $v, 'Trade size (quote)', 'number', 'target quote per entry; actual = min(trade, 65 % of free)');
     $h .= panel_input('equity_floor_usdt', $v, 'Equity floor (KILL)', 'number', 'equity ≤ floor ⇒ close, halt, manual reset');
+    $h .= panel_input('untracked_halt_pct', $v, 'Untracked-balance halt %', 'number',
+        'a coin with no position row halts the bot once it is worth max(minNotional, this % of equity); 0 = minNotional alone');
     $h .= panel_input('hwm_drawdown_pct', $v, 'HWM drawdown % (KILL)', 'number', 'equity < HWM × (1 − pct) ⇒ same as floor');
     $h .= panel_input('daily_loss_cap_pct', $v, 'Daily loss cap %', 'number', 'of day-start equity');
     $h .= panel_input('weekly_loss_cap_pct', $v, 'Weekly loss cap %', 'number', 'rolling 7 days ⇒ 7-day pause');

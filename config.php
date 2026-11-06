@@ -96,6 +96,18 @@ function trader_config_defaults(): array
         'learn_window_days'           => 90,
         'bnb_min_balance'             => 1.0,
 
+        // How big an UNTRACKED base balance has to be, as a percent of equity, before the
+        // survival layer halts on `untracked_position`. The real floor is
+        // max(minNotional, this % of equity), so it can only ever RELAX the old minNotional-only
+        // rule, never tighten it. 0 restores that rule exactly.
+        //
+        // This exists because minNotional is a property of the symbol, not of the account:
+        // DOGEUSDT's is 1.00 USDT, so 1.15 USDT of leftover DOGE halted a 5000 USDT account
+        // every single tick, and "Reset halt" could not clear it because the next tick re-read
+        // the same wallet. At 0.5 % a 10 USDT account is unchanged (minNotional still governs)
+        // and a 5000 USDT account ignores crumbs under 25 USDT.
+        'untracked_halt_pct'          => 0.5,
+
         // --- scalp engine (docs/DESIGN-SCALP.md §6): fast, many-symbol micro-trading. Same
         //     reason as the engine and portfolio keys - a config.json written before the scalp
         //     engine existed still comes back from trader_config() complete and typed.
