@@ -1,0 +1,349 @@
+<div id="italia-track">
+
+<style>
+#italia-track {
+ font-family:Inter,Arial,sans-serif;
+ background:#f3f5f8;
+ color:#25364b;
+ padding:40px 16px;
+ border-radius:10px;
+}
+#italia-track * {box-sizing:border-box}
+#italia-track .container {max-width:900px;margin:auto}
+#italia-track .heading {text-align:center;margin-bottom:28px}
+#italia-track .heading h1 {font-size:34px;font-weight:800;color:#172e4a;margin:0 0 10px}
+#italia-track .heading p {font-size:14px;color:#8793a2}
+#italia-track .eyebrow {font-size:10px;letter-spacing:2px;font-weight:800;color:#315f91;margin-bottom:13px}
+#italia-track .demo {display:inline-block;background:#fff0d8;color:#93600e;padding:7px 12px;border-radius:20px;font-size:9px;font-weight:800;letter-spacing:1px;margin-bottom:15px}
+#italia-track .search {background:white;padding:23px;border:1px solid #e6eaf0;border-radius:10px;margin-bottom:20px}
+#italia-track label {font-size:12px;font-weight:750;display:block;margin-bottom:10px}
+#italia-track .search-row {display:flex;gap:10px}
+#italia-track input {width:100%;min-width:0;padding:15px;border:1px solid #dce2eb;border-radius:6px;font-size:14px;outline:none}
+#italia-track input:focus {border-color:#285a8e}
+#italia-track button {background:#193f68;color:white;border:0;padding:0 25px;border-radius:6px;font-weight:700;cursor:pointer}
+#italia-track button:hover {background:#102c4c}
+#italia-track .error {display:none;color:#b33333;font-size:12px;margin-top:10px}
+#italia-track .panel {background:white;border:1px solid #e6eaf0;border-radius:10px;padding:26px;margin-bottom:17px}
+#italia-track .topline {display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap}
+#italia-track .muted {font-size:10px;letter-spacing:1px;font-weight:800;color:#8591a1}
+#italia-track .tracking-id {font-size:22px;font-weight:800;color:#172d49;margin-top:7px;overflow-wrap:anywhere}
+#italia-track .status {font-size:11px;background:#fff2dc;color:#9a650c;border-radius:30px;padding:10px 14px;font-weight:800}
+#italia-track .route {background:#f7f9fc;padding:23px;border-radius:8px;margin:25px 0;display:grid;grid-template-columns:1fr 1fr}
+#italia-track .destination {text-align:right}
+#italia-track .city {font-size:23px;font-weight:800;color:#193a5d;margin:7px 0}
+#italia-track .country {font-size:12px;color:#8793a3}
+#italia-track .route-line {height:2px;background:#dce4ee;position:relative;grid-column:1/-1;margin:24px 0}
+#italia-track .route-line:after {content:"✈";position:absolute;left:50%;transform:translateX(-50%);top:-15px;background:#f7f9fc;padding:4px 12px;color:#285b8c;font-size:20px}
+#italia-track .route-label {text-align:center;font-size:10px;color:#8793a3;letter-spacing:1px;grid-column:1/-1}
+#italia-track .delivery {display:flex;justify-content:space-between;align-items:center;gap:10px;background:#edf5fc;padding:19px;border-radius:7px;flex-wrap:wrap}
+#italia-track .delivery strong {display:block;font-size:20px;color:#194b7d;margin-top:6px}
+#italia-track .delivery small {font-size:11px;color:#71849b}
+#italia-track .info-grid {display:grid;grid-template-columns:1fr 1fr;gap:15px;margin-top:22px}
+#italia-track .info {border-bottom:1px solid #edf0f4;padding-bottom:12px}
+#italia-track .info span {display:block;font-size:10px;color:#8793a3;letter-spacing:.7px;margin-bottom:6px}
+#italia-track .info strong {font-size:13px;color:#31445b}
+#italia-track .section-title {font-size:17px;color:#1b3553;margin:4px 0 22px;font-weight:750}
+#italia-track .event {display:flex;gap:17px;position:relative;padding-bottom:27px}
+#italia-track .event:not(:last-child):before {content:"";position:absolute;left:8px;top:19px;bottom:0;width:2px;background:#dce4ed}
+#italia-track .dot {width:18px;height:18px;border-radius:50%;background:#dce4ed;border:4px solid white;box-shadow:0 0 0 1px #cbd5e1;flex-shrink:0;z-index:1}
+#italia-track .done .dot {background:#2a9870;box-shadow:0 0 0 1px #2a9870}
+#italia-track .current .dot {background:#e4a52e;box-shadow:0 0 0 3px #ffedc9}
+#italia-track .event h4 {font-size:14px;color:#263d57;margin:0 0 6px;line-height:1.5}
+#italia-track .event p {font-size:12px;color:#8290a0;line-height:1.65;margin:0}
+#italia-track .event .date {font-size:11px;color:#72839a;margin-top:7px}
+#italia-track .tag {font-size:9px;letter-spacing:.7px;font-weight:800;color:white;background:#2b906e;padding:5px 8px;border-radius:3px;margin-left:7px;vertical-align:2px;display:inline-block}
+#italia-track .current .tag {background:#d59420}
+#italia-track .intelligence {background:#172c46;color:white;border-radius:10px;padding:24px;margin-bottom:20px}
+#italia-track .intelligence h3 {color:white;font-size:17px;margin:10px 0 20px}
+#italia-track .intel-grid {display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+#italia-track .intel-item {border-bottom:1px solid #ffffff22;padding-bottom:12px}
+#italia-track .intel-item span {display:block;font-size:9px;color:#a9bbcf;letter-spacing:1px;margin-bottom:7px}
+#italia-track .intel-item strong {font-size:13px;color:white;overflow-wrap:anywhere}
+#italia-track .doc-table {width:100%;border-collapse:collapse;font-size:12px}
+#italia-track .doc-table td {padding:12px 5px;border-bottom:1px solid #edf0f4}
+#italia-track .doc-table td:last-child {text-align:right;color:#536a82;font-family:monospace}
+#italia-track .demo-label {font-size:9px;color:#bd8b39;letter-spacing:1px;font-weight:800;margin-bottom:8px}
+#italia-track .notice {font-size:10px;color:#9aa4b1;text-align:center;line-height:1.8;margin-top:20px}
+
+/* Restricted (grayed-out) sections */
+#italia-track .restricted {background:#f4f6f9;border:1px dashed #cfd7e2;color:#9aa5b3}
+#italia-track .restricted .section-title {color:#9aa5b3;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+#italia-track .lock {font-size:9px;letter-spacing:1px;font-weight:800;background:#e3e8ef;color:#7d8a9b;padding:6px 10px;border-radius:20px}
+#italia-track .mask-row {display:flex;justify-content:space-between;gap:12px;padding:13px 0;border-bottom:1px solid #e6ebf1}
+#italia-track .bar {height:10px;border-radius:5px;background:#dfe5ec}
+#italia-track .restricted p.note {font-size:11px;line-height:1.7;margin:16px 0 0;color:#9aa5b3}
+
+@media(max-width:600px) {
+ #italia-track {padding:27px 11px}
+ #italia-track .heading h1 {font-size:27px}
+ #italia-track .panel {padding:19px}
+ #italia-track .search-row {flex-direction:column}
+ #italia-track button {padding:14px}
+ #italia-track .city {font-size:19px}
+ #italia-track .info-grid {gap:12px}
+ #italia-track .intel-grid {grid-template-columns:repeat(2,1fr)}
+}
+</style>
+
+<div class="container">
+
+ <div class="heading">
+  <div class="eyebrow">INTERNATIONAL LOGISTICS NETWORK</div>
+  <div class="demo">DEMO TRACKING ENVIRONMENT</div>
+  <h1>Track Your Shipment</h1>
+  <p>International cargo visibility · Origin to destination</p>
+ </div>
+
+ <div class="search">
+  <label for="it-number">ENTER YOUR TRACKING NUMBER</label>
+  <div class="search-row">
+   <input id="it-number" placeholder="Enter tracking number" autocomplete="off" inputmode="numeric">
+   <button type="button" id="it-search">Track Shipment</button>
+  </div>
+  <div class="error" id="it-error">Tracking reference not found. Please check the number.</div>
+ </div>
+
+ <div id="it-result" style="display:none">
+
+  <!-- SHIPMENT SUMMARY -->
+  <div class="panel">
+   <div class="topline">
+    <div>
+     <div class="muted">SHIPMENT REFERENCE</div>
+     <div class="tracking-id" id="it-id"></div>
+    </div>
+    <div class="status">● IN TRANSIT · INSPECTION</div>
+   </div>
+
+   <div class="route">
+    <div>
+     <div class="muted">ORIGIN</div>
+     <div class="city">Florence</div>
+     <div class="country">Italy · IT</div>
+    </div>
+    <div class="destination">
+     <div class="muted">DESTINATION</div>
+     <div class="city">Bangalore</div>
+     <div class="country">India · IN</div>
+    </div>
+    <div class="route-line"></div>
+    <div class="route-label">AIR FREIGHT · ITALY → DUBAI → BENGALURU</div>
+   </div>
+
+   <div class="delivery">
+    <div>
+     <small>ESTIMATED DELIVERY DATE</small>
+     <strong>27 November 2026</strong>
+    </div>
+    <div style="font-size:27px">✈️</div>
+   </div>
+
+   <div class="info-grid">
+    <div class="info"><span>COMMODITY</span><strong>Commercial Coffee Machines</strong></div>
+    <div class="info"><span>TRANSPORT MODE</span><strong>International Air Cargo</strong></div>
+    <div class="info"><span>ORIGIN FACILITY</span><strong>Florence, Italy</strong></div>
+    <div class="info"><span>EXPORT AIRPORT</span><strong>Milan Malpensa · MXP</strong></div>
+    <div class="info"><span>TRANSIT AIRPORT</span><strong>Dubai International · DXB</strong></div>
+    <div class="info"><span>DESTINATION AIRPORT</span><strong>Bengaluru · BLR</strong></div>
+    <div class="info"><span>DISPATCH DATE</span><strong>13 November 2026</strong></div>
+    <div class="info"><span>DELIVERY SERVICE</span><strong>Heavy Cargo Handling</strong></div>
+   </div>
+  </div>
+
+  <!-- CARGO INTELLIGENCE -->
+  <div class="panel">
+   <div class="section-title">Cargo &amp; Documentation Intelligence</div>
+
+   <div class="intelligence">
+    <div class="demo-label">SIMULATED CARGO RECORD</div>
+    <h3>Commercial Coffee Equipment</h3>
+    <div class="intel-grid">
+     <div class="intel-item"><span>COMMODITY</span><strong>Espresso Coffee Machines</strong></div>
+     <div class="intel-item"><span>SHIPMENT MODE</span><strong>Priority Air Freight</strong></div>
+     <div class="intel-item"><span>PACKAGE COUNT</span><strong>02 Heavy Cartons</strong></div>
+     <div class="intel-item"><span>GROSS WEIGHT</span><strong>182.00 KG</strong></div>
+     <div class="intel-item"><span>BOX 01 WEIGHT</span><strong>90.80 KG</strong></div>
+     <div class="intel-item"><span>BOX 02 WEIGHT</span><strong>91.20 KG</strong></div>
+     <div class="intel-item"><span>PACKAGING</span><strong>Industrial Export Cartons</strong></div>
+     <div class="intel-item"><span>HANDLING</span><strong>Fragile / Heavy Cargo</strong></div>
+     <div class="intel-item"><span>ORIGIN CODE</span><strong>IT / FLO</strong></div>
+     <div class="intel-item"><span>TRANSIT CODE</span><strong>AE / DXB</strong></div>
+     <div class="intel-item"><span>DESTINATION CODE</span><strong>IN / BLR</strong></div>
+     <div class="intel-item"><span>PACKING STATUS</span><strong>Export Prepared</strong></div>
+    </div>
+   </div>
+
+   <h3 style="font-size:14px;color:#263d57;margin-bottom:12px">Masked Documentation References</h3>
+   <table class="doc-table">
+    <tr><td>Master AWB</td><td>176-****8294</td></tr>
+    <tr><td>House AWB</td><td>ITF-****-7281</td></tr>
+    <tr><td>Export Reference</td><td>IT-EX-****4912</td></tr>
+    <tr><td>Transit Manifest</td><td>DXB-****8820</td></tr>
+    <tr><td>Security Reference</td><td>SEC-****1937</td></tr>
+    <tr><td>Internal Cargo ID</td><td>CGO-****-6128</td></tr>
+    <tr><td>Record Fingerprint</td><td>DEMO-7A3F-91C2</td></tr>
+   </table>
+  </div>
+
+  <!-- LOGISTICS HANDOVER (restricted) -->
+  <div class="panel restricted" aria-label="Restricted section">
+   <div class="section-title">
+    <span>Logistics Custody &amp; Partner Handover</span>
+    <span class="lock">🔒 RESTRICTED</span>
+   </div>
+   <div class="mask-row"><div class="bar" style="width:38%"></div><div class="bar" style="width:22%"></div></div>
+   <div class="mask-row"><div class="bar" style="width:46%"></div><div class="bar" style="width:18%"></div></div>
+   <div class="mask-row"><div class="bar" style="width:31%"></div><div class="bar" style="width:25%"></div></div>
+   <div class="mask-row"><div class="bar" style="width:42%"></div><div class="bar" style="width:20%"></div></div>
+   <p class="note">Partner handover details are not available for public viewing.</p>
+  </div>
+
+  <!-- CUSTOMS (restricted) -->
+  <div class="panel restricted" aria-label="Restricted section">
+   <div class="section-title">
+    <span>Customs &amp; Import Processing</span>
+    <span class="lock">🔒 RESTRICTED</span>
+   </div>
+   <div class="mask-row"><div class="bar" style="width:34%"></div><div class="bar" style="width:20%"></div></div>
+   <div class="mask-row"><div class="bar" style="width:40%"></div><div class="bar" style="width:16%"></div></div>
+   <div class="mask-row"><div class="bar" style="width:28%"></div><div class="bar" style="width:22%"></div></div>
+   <p class="note">Customs information is not available for public viewing.</p>
+  </div>
+
+  <!-- TIMELINE -->
+  <div class="panel">
+   <div class="section-title">Detailed Shipment Tracking History</div>
+
+   <div class="event done"><div class="dot"></div><div>
+    <h4>Shipment Collected from Manufacturer</h4>
+    <p>Commercial coffee machines released from the Italian manufacturing and dispatch facility. Serial number recording, packaging and export preparation.</p>
+    <div class="date">13 Nov 2026 · 10:35 AM · Florence, Italy</div>
+   </div></div>
+
+   <div class="event done"><div class="dot"></div><div>
+    <h4>Received at Export Consolidation Centre</h4>
+    <p>Two heavy cartons received. Gross weight, carton condition and shipment dimensions checked.</p>
+    <div class="date">14 Nov 2026 · 02:20 PM · Bologna, Italy</div>
+   </div></div>
+
+   <div class="event done"><div class="dot"></div><div>
+    <h4>Export Documentation</h4>
+    <p>Export declaration and supporting commercial documents prepared for international transportation.</p>
+    <div class="date">15 Nov 2026 · 11:15 AM · Milan, Italy</div>
+   </div></div>
+
+   <div class="event done"><div class="dot"></div><div>
+    <h4>Air Cargo Terminal Acceptance</h4>
+    <p>Shipment transferred to the airport cargo terminal. Security screening and cargo manifest processing represented as completed.</p>
+    <div class="date">15 Nov 2026 · 06:40 PM · Milan Malpensa Airport, Italy</div>
+   </div></div>
+
+   <div class="event done"><div class="dot"></div><div>
+    <h4>Departed Origin Airport</h4>
+    <p>Cargo loaded for the international air freight movement towards the Dubai transit hub.</p>
+    <div class="date">16 Nov 2026 · 01:25 AM · Milan, Italy</div>
+   </div></div>
+
+   <div class="event done"><div class="dot"></div><div>
+    <h4>Arrived at International Transit Airport</h4>
+    <p>Shipment arrival represented at Dubai International Airport. Cargo unloaded and transferred to transit handling.</p>
+    <div class="date">17 Nov 2026 · 09:10 AM · Dubai, UAE</div>
+   </div></div>
+
+   <div class="event done"><div class="dot"></div><div>
+    <h4>Transit Cargo Documentation Review</h4>
+    <p>Transit manifest and onward transportation documents submitted for verification.</p>
+    <div class="date">18 Nov 2026 · 03:45 PM · Dubai, UAE</div>
+   </div></div>
+
+   <div class="event current"><div class="dot"></div><div>
+    <h4>Additional Cargo Inspection <span class="tag">CURRENT</span></h4>
+    <p>Shipment represented as undergoing additional security inspection and transit-document verification. Awaiting clearance for onward transportation.</p>
+    <div class="date">20 Nov 2026 · 11:30 AM · Dubai, UAE</div>
+   </div></div>
+
+   <div class="event"><div class="dot"></div><div>
+    <h4>Onward Air Cargo Departure</h4>
+    <p>Planned release for the next international air cargo connection to Bengaluru.</p>
+    <div class="date">Estimated · 22–23 Nov 2026 · Dubai, UAE</div>
+   </div></div>
+
+   <div class="event"><div class="dot"></div><div>
+    <h4>Arrival at Destination Airport</h4>
+    <p>Expected arrival at Kempegowda International Airport, Bengaluru, followed by import cargo processing.</p>
+    <div class="date">Estimated · 23–24 Nov 2026 · Bengaluru, India</div>
+   </div></div>
+
+   <div class="event"><div class="dot"></div><div>
+    <h4>Domestic Logistics Handover</h4>
+    <p>Planned release to the domestic distribution partner for heavy cargo handling.</p>
+    <div class="date">Estimated · 26 Nov 2026 · Bengaluru, India</div>
+   </div></div>
+
+   <div class="event"><div class="dot"></div><div>
+    <h4>Out for Delivery</h4>
+    <p>Shipment scheduled for final-mile delivery using suitable heavy-goods transportation.</p>
+    <div class="date">Estimated · 27 Nov 2026</div>
+   </div></div>
+
+   <div class="event"><div class="dot"></div><div>
+    <h4>Delivered to Recipient</h4>
+    <p>Final delivery confirmation and proof-of-delivery record.</p>
+    <div class="date">Awaiting delivery</div>
+   </div></div>
+  </div>
+
+ </div>
+
+ <div class="notice">
+  DEMONSTRATION TRACKING PORTAL<br>
+  All shipment records, references, handling events and delivery estimates shown are simulated.
+  They are not verified carrier scans or official customs records.
+ </div>
+
+</div>
+
+<script>
+(function(){
+ const root=document.getElementById('italia-track');
+ if(!root || root.dataset.initialized) return;
+ root.dataset.initialized='yes';
+
+ // Valid tracking numbers are stored only as SHA-256 hashes,
+ // so the numbers themselves never appear in the page source.
+ const hashes=[
+  '0f54621cc0107e7da3a71814643ed0a0b9bd3382e66ea37e99531e0dbe80f059',
+  'c86650453dffc7221840e7fb46272b6bd361739b98e3f7d81a487193fccf2653',
+  '62a2442970398adfe5f3ac34bbfb1cb659f93d6972b9c5d8fc59e814342ee15a'
+ ];
+
+ const input=root.querySelector('#it-number');
+ const result=root.querySelector('#it-result');
+ const error=root.querySelector('#it-error');
+
+ async function sha256(text){
+  const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+ }
+
+ async function search(){
+  const number=input.value.replace(/\s+/g,'');
+  let ok=false;
+  try{ ok=number.length>0 && hashes.includes(await sha256(number)); }catch(e){ ok=false; }
+
+  if(ok){
+   root.querySelector('#it-id').textContent=number;
+   result.style.display='block';
+   error.style.display='none';
+  }else{
+   result.style.display='none';
+   error.style.display='block';
+  }
+ }
+
+ root.querySelector('#it-search').addEventListener('click',search);
+ input.addEventListener('keydown',function(e){ if(e.key==='Enter') search(); });
+})();
+</script>
+
+</div>
