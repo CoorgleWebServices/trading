@@ -24,15 +24,29 @@
 #ss .route>div:nth-child(2){text-align:right}
 #ss .city{font-size:22px;font-weight:800;color:#193a5d;margin:2px 0 6px}
 #ss .sub{font-size:12px;color:#8793a3}
-#ss .line{grid-column:1/-1;height:2px;background:#dce4ee;position:relative;margin:24px 0 10px}
+#ss .line{grid-column:1/-1;height:2px;background:#dce4ee;position:relative;margin:24px 0 22px}
 #ss .line:after{content:"✈";position:absolute;left:50%;top:-15px;transform:translateX(-50%);background:#f7f9fc;padding:4px 12px;color:#285b8c;font-size:20px}
 #ss .loc{grid-column:1/-1;text-align:center;font-size:11px;color:#71849b;letter-spacing:1px;font-weight:700}
-#ss .grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}
+#ss .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+@media(max-width:600px){#ss .grid{grid-template-columns:1fr 1fr}}
 #ss .grid>div{border-bottom:1px solid #edf0f4;padding-bottom:12px;font-size:14px;font-weight:700;color:#31445b}
-#ss .msg{background:#edf5fc;border-radius:7px;padding:16px 18px;font-size:13px;line-height:1.7;color:#3d5673;margin-top:22px}
+#ss .msg{background:#edf5fc;border-radius:7px;padding:16px 18px;font-size:13px;line-height:1.7;color:#3d5673}
 #ss .load{display:none;text-align:center;padding:40px 0;font-size:12px;color:#71849b}
 #ss .spin{width:34px;height:34px;margin:0 auto 14px;border:3px solid #dce4ee;border-top-color:#193f68;border-radius:50%;animation:ssspin .8s linear infinite}
 @keyframes ssspin{to{transform:rotate(360deg)}}
+#ss h3{font-size:17px;color:#1b3553;margin:0 0 22px}
+#ss .dark{background:#172c46;border-radius:10px;padding:24px}
+#ss .dark .grid>div{color:#fff;border-color:#ffffff22}
+#ss .dark .k{color:#a9bbcf}
+#ss .ev{display:flex;gap:17px;position:relative;padding-bottom:27px}
+#ss .ev:not(:last-child):before{content:"";position:absolute;left:8px;top:19px;bottom:0;width:2px;background:#dce4ed}
+#ss .dot{width:18px;height:18px;border-radius:50%;background:#dce4ed;border:4px solid #fff;box-shadow:0 0 0 1px #cbd5e1;flex-shrink:0;z-index:1}
+#ss .done .dot{background:#2a9870;box-shadow:0 0 0 1px #2a9870}
+#ss .cur .dot{background:#e4a52e;box-shadow:0 0 0 3px #ffedc9}
+#ss .ev h4{font-size:14px;color:#263d57;margin:0 0 6px}
+#ss .ev p{font-size:12px;color:#8290a0;line-height:1.65;margin:0}
+#ss .ev small{display:block;font-size:11px;color:#72839a;margin-top:7px}
+#ss .tag{font-size:9px;font-weight:800;color:#fff;background:#d59420;padding:4px 8px;border-radius:3px;margin-left:7px}
 #ss .ft{font-size:11px;color:#9aa4b1;text-align:center;line-height:1.8;margin-top:18px}
 @media(max-width:600px){#ss{padding:27px 11px}#ss h1{font-size:26px}#ss .card{padding:19px}#ss .row{flex-direction:column}#ss button{padding:14px}#ss .city{font-size:18px}}
 </style>
@@ -51,15 +65,18 @@
 
  <div class="card load" id="ss-l"><div class="spin"></div><div id="ss-lt">Looking up your shipment…</div></div>
 
- <div class="card" id="ss-r" hidden>
-  <div class="top"><div><span class="k">SHIPMENT REFERENCE</span><div class="tid" id="ss-id"></div></div><div class="st" id="ss-st"></div></div>
-  <div class="route">
-   <div><span class="k">ORIGIN</span><div class="city">Florence</div><div class="sub">Italy</div></div>
-   <div><span class="k">DESTINATION</span><div class="city">Bengaluru</div><div class="sub">India</div></div>
-   <div class="line"></div><div class="loc" id="ss-loc"></div>
+ <div id="ss-r" hidden>
+  <div class="card">
+   <div class="top"><div><span class="k">SHIPMENT REFERENCE</span><div class="tid" id="ss-id"></div></div><div class="st" id="ss-st"></div></div>
+   <div class="route">
+    <div><span class="k">ORIGIN</span><div class="city">Florence</div><div class="sub">Italy</div></div>
+    <div><span class="k">DESTINATION</span><div class="city">Bengaluru</div><div class="sub">India</div></div>
+    <div class="line"></div><div class="loc" id="ss-loc"></div>
+   </div>
+   <div class="msg" id="ss-m"></div>
   </div>
-  <div class="grid" id="ss-g"></div>
-  <div class="msg" id="ss-m"></div>
+  <div class="card"><h3>Cargo Details</h3><div class="dark"><div class="grid" id="ss-g"></div></div></div>
+  <div class="card"><h3>Shipment Progress</h3><div id="ss-tl"></div></div>
  </div>
 
  <div class="ft">Questions about your shipment? Contact us at your-email@yourcompany.com</div>
@@ -77,13 +94,22 @@
  var S={
   '0f54621cc0107e7da3a71814643ed0a0b9bd3382e66ea37e99531e0dbe80f059':{ // shipment 01
    status:'In Transit',location:'Dubai, UAE',packages:'2',weight:'92 kg',commodity:'Espresso machine',
-   pickup:'',eta:'',note:'Your shipment is in transit. Carrier tracking details will be shared here as soon as they are available.'},
+   pickup:'',eta:'',note:'Your shipment is in transit. Carrier tracking details will be shared here as soon as they are available.',
+   mode:'Air freight',route:'Italy → Dubai → Bengaluru',
+   // Progress steps: 'd' = done, 'c' = current, '' = upcoming. Add a date only when you know it.
+   steps:[['d','Dispatched from origin','Florence, Italy',''],['c','In transit','Dubai, UAE',''],['','Arrival at destination airport','Bengaluru, India',''],['','Import customs clearance','Bengaluru, India',''],['','Delivered','','']]},
   'c86650453dffc7221840e7fb46272b6bd361739b98e3f7d81a487193fccf2653':{ // shipment 02
    status:'In Transit',location:'Dubai, UAE',packages:'2',weight:'96 kg',commodity:'Espresso machine',
-   pickup:'',eta:'',note:'Your shipment is in transit. Carrier tracking details will be shared here as soon as they are available.'},
+   pickup:'',eta:'',note:'Your shipment is in transit. Carrier tracking details will be shared here as soon as they are available.',
+   mode:'Air freight',route:'Italy → Dubai → Bengaluru',
+   // Progress steps: 'd' = done, 'c' = current, '' = upcoming. Add a date only when you know it.
+   steps:[['d','Dispatched from origin','Florence, Italy',''],['c','In transit','Dubai, UAE',''],['','Arrival at destination airport','Bengaluru, India',''],['','Import customs clearance','Bengaluru, India',''],['','Delivered','','']]},
   '62a2442970398adfe5f3ac34bbfb1cb659f93d6972b9c5d8fc59e814342ee15a':{ // shipment 03
    status:'In Transit',location:'Dubai, UAE',packages:'3',weight:'108 kg',commodity:'Espresso machine',
-   pickup:'',eta:'',note:'Your shipment is in transit. Carrier tracking details will be shared here as soon as they are available.'}
+   pickup:'',eta:'',note:'Your shipment is in transit. Carrier tracking details will be shared here as soon as they are available.',
+   mode:'Air freight',route:'Italy → Dubai → Bengaluru',
+   // Progress steps: 'd' = done, 'c' = current, '' = upcoming. Add a date only when you know it.
+   steps:[['d','Dispatched from origin','Florence, Italy',''],['c','In transit','Dubai, UAE',''],['','Arrival at destination airport','Bengaluru, India',''],['','Import customs clearance','Bengaluru, India',''],['','Delivered','','']]}
  };
  /* ==================================== */
 
@@ -98,9 +124,12 @@
   $('#ss-id').textContent=n;
   $('#ss-st').textContent='● '+d.status.toUpperCase();
   $('#ss-loc').textContent=d.location?'CURRENT LOCATION · '+d.location.toUpperCase():'';
-  var f=[['COMMODITY',d.commodity],['PACKAGES',d.packages],['GROSS WEIGHT',d.weight],['PICKUP DATE',d.pickup],['ESTIMATED DELIVERY',d.eta]];
+  var f=[['COMMODITY',d.commodity],['PACKAGES',d.packages],['GROSS WEIGHT',d.weight],['TRANSPORT MODE',d.mode],['ROUTE',d.route],['CURRENT LOCATION',d.location],['PICKUP DATE',d.pickup],['ESTIMATED DELIVERY',d.eta]];
   $('#ss-g').innerHTML=f.filter(function(x){return x[1]}).map(function(x){return '<div><span class="k">'+x[0]+'</span>'+x[1]+'</div>'}).join('');
   $('#ss-m').textContent=d.note;$('#ss-m').hidden=!d.note;
+  $('#ss-tl').innerHTML=(d.steps||[]).map(function(e){
+   return '<div class="ev '+({d:'done',c:'cur'}[e[0]]||'')+'"><div class="dot"></div><div><h4>'+e[1]+(e[0]=='c'?'<span class="tag">CURRENT</span>':'')+'</h4>'+(e[2]?'<p>'+e[2]+'</p>':'')+'<small>'+(e[3]||(e[0]?'':'Upcoming'))+'</small></div></div>';
+  }).join('');
  }
  function go(){
   if(busy)return;busy=1;
